@@ -196,7 +196,7 @@ fn header_height_is_always_three() {
     assert_eq!(header_height(&compact), 3);
 }
 
-// ── Row 1: the gauge and the status indicator, nothing live ──────────────
+// ── Row 1: the live count, the gauge and the status indicator ────────────
 //
 // Row 1's text column starts after the 10-cell glyph column, so a terminal `W`
 // columns wide offers it `W - 10`. The indicator `● status.claude.ai` is 18
@@ -204,22 +204,25 @@ fn header_height_is_always_three() {
 // fitted to `W - 31` and the indicator is gated on the gauge as rendered. No
 // account count and no harness filter name takes part: both live on the
 // accounts panel's title row. These fixtures run no session, so the live
-// count's prefix stays off the row.
+// count reads `0 live` wherever the width leaves it room.
 
 #[test]
-fn row1_is_the_gauge_and_the_status_indicator_alone_when_wide() {
+fn row1_is_the_live_count_the_gauge_and_the_status_indicator_when_wide() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
     app.tab = Tab::Tokens;
 
-    // At 120 the text column is 110 cells: the gauge's widest rung is 26
-    // (8 name + 2 gap + 10 bar + 2 brackets + ` 42%`), the indicator 18, and
-    // the 66 cells between them are the elastic gap.
+    // At 120 the text column is 110 cells: `0 live · ` is 9, the gauge's
+    // widest rung 26 (8 name + 2 gap + 10 bar + 2 brackets + ` 42%`), the
+    // indicator 18, and the 57 cells between them are the elastic gap.
     let chars: Vec<char> = row_content(&app, 120, 1).chars().collect();
-    let left: String = chars[..26].iter().collect();
-    let gap: String = chars[26..92].iter().collect();
+    let left: String = chars[..35].iter().collect();
+    let gap: String = chars[35..92].iter().collect();
     let dot: String = chars[92..].iter().collect();
-    assert_eq!(left, "uwuclxdy  [████░░░░░░] 42%", "the gauge leads row 1");
+    assert_eq!(
+        left, "0 live · uwuclxdy  [████░░░░░░] 42%",
+        "the live count, then the gauge, lead row 1"
+    );
     assert!(
         gap.chars().all(|c| c == ' '),
         "the elastic gap carries whitespace alone: {gap:?}"
@@ -256,11 +259,16 @@ fn row1_gauge_for_a_provider_profile_carries_no_bar() {
     let mut app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
     app.tab = Tab::Tokens;
 
-    // 90 - 10 = 80 text cells; the gauge is 6 of them, the indicator 18.
+    // 90 - 10 = 80 text cells; the count is 9 of them, the gauge 6, the
+    // indicator 18.
     let row = row_content(&app, 90, 1);
-    let (left, rest) = row.split_at(6);
-    assert_eq!(left, "z.ai  ", "the gauge is the name and its own gap");
-    let (gap, dot) = rest.split_at(80 - 6 - 18);
+    let left: String = row.chars().take(15).collect();
+    assert_eq!(
+        left, "0 live · z.ai  ",
+        "the live count leads, then the gauge: the name and its own gap"
+    );
+    let rest: String = row.chars().skip(15).collect();
+    let (gap, dot) = rest.split_at(80 - 15 - 18);
     assert!(
         gap.chars().all(|c| c == ' '),
         "the elastic gap carries whitespace alone: {gap:?}"
@@ -275,9 +283,9 @@ fn row1_gauge_for_a_provider_profile_carries_no_bar() {
 }
 
 /// Two ways the active profile cannot be shown — compact mode, and a config
-/// with no active slot — leave row 1 to the indicator alone. Both are pinned
-/// on the tab where the gauge otherwise renders, so neither passes by the
-/// Overview tab's own gauge-off rule.
+/// with no active slot — leave row 1 to the live count and the indicator.
+/// Both are pinned on the tab where the gauge otherwise renders, so neither
+/// passes by the Overview tab's own gauge-off rule.
 #[test]
 fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -287,8 +295,9 @@ fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
     let mut no_active = app_with(vec![oauth_profile("uwuclxdy", 42.0)], None);
     no_active.tab = Tab::Tokens;
 
-    // (90 - 10) - 18 = 62: the indicator alone, right-aligned on a blank row.
-    let expected = format!("{}● status.claude.ai", " ".repeat(62));
+    // (90 - 10) - 6 - 18 = 56: the count alone on the left, the indicator
+    // right-aligned.
+    let expected = format!("0 live{}● status.claude.ai", " ".repeat(56));
     for (case, app) in [("compact", &compact), ("no active profile", &no_active)] {
         let rows = render_header_rows(app, 90);
         assert_eq!(rows.len(), 3);
@@ -299,7 +308,7 @@ fn row1_carries_no_gauge_in_compact_mode_or_without_an_active_profile() {
         assert_eq!(
             row_content(app, 90, 1),
             expected,
-            "{case}: row 1 is the indicator alone"
+            "{case}: row 1 is the count and the indicator alone"
         );
     }
 }
@@ -414,20 +423,45 @@ fn row1_carries_the_live_count_alone_where_no_gauge_renders() {
     );
 }
 
+/// Zero shows (cloudy, 2026-09-29): a count that vanished at zero would move
+/// the gauge 9 cells each time the first session starts or the last one ends.
+/// Swept over every width and three row shapes (gauge with a bar, a provider's
+/// name-only gauge, no gauge), so a count-conditional term anywhere in the
+/// shed gate reds wherever it bites inside 24..=140 columns.
 #[test]
-fn row1_carries_no_live_count_while_nothing_is_live() {
+fn row1_shows_zero_live_so_the_gauge_holds_its_place() {
     let _home = crate::testutil::HomeSandbox::new();
-    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
-    app.tab = Tab::Tokens;
-
-    assert_eq!(
-        row_content(&app, 120, 1),
-        format!(
-            "uwuclxdy  [████░░░░░░] 42%{}● status.claude.ai",
-            " ".repeat(66)
-        ),
-        "zero is hidden: no `0 live` and no stray separator"
-    );
+    type Build = fn() -> App;
+    let shapes: [(&str, Build); 3] = [
+        ("oauth", || {
+            let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+            app.tab = Tab::Tokens;
+            app
+        }),
+        ("provider", || {
+            let mut app = app_with(vec![provider_profile("z.ai")], Some("z.ai"));
+            app.tab = Tab::Tokens;
+            app
+        }),
+        ("no gauge", || {
+            let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+            app.tab = Tab::Overview;
+            app
+        }),
+    ];
+    for (shape, build) in shapes {
+        let idle = build();
+        let mut busy = build();
+        busy.live_sessions =
+            crate::live_sessions::LiveTally::of([crate::testutil::live_row("4242-0", "uwuclxdy")]);
+        for width in 24..=140u16 {
+            assert_eq!(
+                row_content(&idle, width, 1).replacen("0 live", "1 live", 1),
+                row_content(&busy, width, 1),
+                "{shape} at {width}: the first session changes the digit alone"
+            );
+        }
+    }
 }
 
 /// The shed seam: gauge 26 + count 9 + indicator 18 + reserve 3 = 56 text

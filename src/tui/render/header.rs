@@ -280,21 +280,23 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
     }
-    // The fleet's live-session count leads the row, hidden at zero. It takes
-    // only what the gauge and the indicator leave, so it is the first thing
-    // the row sheds, whole, never costing the gauge a cell.
-    let live = app.live_sessions.total();
-    if live > 0 {
-        let mut prefix = vec![Span::styled(format!("{live} live"), theme::dim())];
-        if !left_spans.is_empty() {
-            prefix.push(Span::styled(" · ", theme::dim()));
-        }
-        let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
-        let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-        if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
-            prefix.append(&mut left_spans);
-            left_spans = prefix;
-        }
+    // The fleet's live-session count leads the row, zero included: hiding it
+    // at zero would move the gauge each time the first session starts or the
+    // last one ends. It takes only what the gauge and the indicator leave, so
+    // it is the first thing the row sheds, whole, never costing the gauge a
+    // cell.
+    let mut prefix = vec![Span::styled(
+        format!("{} live", app.live_sessions.total()),
+        theme::dim(),
+    )];
+    if !left_spans.is_empty() {
+        prefix.push(Span::styled(" · ", theme::dim()));
+    }
+    let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
+    let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
+        prefix.append(&mut left_spans);
+        left_spans = prefix;
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
     let mut row1_spans = left_spans;
