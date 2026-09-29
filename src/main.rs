@@ -40,6 +40,7 @@ mod profile;
 mod profile_cache;
 mod profile_json;
 mod providers;
+mod proxy_check;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -312,6 +313,15 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Proxy {
+            cmd:
+                cli::ProxyCommand::Check {
+                    url,
+                    admin_token_file,
+                    key_file,
+                    destructive,
+                },
+        } => proxy_check::run(&url, &admin_token_file, &key_file, destructive),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }

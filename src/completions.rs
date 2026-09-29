@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable limit-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr proxy completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -62,6 +62,12 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--key --no-config --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "proxy" ]; then
+        COMPREPLY=( $(compgen -W "check" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && { [ "$prev" = "--admin-token-file" ] || [ "$prev" = "--key-file" ]; }; then
+        COMPREPLY=( $(compgen -f -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--admin-token-file --key-file --destructive" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--profile" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "delete" ] && [ "${cur:0:2}" = "--" ]; then
@@ -110,6 +116,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
+            'proxy[check a clauth-compatible proxy against the contract]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -146,6 +153,14 @@ _clauth() {
         _values 'flag' '--key[key that opens the dashboard]' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
+        _values 'subcommand' 'check[check a running proxy against the clauth proxy contract]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check && "${words[CURRENT-1]}" == (--admin-token-file|--key-file) ]]; then
+        _files
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check ]]; then
+        _values 'flag' '--admin-token-file[file holding the proxy admin token]' \
+            '--key-file[file holding an inference key of one of its accounts]' \
+            '--destructive[also run the mutating routes for real on this account]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
@@ -243,6 +258,12 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Check a clauth-compatible proxy against the contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a check -d "Check a running proxy against the clauth proxy contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --admin-token-file -d "File holding the proxy admin token"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --key-file -d "File holding an inference key of one of its accounts"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --destructive -d "Also run the mutating routes for real on this account"
+complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" --admin-token-file --key-file'
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile

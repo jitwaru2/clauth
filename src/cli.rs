@@ -416,6 +416,16 @@ pub(crate) enum Command {
         cmd: HerdrCommand,
     },
 
+    /// Work with clauth-compatible proxies
+    ///
+    /// A clauth proxy is a separate `clauth-<service>-proxy` process that sits
+    /// between Claude Code and one inference provider and speaks the clauth
+    /// proxy contract.
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
@@ -690,6 +700,35 @@ pub(crate) enum HerdrCommand {
     Config {
         #[command(subcommand)]
         cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth proxy <cmd>`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProxyCommand {
+    /// Check a running proxy against the clauth proxy contract
+    ///
+    /// Drives every contract route and prints one line per departure (the
+    /// route, what the contract expects, what the proxy answered), exiting 1
+    /// when there is any. Safe on a live proxy: mutating routes are only aimed
+    /// at an account id no proxy holds, and the one login flow it starts is
+    /// cancelled. It does send one real inference request on the key's account.
+    Check {
+        /// The proxy's base URL, like http://127.0.0.1:9101.
+        url: String,
+        /// File holding the proxy's admin token, alone, readable by you only.
+        #[arg(long, value_name = "PATH")]
+        admin_token_file: PathBuf,
+        /// File holding an inference key of one of the proxy's accounts,
+        /// alone, readable by you only.
+        #[arg(long, value_name = "PATH")]
+        key_file: PathBuf,
+        /// Also run the mutating routes for real on this account: change and
+        /// restore each setting it can, run each action, re-mint its key, then delete
+        /// it. The key file must hold this account's key. Meant for a proxy's
+        /// CI against a stub upstream.
+        #[arg(long, value_name = "ACCOUNT")]
+        destructive: Option<String>,
     },
 }
 

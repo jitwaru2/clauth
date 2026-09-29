@@ -2177,6 +2177,67 @@ mod api_key_helper_tests {
     }
 }
 
+/// `clauth proxy check`: both secret files are flags holding paths, never the
+/// secrets themselves, and `--destructive` takes the account it may consume.
+#[test]
+fn proxy_check_parses_its_paths_and_the_destructive_account() {
+    let safe = command(&[
+        "proxy",
+        "check",
+        "http://127.0.0.1:9101",
+        "--admin-token-file",
+        "/t/admin",
+        "--key-file",
+        "/t/key",
+    ]);
+    let Command::Proxy {
+        cmd:
+            crate::cli::ProxyCommand::Check {
+                url,
+                admin_token_file,
+                key_file,
+                destructive,
+            },
+    } = safe
+    else {
+        panic!("`proxy check` must select the check arm");
+    };
+    assert_eq!(url, "http://127.0.0.1:9101");
+    assert_eq!(admin_token_file, std::path::PathBuf::from("/t/admin"));
+    assert_eq!(key_file, std::path::PathBuf::from("/t/key"));
+    assert_eq!(destructive, None);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Check { destructive, .. },
+    } = command(&[
+        "proxy",
+        "check",
+        "http://127.0.0.1:9101",
+        "--admin-token-file",
+        "/t/admin",
+        "--key-file",
+        "/t/key",
+        "--destructive",
+        "acct-ci-1",
+    ])
+    else {
+        panic!("the destructive form must select the check arm");
+    };
+    assert_eq!(destructive.as_deref(), Some("acct-ci-1"));
+
+    for missing in [
+        &["proxy", "check", "http://x", "--key-file", "/k"][..],
+        &["proxy", "check", "http://x", "--admin-token-file", "/a"],
+    ] {
+        let argv: Vec<&str> = std::iter::once("clauth")
+            .chain(missing.iter().copied())
+            .collect();
+        let err = <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+            .expect_err("both secret files are required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+}
+
 /// `clauth herdr install` and its flags. The grammar is what makes the setup a
 /// single command, so a rename or a dropped flag reds here rather than in a
 /// user's shell.

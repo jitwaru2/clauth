@@ -59,12 +59,12 @@ pub(crate) const VERSION_FLOOR: ShuntVersion = ShuntVersion {
 /// on Windows 11 24H2, 40 connects over 127.0.0.1 and ::1), so a shorter
 /// bound reads an empty port there as a timeout; 4 s is about 1.9 times that
 /// maximum, and the usage fetch's connect bound too.
-const HEALTH_CONNECT_SECS: u64 = 4;
+pub(crate) const HEALTH_CONNECT_SECS: u64 = 4;
 
 /// The probe's response bound once connected: shunt answers `/health`
 /// outside its concurrency gate, so a live gateway answers in milliseconds,
 /// and this is what keeps a wedged answerer from parking the caller.
-const HEALTH_RESPONSE_SECS: u64 = 2;
+pub(crate) const HEALTH_RESPONSE_SECS: u64 = 2;
 
 /// The probe's end-to-end ceiling, the two phase bounds added: ureq re-arms
 /// its response deadline before every wait (`oauth::TOKEN_HTTP_DEADLINES`),
@@ -1232,18 +1232,10 @@ impl GatewaySilent {
     }
 }
 
-#[derive(Deserialize)]
-struct HealthBody {
-    version: String,
-}
-
-/// `GET http://<addr>/health`, its connect and response phases bounded apart
-/// and together by [`HEALTH_PROBE_TIMEOUT`]. Only a refused connection reads
-/// as [`Health::Silent`], on every platform: a connect that times out, or a
-/// listener that takes the connection and never answers, is an error, never
-/// an empty port.
-pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// The `/health` probe's client, its connect and response phases bounded
+/// apart and together; `clauth proxy check` holds a proxy to the same bounds.
+pub(crate) fn health_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(HEALTH_CONNECT_SECS)))
         .timeout_recv_response(Some(Duration::from_secs(HEALTH_RESPONSE_SECS)))
         .timeout_recv_body(Some(Duration::from_secs(HEALTH_RESPONSE_SECS)))
@@ -1255,7 +1247,21 @@ pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
         // the proxy's host, not this one.
         .proxy(None)
         .build()
-        .into();
+        .into()
+}
+
+#[derive(Deserialize)]
+struct HealthBody {
+    version: String,
+}
+
+/// `GET http://<addr>/health`, its connect and response phases bounded apart
+/// and together by [`HEALTH_PROBE_TIMEOUT`]. Only a refused connection reads
+/// as [`Health::Silent`], on every platform: a connect that times out, or a
+/// listener that takes the connection and never answers, is an error, never
+/// an empty port.
+pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
+    let agent = health_agent();
     let url = format!("http://{addr}/health");
     let mut response = match agent.get(&url).call() {
         Ok(response) => response,
