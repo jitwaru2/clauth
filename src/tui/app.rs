@@ -37,6 +37,7 @@ use crate::claude::{
     force_snapshot_active_credentials, is_first_login, link_profile_credentials,
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
+use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
     DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
     parse_threshold, threshold_for,
@@ -1489,9 +1490,8 @@ pub(crate) struct ServicesState {
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
     /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction on
     /// the first herdr landing only (`HERDR_ENV=1` proves herdr is present), else
-    /// only on `r`;
-    /// it spawns three subprocesses, so a tab switch and the per-tick refresh
-    /// reuse the cached value.
+    /// only on `r`; it spawns three subprocesses, so a tab switch and the
+    /// per-tick refresh reuse the cached value.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates detail draws. Re-read on the same cadence as the checks, because
@@ -4416,11 +4416,11 @@ pub(crate) fn herdr_check(
     }
 }
 
-/// Recompute the Services tab's rows: `delegates` (its detail is the job list),
-/// `plugin` (the four integration readouts in one detail), `herdr`.
-/// Every read is a local FS/`PATH` check; `claude --version` runs only when
-/// `refresh_version` is set or the cached result is absent. Synchronous — no
-/// background thread.
+/// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
+/// `delegates` (its detail is the job list), `plugin` (the four integration
+/// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
+/// `claude --version` runs only when `refresh_version` is set or the cached
+/// result is absent. Synchronous — no background thread.
 fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     use crate::plugin_probe as probe;
 
@@ -4466,6 +4466,18 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     }
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    // shunt row — read-only gateway status: the daemon's feed when one is
+    // fresh, else the record-only verdict. The "the daemon runs the gateway"
+    // note names the daemon only for a record the gateway WOULD run on with no
+    // daemon to run it (the `unobserved` verdict) — never for absent/disabled/
+    // no_config, where no gateway would run at all.
+    let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    let mut shunt = shunt_check(&gateway_slot, gateway_supervised);
+    if !gateway_supervised && gateway_slot.state == GatewayState::Unobserved {
+        shunt.detail.push("the daemon runs the gateway".to_string());
+    }
+    checks.push(shunt);
 
     // The delegates detail names the profiles whose delegate traffic is
     // rate-limited. Snapshot the names under the config lock, then read each
@@ -4580,6 +4592,125 @@ pub(crate) fn delegates_check(
         fix: None,
         problems: Vec::new(),
     }
+}
+
+/// The `shunt` row: the managed gateway's status dot + readout, from the slot
+/// `gateway_slot` resolves (the daemon's feed, or the record-only verdict).
+/// Read-only — no actions — so no fix and no problems. Pure over the slot plus
+/// the `supervised` flag (whether the slot came from a fresh daemon's feed) so
+/// the verdict logic unit-tests without touching `status.json`.
+pub(crate) fn shunt_check(slot: &crate::daemon::gateway::GatewaySlot, supervised: bool) -> Check {
+    let mut detail = Vec::new();
+    detail.push(format!("state: {}", gateway_state_word(slot.state)));
+    if let Some(config) = &slot.config {
+        detail.push(format!("config: {}", escape_control(config)));
+    }
+    if let Some(binary) = &slot.binary {
+        detail.push(format!("binary: {}", escape_control(binary)));
+    }
+    if let Some(port) = slot.port {
+        detail.push(format!("port: {port}"));
+    }
+    if let Some(pid) = slot.pid {
+        detail.push(format!("pid: {pid}"));
+    }
+    if let Some(version) = &slot.version {
+        detail.push(format!("version: {}", escape_control(version)));
+    }
+    // A foreign answerer names what holds the port, so a red `foreign` dot
+    // states its cause instead of leaving it to the state word alone.
+    if slot.state == GatewayState::Foreign
+        && let Some(answerer) = &slot.answerer
+    {
+        let word = match answerer {
+            Answerer::Shunt => "shunt",
+            Answerer::NotShunt => "not shunt",
+            Answerer::NoAnswer => "no answer",
+        };
+        detail.push(format!("answerer: {word}"));
+    }
+    // `restarts` and `last exit` are figures only the daemon observed: on a
+    // record-only slot they are literals nobody read, so they do not show.
+    if supervised {
+        detail.push(format!("restarts: {}", slot.restarts));
+    }
+    if let Some(reason) = &slot.reason {
+        // A multi-line reason (a TOML parse error with its snippet) splits onto
+        // one indented sub-line per further line instead of one garbled row; the
+        // detail renderer truncates each line to the pane.
+        let mut lines = reason.split('\n');
+        if let Some(first) = lines.next() {
+            detail.push(format!("reason: {}", escape_control(first)));
+        }
+        for line in lines {
+            detail.push(format!("  {}", escape_control(line)));
+        }
+    }
+    if supervised && let Some(exit) = &slot.last_exit {
+        detail.push(format!("last exit: {exit}"));
+    }
+    Check {
+        label: "shunt",
+        health: gateway_health(slot.state),
+        detail,
+        fix: None,
+        problems: Vec::new(),
+    }
+}
+
+/// The gateway state's word — the same spelling `status.json` publishes.
+fn gateway_state_word(state: GatewayState) -> &'static str {
+    match state {
+        GatewayState::Absent => "absent",
+        GatewayState::Disabled => "disabled",
+        GatewayState::NoConfig => "no_config",
+        GatewayState::YamlRefused => "yaml_refused",
+        GatewayState::Misconfigured => "misconfigured",
+        GatewayState::BinaryMissing => "binary_missing",
+        GatewayState::Foreign => "foreign",
+        GatewayState::Starting => "starting",
+        GatewayState::Healthy => "healthy",
+        GatewayState::Unhealthy => "unhealthy",
+        GatewayState::BelowFloor => "below_floor",
+        GatewayState::Restarting => "restarting",
+        GatewayState::Stopping => "stopping",
+        GatewayState::Unobserved => "unobserved",
+    }
+}
+
+/// The gateway state's dot bucket: green healthy; amber starting/unhealthy/
+/// restarting/stopping; red the refusal states; dim absent/disabled/unobserved.
+fn gateway_health(state: GatewayState) -> Health {
+    match state {
+        GatewayState::Healthy => Health::Ok,
+        GatewayState::Starting
+        | GatewayState::Unhealthy
+        | GatewayState::Restarting
+        | GatewayState::Stopping => Health::Warn,
+        GatewayState::Misconfigured
+        | GatewayState::BinaryMissing
+        | GatewayState::Foreign
+        | GatewayState::YamlRefused
+        | GatewayState::BelowFloor
+        | GatewayState::NoConfig => Health::Danger,
+        GatewayState::Absent | GatewayState::Disabled | GatewayState::Unobserved => Health::Idle,
+    }
+}
+
+/// Every slot string the detail renders goes through here. A control character
+/// or a bidi formatting character is spelled as its visible `\u{…}` form so an
+/// untrusted string off the feed or the record can neither inject into the
+/// terminal nor reorder a line; every other character passes through unchanged.
+fn escape_control(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// The `plugin` row: one detail holding clauth on PATH (+ the data dir), the

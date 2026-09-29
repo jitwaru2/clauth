@@ -564,7 +564,10 @@ fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
 /// both ends, because the head (which tree) and the leaf (which file) both
 /// carry meaning.
 fn is_path_key(key: &str) -> bool {
-    matches!(key, "data" | "path" | "project" | "root")
+    matches!(
+        key,
+        "data" | "path" | "project" | "root" | "config" | "binary"
+    )
 }
 
 /// One `f  <verb>` fix line. Dim while unfocused — the whole line, `f`

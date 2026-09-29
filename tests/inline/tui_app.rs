@@ -509,13 +509,365 @@ fn enter_does_not_descend_into_the_delegates_detail() {
     let mut app = bare_app();
     app.tab = super::Tab::Services;
     super::recompute_services_checks(&mut app, false);
-    app.services.cursor = 0; // delegates is the first row
+    app.services.cursor = 1; // delegates is the second row, after shunt
     app.services.focus = super::ServicesFocus::List;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(
         app.services.focus,
         super::ServicesFocus::List,
         "↵ does not descend into the delegates detail"
+    );
+}
+
+/// The shunt row's readout: state + every field that has a value, in order —
+/// `restarts` and `last exit` only when the slot came from the daemon's feed,
+/// `reason` split onto indented sub-lines when it spans more than one line.
+#[test]
+fn shunt_check_reads_the_slot_fields_in_order() {
+    use crate::daemon::gateway::{ExitReport, GatewaySlot, GatewayState};
+    let every = GatewaySlot {
+        state: GatewayState::Healthy,
+        config: Some("/home/u/.clauth/gateway.toml".to_string()),
+        binary: Some("/usr/local/bin/shunt".to_string()),
+        port: Some(3001),
+        pid: Some(4242),
+        version: Some("0.49.1".to_string()),
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 2,
+        last_exit: Some(ExitReport {
+            code: Some(1),
+            signal: None,
+        }),
+        reason: Some("TOML parse error at line 1\n  |\n1 | foo =".to_string()),
+        since: Some("2026-09-29T00:00:00Z".to_string()),
+    };
+    let check = super::shunt_check(&every, true);
+    assert_eq!(check.health, super::Health::Ok, "healthy is green");
+    assert_eq!(
+        check.detail,
+        vec![
+            "state: healthy".to_string(),
+            "config: /home/u/.clauth/gateway.toml".to_string(),
+            "binary: /usr/local/bin/shunt".to_string(),
+            "port: 3001".to_string(),
+            "pid: 4242".to_string(),
+            "version: 0.49.1".to_string(),
+            "restarts: 2".to_string(),
+            "reason: TOML parse error at line 1".to_string(),
+            "    |".to_string(),
+            "  1 | foo =".to_string(),
+            "last exit: exit 1".to_string(),
+        ],
+        "every set field renders in order, a multi-line reason splits"
+    );
+
+    let absent = GatewaySlot {
+        state: GatewayState::Absent,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let check = super::shunt_check(&absent, false);
+    assert_eq!(check.health, super::Health::Idle, "absent is dim");
+    assert_eq!(
+        check.detail,
+        vec!["state: absent".to_string()],
+        "a record-only absent slot renders state alone, no unobserved figures"
+    );
+}
+
+/// The dot buckets the gateway states into their classes: green healthy; amber
+/// starting/unhealthy/restarting/stopping; red the refusal states; dim
+/// absent/disabled/unobserved.
+#[test]
+fn shunt_check_maps_each_state_to_its_dot_class() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    let slot = |state| GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let cases: &[(GatewayState, super::Health)] = &[
+        (GatewayState::Healthy, super::Health::Ok),
+        (GatewayState::Starting, super::Health::Warn),
+        (GatewayState::Unhealthy, super::Health::Warn),
+        (GatewayState::Restarting, super::Health::Warn),
+        (GatewayState::Stopping, super::Health::Warn),
+        (GatewayState::Misconfigured, super::Health::Danger),
+        (GatewayState::BinaryMissing, super::Health::Danger),
+        (GatewayState::Foreign, super::Health::Danger),
+        (GatewayState::YamlRefused, super::Health::Danger),
+        (GatewayState::BelowFloor, super::Health::Danger),
+        (GatewayState::NoConfig, super::Health::Danger),
+        (GatewayState::Absent, super::Health::Idle),
+        (GatewayState::Disabled, super::Health::Idle),
+        (GatewayState::Unobserved, super::Health::Idle),
+    ];
+    for (state, want) in cases {
+        assert_eq!(
+            super::shunt_check(&slot(*state), false).health,
+            *want,
+            "{state:?} dot class"
+        );
+    }
+}
+
+/// The sanitizer escapes exactly the control and bidi-formatting characters,
+/// and leaves every other character — backslashes, non-ASCII, quotes, the
+/// ellipsis — unchanged.
+#[test]
+fn escape_control_escapes_only_control_and_bidi_chars() {
+    assert_eq!(
+        super::escape_control(r"C:\Users\u\.clauth\shunt.toml"),
+        r"C:\Users\u\.clauth\shunt.toml",
+        "a Windows path renders with its backslashes unchanged"
+    );
+    assert_eq!(
+        super::escape_control("/home/zoë/.cargo/bin/shunt"),
+        "/home/zoë/.cargo/bin/shunt",
+        "a non-ASCII path renders unchanged"
+    );
+    assert_eq!(
+        super::escape_control(r#"invalid value: string "abc", …"#),
+        r#"invalid value: string "abc", …"#,
+        "a quoted reason renders unchanged"
+    );
+    assert_eq!(super::escape_control("\u{1b}"), "\\u{1b}", "ESC escapes");
+    assert_eq!(super::escape_control("\u{7}"), "\\u{7}", "BEL escapes");
+    assert_eq!(
+        super::escape_control("\u{202e}"),
+        "\\u{202e}",
+        "a bidi override escapes"
+    );
+}
+
+/// Every slot string the detail renders goes through the sanitizer: a planted
+/// control character never reaches the detail raw, whichever field carries it.
+#[test]
+fn shunt_check_escapes_the_untrusted_slot_strings() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    let slot = GatewaySlot {
+        state: GatewayState::Healthy,
+        config: Some("/tmp/a\u{1b}b".to_string()),
+        binary: Some("/tmp/b\u{202e}c".to_string()),
+        port: None,
+        pid: None,
+        version: Some("0.49.1\u{1b}[2J".to_string()),
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: Some("bad \u{202e} entry".to_string()),
+        since: None,
+    };
+    let check = super::shunt_check(&slot, true);
+    let find = |prefix: &str| {
+        check
+            .detail
+            .iter()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} line: {:?}", check.detail))
+            .clone()
+    };
+    assert_eq!(
+        find("version:"),
+        "version: 0.49.1\\u{1b}[2J",
+        "the ESC renders as its visible escape"
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.contains('\u{1b}')),
+        "no raw control character reaches the readout: {:?}",
+        check.detail
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.contains('\u{202e}')),
+        "no raw bidi override reaches the readout: {:?}",
+        check.detail
+    );
+    assert!(find("config:").contains("\\u{1b}"), "config is escaped");
+    assert!(find("binary:").contains("\\u{202e}"), "binary is escaped");
+    assert!(find("reason:").contains("\\u{202e}"), "reason is escaped");
+}
+
+/// A `foreign` slot names what answered on the bind port, so the red dot states
+/// its cause.
+#[test]
+fn shunt_check_renders_the_foreign_answerer() {
+    use crate::daemon::gateway::{Answerer, GatewaySlot, GatewayState};
+    let foreign = |answerer| GatewaySlot {
+        state: GatewayState::Foreign,
+        config: None,
+        binary: None,
+        port: Some(3001),
+        pid: None,
+        version: None,
+        answerer,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let check = super::shunt_check(&foreign(Some(Answerer::Shunt)), false);
+    assert_eq!(
+        check.detail,
+        vec![
+            "state: foreign".to_string(),
+            "port: 3001".to_string(),
+            "answerer: shunt".to_string()
+        ],
+        "a shunt-shaped foreign answerer names itself"
+    );
+    let check = super::shunt_check(&foreign(Some(Answerer::NotShunt)), false);
+    assert_eq!(
+        check.detail,
+        vec![
+            "state: foreign".to_string(),
+            "port: 3001".to_string(),
+            "answerer: not shunt".to_string()
+        ],
+        "a non-shunt HTTP answerer names itself"
+    );
+    let check = super::shunt_check(&foreign(Some(Answerer::NoAnswer)), false);
+    assert_eq!(
+        check.detail,
+        vec![
+            "state: foreign".to_string(),
+            "port: 3001".to_string(),
+            "answerer: no answer".to_string()
+        ],
+        "a silent answerer names itself"
+    );
+}
+
+/// The reader: a fresh daemon's `gateway` object is the slot (flagged
+/// from-daemon); a stale daemon, an absent key, and an unparseable object all
+/// fall back to the record-only verdict (flagged not-from-daemon).
+#[test]
+fn gateway_slot_reads_a_fresh_feed_and_falls_back_otherwise() {
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status_path = dir.join("status.json");
+
+    let feed = serde_json::json!({
+        "gateway": {
+            "state": "healthy",
+            "floor": "0.48.0",
+            "restarts": 2,
+            "version": "0.49.1"
+        }
+    });
+    std::fs::write(&status_path, serde_json::to_vec(&feed).expect("serialize")).expect("write");
+    let (slot, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(supervised, "a fresh feed's gateway slot is from the daemon");
+    assert_eq!(
+        slot.state,
+        GatewayState::Healthy,
+        "and it is the feed's slot"
+    );
+
+    // No gateway key (an older daemon): record-only, not from the daemon.
+    std::fs::write(&status_path, b"{}").expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(
+        !supervised,
+        "a fresh feed with no gateway key is not the daemon's slot"
+    );
+
+    // A gateway object this binary cannot parse (a state word from a newer
+    // daemon): record-only, not from the daemon.
+    std::fs::write(
+        &status_path,
+        br#"{"gateway": {"state": "adopting", "floor": "0.48.0", "restarts": 0}}"#,
+    )
+    .expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(
+        !supervised,
+        "an unparseable gateway object falls back, not from the daemon"
+    );
+
+    // A stale daemon never reads its feed.
+    std::fs::write(&status_path, serde_json::to_vec(&feed).expect("serialize")).expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Stale);
+    assert!(!supervised, "a stale daemon's verdict is record-only");
+}
+
+/// The "the daemon runs the gateway" note names the daemon only for a record
+/// the gateway WOULD run on with no daemon to run it: an `unobserved` record.
+/// An absent record shows no note — no gateway would run at all.
+#[test]
+fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status_path = dir.join("status.json");
+
+    // No record in the sandbox: the record-only verdict is `absent`.
+    std::fs::write(&status_path, b"{}").expect("feed");
+    let mut app = bare_app();
+    app.daemon_health = DaemonHealth::Fresh;
+    super::recompute_services_checks(&mut app, false);
+    let shunt = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "shunt")
+        .expect("shunt row");
+    assert_eq!(
+        shunt.detail,
+        vec!["state: absent".to_string()],
+        "an absent record shows no daemon note"
+    );
+
+    // A record whose config exists: `unobserved` — the gateway would run on it.
+    let config = dir.join("shunt.toml");
+    std::fs::write(&config, "port = 3001\n").expect("config");
+    std::fs::write(
+        dir.join("gateway.toml"),
+        format!("config = {:?}\n", config.to_string_lossy()),
+    )
+    .expect("record");
+    let mut app = bare_app();
+    app.daemon_health = DaemonHealth::Fresh;
+    super::recompute_services_checks(&mut app, false);
+    let shunt = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "shunt")
+        .expect("shunt row");
+    assert_eq!(
+        shunt.detail,
+        vec![
+            "state: unobserved".to_string(),
+            format!("config: {}", config.to_string_lossy()),
+            "binary: shunt".to_string(),
+            "the daemon runs the gateway".to_string(),
+        ],
+        "an unobserved record names the daemon as what would run the gateway"
     );
 }
 
@@ -12521,12 +12873,12 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let labels: Vec<&str> = app.services.checks.iter().map(|c| c.label).collect();
     assert_eq!(
         labels,
-        vec!["delegates", "plugin"],
+        vec!["shunt", "delegates", "plugin"],
         "construction recomputes the checks, so the first paint is not empty \
          (herdr does not render until its probe resolves)"
     );
     assert_eq!(
-        app.services.cursor, 1,
+        app.services.cursor, 2,
         "the pending landing parks on the last row"
     );
     assert_eq!(
@@ -12535,7 +12887,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         "with no herdr resolved the parked cursor rests on the last row"
     );
     // Unprobed must read as unprobed, never as a missing binary.
-    let plugin = &app.services.checks[1];
+    let plugin = &app.services.checks[2];
     assert_eq!(plugin.label, "plugin");
     assert!(
         plugin

@@ -125,6 +125,47 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
 }
 
+/// The managed-gateway slot for the Services tab's `shunt` row: with a fresh
+/// daemon, the `gateway` object the daemon published in `status.json` (the
+/// supervisor's live read); otherwise the record-only verdict
+/// ([`super::gateway::unsupervised_slot`]), which reads `unobserved` for a
+/// record the gateway would run on. The `bool` is `true` only when the slot
+/// came from a fresh daemon's feed AND its `gateway` object parsed — the caller
+/// names the daemon as what runs the gateway whenever it did not.
+///
+/// `health` is the caller's already-probed [`daemon_health`] verdict (the
+/// per-tick reading the header holds), so this reader never takes the flock a
+/// second time or re-reads `status.json` just to decide freshness. A fresh
+/// daemon whose feed cannot be read, whose `gateway` key is absent (an older
+/// daemon), or whose `gateway` object this binary cannot parse (a state word or
+/// field shape from a newer daemon) all fall back to the record verdict,
+/// reported as not-from-daemon, rather than guessing a state.
+pub(crate) fn gateway_slot(health: DaemonHealth) -> (super::gateway::GatewaySlot, bool) {
+    if health != DaemonHealth::Fresh {
+        return (super::gateway::unsupervised_slot(), false);
+    }
+    let Ok(dir) = clauth_dir() else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    // Parse only the `gateway` key: one unrelated profile entry or codex slot
+    // that this binary cannot read must not discard a fresh daemon's slot.
+    #[derive(serde::Deserialize)]
+    struct GatewayFeed {
+        #[serde(default)]
+        gateway: Option<super::gateway::GatewaySlot>,
+    }
+    let Ok(feed) = serde_json::from_str::<GatewayFeed>(&body) else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    match feed.gateway {
+        Some(slot) => (slot, true),
+        None => (super::gateway::unsupervised_slot(), false),
+    }
+}
+
 /// What a starting `clauth daemon` is allowed to become (#57).
 ///
 /// Standby exists because a supervisor's instance must be able to take over

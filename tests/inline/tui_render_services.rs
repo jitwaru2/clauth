@@ -90,6 +90,45 @@ fn plugin_check_with_problems() -> Check {
     }
 }
 
+/// A shunt slot for the render pins: the fields the pick lists, each optional.
+fn shunt_slot(state: crate::daemon::gateway::GatewayState) -> crate::daemon::gateway::GatewaySlot {
+    crate::daemon::gateway::GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    }
+}
+
+/// A shunt slot with every optional field set, for the detail render pin.
+fn shunt_slot_full() -> crate::daemon::gateway::GatewaySlot {
+    crate::daemon::gateway::GatewaySlot {
+        state: crate::daemon::gateway::GatewayState::Healthy,
+        config: Some("/home/u/.clauth/gateway.toml".to_string()),
+        binary: Some("/usr/local/bin/shunt".to_string()),
+        port: Some(3001),
+        pid: Some(4242),
+        version: Some("0.49.1".to_string()),
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 2,
+        last_exit: Some(crate::daemon::gateway::ExitReport {
+            code: Some(1),
+            signal: None,
+        }),
+        reason: Some("port busy".to_string()),
+        since: Some("2026-09-29T00:00:00Z".to_string()),
+    }
+}
+
 fn app_with(check: Check) -> App {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -124,6 +163,16 @@ fn dump_full(app: &App) -> String {
     let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
     term.draw(|f| super::super::draw(f, app)).unwrap();
     crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+}
+
+/// The detail pane's content rows, trimmed of the selector pane, the border and
+/// the pane padding — one `key value` line per row, blank padding dropped.
+fn detail_rows(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .map(|r| r.trim_matches('│').trim().to_string())
+        .filter(|r| !r.is_empty())
+        .collect()
 }
 
 /// The dot carries the verdict hue and the selector row carries no `[f]` cue —
@@ -164,19 +213,23 @@ fn assert_dot(check: &Check, expected: Health) {
 
 // ── selector rows ──────────────────────────────────────────────────────────────
 
-/// The three service rows render as dot + label, in order, with no fix cue on
+/// The four service rows render as dot + label, in order, with no fix cue on
 /// any row.
 #[test]
 fn the_selector_lists_each_service_row_dot_and_label_only() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_checks(vec![
+        crate::tui::app::shunt_check(
+            &shunt_slot(crate::daemon::gateway::GatewayState::Absent),
+            false,
+        ),
         delegates_check(&[], &[]),
         plugin_check_with_problems(),
         herdr_check(&healthy_probe(), Some(&healthy_config())),
     ]);
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
-    for label in ["delegates", "plugin", "herdr"] {
+    for label in ["shunt", "delegates", "plugin", "herdr"] {
         assert!(
             screen.contains(&format!("● {label}")),
             "the `{label}` row renders dot + label:\n{screen}"
@@ -185,6 +238,76 @@ fn the_selector_lists_each_service_row_dot_and_label_only() {
     assert!(
         !screen.contains("[f]"),
         "no selector row carries a fix cue; the fix lives in the detail:\n{screen}"
+    );
+}
+
+/// The shunt dot buckets each state into its class (green / amber / red / dim).
+#[test]
+fn the_shunt_dot_maps_each_state_to_its_class() {
+    use crate::daemon::gateway::GatewayState as S;
+    let _home = crate::testutil::HomeSandbox::new();
+    for (state, want) in [
+        (S::Healthy, Health::Ok),
+        (S::Starting, Health::Warn),
+        (S::Unhealthy, Health::Warn),
+        (S::Restarting, Health::Warn),
+        (S::Stopping, Health::Warn),
+        (S::Misconfigured, Health::Danger),
+        (S::BinaryMissing, Health::Danger),
+        (S::Foreign, Health::Danger),
+        (S::YamlRefused, Health::Danger),
+        (S::BelowFloor, Health::Danger),
+        (S::NoConfig, Health::Danger),
+        (S::Absent, Health::Idle),
+        (S::Disabled, Health::Idle),
+        (S::Unobserved, Health::Idle),
+    ] {
+        assert_dot(
+            &crate::tui::app::shunt_check(&shunt_slot(state), false),
+            want,
+        );
+    }
+}
+
+/// The shunt detail renders every set field in order, pinned by equality on the
+/// detail pane's content rows (key column 11 cells: widest key `last exit` +
+/// the 2-space gap).
+#[test]
+fn the_shunt_detail_renders_every_set_field() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with(crate::tui::app::shunt_check(&shunt_slot_full(), true));
+    let (rows, _) = render(&app);
+    assert_eq!(
+        detail_rows(&rows),
+        vec![
+            "state      healthy",
+            "config     /home/u/.clauth/gateway.toml",
+            "binary     /usr/local/bin/shunt",
+            "port       3001",
+            "pid        4242",
+            "version    0.49.1",
+            "restarts   2",
+            "reason     port busy",
+            "last exit  exit 1",
+        ],
+        "every set field renders in order"
+    );
+}
+
+/// The untrusted `/health` version's planted `ESC [2J` renders as its visible
+/// escape, pinned by equality on the rendered version row.
+#[test]
+fn the_shunt_detail_escapes_a_planted_screen_clear() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut slot = shunt_slot_full();
+    slot.version = Some("0.49.1\u{1b}[2J".to_string());
+    let app = app_with(crate::tui::app::shunt_check(&slot, true));
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    assert_eq!(
+        detail.iter().find(|r| r.starts_with("version")),
+        Some(&"version    0.49.1\\u{1b}[2J".to_string()),
+        "the version renders escaped: {detail:?}"
     );
 }
 
@@ -457,6 +580,32 @@ fn detail_line_truncates_paths_and_prose_to_the_pane() {
     assert!(
         rendered.ends_with('…'),
         "prose trails an ellipsis: {rendered}"
+    );
+}
+
+/// The shunt row's `config` and `binary` path keys truncate on the same shared
+/// middle-ellipsis helper, by equality.
+#[test]
+fn the_shunt_path_keys_truncate_on_the_shared_middle_ellipsis() {
+    use ratatui::text::Line;
+    let text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    // key_w = 9 (`last exit` is the widest shunt key): value column = 20 - 9 - 2 = 9.
+    let line = super::detail_line("config: /home/u/.clauth/gateway.toml", 9, 20);
+    assert_eq!(
+        text(&line),
+        "config     /hom…toml",
+        "the config path keeps both ends"
+    );
+    let line = super::detail_line("binary: /usr/local/bin/shunt", 9, 20);
+    assert_eq!(
+        text(&line),
+        "binary     /usr…hunt",
+        "the binary path keeps both ends"
     );
 }
 
