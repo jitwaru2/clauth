@@ -141,7 +141,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 
 ## Services tab
 
-Four rows: `shunt`, `delegates`, `plugin`, and `herdr` (shown only when herdr resolves; press <kbd>r</kbd> once to probe it, since only the first herdr launch probes on its own). A row's dot carries its health; the full readout lives in the detail pane. <kbd>⏎</kbd> descends into the selected row's detail (`delegates` excepted: its detail takes no keys). A fixable problem shows a dim `f  <verb>` line under the problem it fixes, and the footer shows `f <verb>`. On the list <kbd>f</kbd> fixes the first fixable problem on the selected row; in the `plugin` detail <kbd>↑</kbd>/<kbd>↓</kbd> walk the problems, the focused one highlighted, and <kbd>f</kbd> fixes it.
+Four rows: `shunt`, `delegates`, `plugin`, and `herdr` (shown once herdr resolves; the tab probes for it in the background the first time you open it, and <kbd>r</kbd> probes again). A row's dot carries its health; the full readout lives in the detail pane. <kbd>⏎</kbd> descends into the selected row's detail (`delegates` excepted: its detail takes no keys). A fixable problem shows a dim `f  <verb>` line under the problem it fixes, and the footer shows `f <verb>`. On the list <kbd>f</kbd> fixes the first fixable problem on the selected row; in the `plugin` detail <kbd>↑</kbd>/<kbd>↓</kbd> walk the problems, the focused one highlighted, and <kbd>f</kbd> fixes it.
 
 `shunt` reports the managed gateway's status, read-only: the daemon's live verdict when it runs the gateway, else the gateway record's own. It names the binary, config and version it resolved, the state and its reason, then the pid and port. No action lives on this row yet.
 
