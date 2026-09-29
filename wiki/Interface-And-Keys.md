@@ -143,17 +143,17 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 
 Four rows: `shunt`, `delegates`, `plugin`, and `herdr` (shown only when herdr resolves; press <kbd>r</kbd> once to probe it, since only the first herdr launch probes on its own). A row's dot carries its health; the full readout lives in the detail pane. <kbd>⏎</kbd> descends into the selected row's detail (`delegates` excepted: its detail takes no keys). A fixable problem shows a dim `f  <verb>` line under the problem it fixes, and the footer shows `f <verb>`. On the list <kbd>f</kbd> fixes the first fixable problem on the selected row; in the `plugin` detail <kbd>↑</kbd>/<kbd>↓</kbd> walk the problems, the focused one highlighted, and <kbd>f</kbd> fixes it.
 
-`shunt` reports the managed gateway's status, read-only: the daemon's live verdict when it runs the gateway, else the gateway record's own. It names the state plus the config, binary, port, pid and version it resolved. No action lives on this row yet.
+`shunt` reports the managed gateway's status, read-only: the daemon's live verdict when it runs the gateway, else the gateway record's own. It names the binary, config and version it resolved, the state and its reason, then the pid and port. No action lives on this row yet.
 
 `delegates` lists the `clauth mcp` job store in its detail. The row's dot reads green while a job runs and dim when none; a recent delegate rate-limit warning names the accounts in its detail. The detail binds no key: a delegate is stopped through the plugin's `monitor` tool ([Claude Code plugin](Claude-Code-Plugin)).
 
-`plugin` folds the Claude Code wiring checks into one detail: the clauth data dir and whether `clauth` is on `PATH`, the `mcpServers` wiring (`mcp wired` / `mcp source` / `mcp server`), the plugin install record, and the `claude` version. Its health is the worst of the four, and two fixes can apply:
+`plugin` folds the Claude Code wiring checks into one detail: the plugin install record first, then the `mcpServers` entry (`mcp entry` registered or not, `mcp server` ok or won't start, `mcp source`), then the `claude` version, whether `clauth` is on `PATH`, and the clauth data dir. Its health is the worst of the four, and two fixes can apply, in this order:
 
 | Verb | When it appears |
 |------|-----------------|
-| `wire mcp server` | the `mcpServers` entry is missing, project-local only, or drifted off the current launch line; writes the clauth entry into `~/.claude.json` |
 | `install plugin` | the plugin reads not installed, or installed for this project only; installs at user scope |
+| `wire mcp server` | the `mcpServers` entry is missing, project-local only, or drifted off the current launch line; writes the clauth entry into `~/.claude.json` |
 
-To install the plugin: select the `plugin` row, press <kbd>⏎</kbd>, move to `f  install plugin` with <kbd>↑</kbd>/<kbd>↓</kbd>, press <kbd>f</kbd>, confirm.
+To install the plugin: select the `plugin` row, press <kbd>f</kbd>, confirm.
 
 The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel. <kbd>f</kbd> applies `heal herdr config` when the herdr plugin is installed and its key is unbound or its sidebar row is untemplated.
