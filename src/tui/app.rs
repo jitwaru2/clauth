@@ -384,7 +384,7 @@ pub(crate) enum GlobalConfigRow {
     ClockNotation,
     /// The tab every launch opens on (`AppState.home_tab`): space/⏎
     /// cycles the eight tabs in [`Tab::ALL`] order. The first herdr launch
-    /// overrides it — that one landing opens the Plugin tab with the herdr
+    /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
@@ -612,13 +612,9 @@ pub(crate) enum ConfirmAction {
     /// Disable one account (action-menu "disable account" off the Setup pane,
     /// standing in for the row's arm-then-confirm).
     DisableOne(String),
-    /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
+    /// Services tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
-    /// Plugin tab: relink `~/.claude/.credentials.json` to the active profile's
-    /// own stored credentials (repair a `missing` link). Spends no token — it only
-    /// re-points at creds the profile already holds — so it keeps the plain button.
-    RelinkCredentials(String),
     /// Setup tab: drop a profile's stored OAuth credentials, keeping the shell.
     BlankCredentials(String),
     /// Setup `+ new` draft: a login already stashed a mint (the `✓ logged in`
@@ -650,13 +646,13 @@ pub(crate) enum ConfirmAction {
     /// its login in a Keychain entry clauth cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
-    /// Plugin tab: run `crate::herdr::heal` on the named config file.
+    /// Services tab: run `crate::herdr::heal` on the named config file.
     HealHerdrConfig(std::path::PathBuf),
-    /// Plugin tab herdr options: flip the `delegate row text` knob, persist it,
+    /// Services tab herdr options: flip the `delegate row text` knob, persist it,
     /// then heal herdr's config so the sidebar row matches the new knob. The
     /// heal is what the confirm gates — it rewrites herdr's own file.
     HerdrDelegateRowText(std::path::PathBuf),
-    /// Plugin tab: install the clauth plugin through agentgear at user scope.
+    /// Services tab: install the clauth plugin through agentgear at user scope.
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
@@ -1125,8 +1121,8 @@ pub(crate) enum Tab {
     Config,
     /// Claude service status feed (incidents from status.claude.com).
     Status,
-    /// Claude Code integration health: MCP wiring, plugin install, per-profile runtime.
-    Plugin,
+    /// Services: the shunt gateway, delegates, the Claude Code plugin and herdr.
+    Services,
 }
 
 impl Tab {
@@ -1138,7 +1134,7 @@ impl Tab {
         Tab::Fallback,
         Tab::Config,
         Tab::Status,
-        Tab::Plugin,
+        Tab::Services,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -1150,7 +1146,7 @@ impl Tab {
             Tab::Fallback => "Fallback",
             Tab::Config => "Config",
             Tab::Status => "Status",
-            Tab::Plugin => "Plugin",
+            Tab::Services => "Services",
         }
     }
 
@@ -1177,7 +1173,7 @@ impl From<Tab> for HomeTab {
             Tab::Fallback => HomeTab::Fallback,
             Tab::Config => HomeTab::Config,
             Tab::Status => HomeTab::Status,
-            Tab::Plugin => HomeTab::Plugin,
+            Tab::Services => HomeTab::Services,
         }
     }
 }
@@ -1192,7 +1188,7 @@ impl From<HomeTab> for Tab {
             HomeTab::Fallback => Tab::Fallback,
             HomeTab::Config => Tab::Config,
             HomeTab::Status => Tab::Status,
-            HomeTab::Plugin => Tab::Plugin,
+            HomeTab::Services => Tab::Services,
         }
     }
 }
@@ -1387,19 +1383,20 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
     incident.is_active()
 }
 
-// ── Plugin tab ─────────────────────────────────────────────────────────────────
+// ── Services tab ───────────────────────────────────────────────────────────────
 
-/// Which Plugin pane has focus. `List`: the checks + profiles selector (↑↓ moves,
-/// ⏎ descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls).
+/// Which Services pane has focus. `List`: the row selector (↑↓ moves, ⏎
+/// descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls, or
+/// walks the plugin problems / herdr options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PluginFocus {
+pub(crate) enum ServicesFocus {
     List,
     Detail,
 }
 
 /// Health bucket for a row's status dot — the same success / warning / danger
 /// buckets as the header `● status.claude.ai` dot, plus a neutral `Idle` for a
-/// profile that is neither linked nor running a live session.
+/// row that is neither running nor healthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Health {
     Ok,
@@ -1408,42 +1405,68 @@ pub(crate) enum Health {
     Idle,
 }
 
-/// A one-key fix offered on the selected row. `WireMcpServers` writes the manual
-/// entry (a [`ConfirmAction`]); `RepairDivergence` re-raises the existing
-/// divergence resolver for the named (active) profile.
+/// A one-key fix offered on a service row. `WireMcpServers` writes the manual
+/// entry (a [`ConfirmAction`]); the verb `f` renders in the footer and under the
+/// problem it fixes is [`fix_verb`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PluginFix {
+pub(crate) enum ServiceFix {
     WireMcpServers,
-    RepairDivergence(String),
-    /// Relink a `missing` active-profile credential link to its own stored creds.
-    RelinkCredentials(String),
     /// Append the keybinding + sidebar row to herdr's config (the config half of
     /// `clauth herdr install`). `PathBuf` = the resolved config file.
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
-    /// Replaces the copy-paste `/plugin` hint the row used to show.
     InstallPlugin,
 }
 
-/// A computed integration-check row (global, profile-independent).
+/// One focusable fix problem inside a service row's detail. When the detail pane
+/// is descended, ↑↓ walks these problems and `f` applies the focused one; the
+/// footer's `f <verb>` and the dim `f  <verb>` detail line follow the focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Problem {
+    /// The detail-line index of this problem's `f  <verb>` line.
+    pub(crate) line: usize,
+    pub(crate) fix: ServiceFix,
+}
+
+/// A computed service row. `fix` is the list-focus `f` (the first fixable
+/// problem); `problems` is the detail-pane focus walk (empty on rows whose
+/// detail has no per-problem focus).
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) label: &'static str,
     pub(crate) health: Health,
-    /// Full readout for the detail pane, one entry per line. (Checks are
+    /// Full readout for the detail pane, one entry per line. (Rows are
     /// dot-only in the list — the dot color carries the verdict, the readout
     /// lives here — so there is no separate terse value.)
     pub(crate) detail: Vec<String>,
-    pub(crate) fix: Option<PluginFix>,
+    pub(crate) fix: Option<ServiceFix>,
+    pub(crate) problems: Vec<Problem>,
 }
 
-/// UI-thread-only state for the Plugin tab. Recomputed synchronously on tab focus
-/// and on `r`; there is no background thread (all reads are local FS/`PATH`;
-/// `claude --version` is one cached subprocess gated by [`PluginState::cc_version`]).
+/// The one verb per fix, used identically in the detail's dim `f  <verb>` line
+/// and the footer's `f <verb>` hint. One verb per fix, never the bracketed
+/// `[f] repair credentials` anti-pattern.
+pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
+    match fix {
+        ServiceFix::WireMcpServers => "wire mcp server",
+        ServiceFix::InstallPlugin => "install plugin",
+        ServiceFix::HealHerdrConfig(_) => "heal herdr config",
+    }
+}
+
+/// The `f  <verb>` detail line for a fix.
+pub(crate) fn fix_line(fix: &ServiceFix) -> String {
+    format!("f  {}", fix_verb(fix))
+}
+
+/// UI-thread-only state for the Services tab. Recomputed synchronously on tab
+/// focus and on `r`; there is no background thread (all reads are local
+/// FS/`PATH`; `claude --version` is one cached subprocess gated by
+/// [`ServicesState::cc_version`]).
 #[derive(Debug)]
-pub(crate) struct PluginState {
-    pub(crate) focus: PluginFocus,
-    /// Cursor over the integration checks (`0..checks.len()`).
+pub(crate) struct ServicesState {
+    pub(crate) focus: ServicesFocus,
+    /// Cursor over the service rows (`0..checks.len()`).
     pub(crate) cursor: usize,
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
@@ -1464,13 +1487,14 @@ pub(crate) struct PluginState {
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
-    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction in
-    /// herdr mode (`HERDR_ENV=1` proves herdr is present) and re-probed on `r`;
+    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction on
+    /// the first herdr landing only (`HERDR_ENV=1` proves herdr is present), else
+    /// only on `r`;
     /// it spawns three subprocesses, so a tab switch and the per-tick refresh
     /// reuse the cached value.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
-    /// delegates pane draws. Re-read on the same cadence as the checks, because
+    /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
     /// subscribe to and no event to wait for. Read-only: the TUI never writes
     /// this store, and never sweeps it.
@@ -1489,6 +1513,10 @@ pub(crate) struct PluginState {
     /// who re-derives it and misses by half. What binds is the order: single-
     /// digit ms in release, roughly ten times that in debug.
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the plugin detail's fixable problems ([`Check::problems`]).
+    /// While the plugin detail is descended, ↑↓ walks these instead of
+    /// scrolling the prose; `f` applies the focused one.
+    pub(crate) problem_cursor: usize,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
@@ -1502,19 +1530,16 @@ pub(crate) struct PluginState {
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
+    /// A pending first-herdr-launch landing: the cursor must land on the `herdr`
+    /// row the moment its probe resolves, even when the construction probe did
+    /// not. Cleared on landing, or when the user moves the cursor first.
+    pub(crate) land_on_herdr: bool,
 }
 
-/// Selector index the `herdr` check occupies once it renders: `about`,
-/// `mcp servers`, `plugin`, `herdr`, `runtime`. The landing row in herdr mode;
-/// when the construction probe does not resolve herdr, the same index rests
-/// on `runtime`, the last row — the cursor clamp in
-/// `recompute_plugin_checks` keeps it valid either way.
-const HERDR_SELECTOR_ROW: usize = 3;
-
-impl Default for PluginState {
+impl Default for ServicesState {
     fn default() -> Self {
         Self {
-            focus: PluginFocus::List,
+            focus: ServicesFocus::List,
             cursor: 0,
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
@@ -1525,15 +1550,17 @@ impl Default for PluginState {
             mcp_boot: None,
             herdr: None,
             delegates: Vec::new(),
+            problem_cursor: 0,
             herdr_options_cursor: 0,
             herdr_tag_draft: None,
             herdr_config: None,
+            land_on_herdr: false,
         }
     }
 }
 
-impl PluginState {
-    /// Total selectable rows (the integration checks).
+impl ServicesState {
+    /// Total selectable rows (the service rows).
     pub(crate) fn row_count(&self) -> usize {
         self.checks.len()
     }
@@ -1544,8 +1571,25 @@ impl PluginState {
     }
 
     /// The fix offered by the row under the cursor, if any.
-    pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
+    pub(crate) fn selected_fix(&self) -> Option<&ServiceFix> {
         self.selected_check().and_then(|check| check.fix.as_ref())
+    }
+
+    /// The fix `f` applies this frame: the list-focus fix, or — on the plugin
+    /// detail, whose problems walk — the focused problem's fix. The footer's
+    /// `f <verb>` and the dim `f  <verb>` detail line follow this.
+    pub(crate) fn focused_fix(&self) -> Option<&ServiceFix> {
+        match self.focus {
+            ServicesFocus::List => self.selected_fix(),
+            ServicesFocus::Detail => {
+                let check = self.selected_check()?;
+                if check.label == "plugin" {
+                    check.problems.get(self.problem_cursor).map(|p| &p.fix)
+                } else {
+                    self.selected_fix()
+                }
+            }
+        }
     }
 }
 
@@ -1876,7 +1920,7 @@ pub(crate) struct App {
     pub(crate) last_broken_verdict_sync: Option<Instant>,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
-    /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
+    /// carries a `[ herdr ]` tag and the TUI lands on the Services tab's herdr
     /// row. Read-only after construction — the mode is decided once at launch.
     pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
@@ -1976,8 +2020,8 @@ pub(crate) struct App {
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
 
-    /// Plugin tab state; UI-thread-only, recomputed on focus + `r` (no thread).
-    pub(crate) plugin: PluginState,
+    /// Services tab state; UI-thread-only, recomputed on focus + `r` (no thread).
+    pub(crate) services: ServicesState,
 
     /// Global token-usage stats read from `~/.claude` (stats-cache + recent
     /// transcript top-up); `None` until the loader posts its first result.
@@ -2065,9 +2109,10 @@ pub(crate) struct App {
     /// reconcile; <kbd>d</kbd> opens the resolver from it. In-memory only — a
     /// restart re-evaluates.
     pub(crate) divergence_pending: Option<DivergenceNotice>,
-    /// Throttle for the Plugin tab's per-tick live refresh (session counts + link
-    /// state); recompute fires at most once per `PLUGIN_REFRESH_INTERVAL`.
-    pub(crate) last_plugin_refresh: Instant,
+    /// Throttle for the Services tab's per-tick live refresh (job store +
+    /// wiring + herdr config); recompute fires at most once per
+    /// `SERVICES_REFRESH_INTERVAL`.
+    pub(crate) last_services_refresh: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
@@ -2446,7 +2491,7 @@ impl App {
             daemon_control_rx,
             daemon_control_tx,
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-            plugin: PluginState::default(),
+            services: ServicesState::default(),
             token_stats: None,
             tokens_failed: false,
             tokens_topping_up: false,
@@ -2474,7 +2519,7 @@ impl App {
             banner: None,
             last_divergence_check: Some(Instant::now()),
             divergence_pending: None,
-            last_plugin_refresh: Instant::now(),
+            last_services_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
             refresh_interval,
@@ -2534,7 +2579,7 @@ impl App {
     }
 
     /// Landing, applied at construction (before the first paint). The FIRST
-    /// herdr launch opens the Plugin tab with the herdr selector row under the
+    /// herdr launch opens the Services tab with the herdr selector row under the
     /// cursor and its detail pane descended, then marks the landing done in
     /// `[herdr] first_landing_done` — once, forever. Every other launch — a
     /// plain TUI, and herdr after the first — opens the top-level `home_tab`
@@ -2543,26 +2588,31 @@ impl App {
     /// each of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT`
     /// (2 s, worst case 6 s total) — so the landing row is real at first paint
     /// instead of waiting for `r`; later launches skip it like plain ones (the
-    /// probe stays `r`-gated), and the cursor clamp inside the recompute
-    /// below keeps the landing row valid when herdr does not resolve. The
-    /// `claude --version` probe stays `r`-gated: construction must not block
-    /// the first paint on a spawn. Nothing else changes — no key handling, no
-    /// focus stealing after construction.
+    /// probe stays `r`-gated), and a pending landing intent inside the
+    /// recompute re-lands on the herdr row by label when the construction
+    /// probe did not resolve it. The `claude --version` probe stays `r`-gated:
+    /// construction must not block the first paint on a spawn. The pending
+    /// intent can still move the cursor only on the recomputes before it lands;
+    /// an ↑↓ cursor move, ↵, or a tab switch clears it, so focus is never
+    /// stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
         let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
         if first_landing {
-            self.tab = Tab::Plugin;
-            self.plugin.cursor = HERDR_SELECTOR_ROW;
-            self.plugin.focus = PluginFocus::Detail;
+            self.tab = Tab::Services;
+            // Land on the herdr row by label once its probe resolves. The
+            // recompute below selects it when the construction probe already
+            // did; when it did not (or the probe is skipped under test), the
+            // intent stays pending until a later `r` resolves herdr.
+            self.services.land_on_herdr = true;
             // Skipped under test (a spawned probe would read the real
             // registry); the landing test injects the probe instead.
-            self.plugin.herdr = Some(if cfg!(test) {
+            self.services.herdr = Some(if cfg!(test) {
                 None
             } else {
                 crate::herdr::probe()
             });
-            recompute_plugin_checks(&mut self, false);
+            recompute_services_checks(&mut self, false);
             {
                 let mut cfg = self.config();
                 cfg.state.herdr.first_landing_done = true;
@@ -3290,7 +3340,7 @@ pub(super) fn reconcile_startup(app: &mut App) {
 // ── Event handling ────────────────────────────────────────────────────────────
 
 /// True while `app.tab`'s descend/ascend sub-focus screen is active (Setup's
-/// Actions pane, Fallback's Detail pane, Status/Plugin's Detail pane, Tokens'
+/// Actions pane, Fallback's Detail pane, Status/Services' Detail pane, Tokens'
 /// Models view) — the state where `q`/`esc` ascend instead of arming quit /
 /// no-op. Single source of truth shared by the `q` handler and the footer's
 /// `q back` / `q quit` label; the help-modal esc-row test iterates it too, so
@@ -3299,7 +3349,7 @@ pub(crate) fn has_sub_focus(app: &App) -> bool {
     (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
         || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
-        || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
+        || (app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail)
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
 }
 
@@ -3325,7 +3375,7 @@ pub(crate) enum KeyOwner {
     ContextNudge,
     /// The Config tab's `weekly limit` custom-value field.
     WeeklyThreshold,
-    /// The Plugin tab's herdr tag-refresh field.
+    /// The Services tab's herdr tag-refresh field.
     HerdrTag,
 }
 
@@ -3368,14 +3418,14 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
         Tab::Config if app.refresh_interval_draft.is_some() => Some(KeyOwner::RefreshInterval),
         Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
         Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
-        Tab::Plugin if app.plugin.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Services if app.services.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
         Tab::Overview
         | Tab::Usage
         | Tab::Tokens
         | Tab::Fallback
         | Tab::Config
         | Tab::Status
-        | Tab::Plugin => None,
+        | Tab::Services => None,
     }
 }
 
@@ -3467,10 +3517,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 trigger_status_refresh(app);
                 return;
             }
-            // Plugin checks re-run synchronously; `r` also re-probes `claude --version`.
-            if app.tab == Tab::Plugin {
-                recompute_plugin_checks(app, true);
-                app.toast(ToastKind::Info, "re-running plugin checks");
+            // Service checks re-run synchronously; `r` also re-probes `claude --version`.
+            if app.tab == Tab::Services {
+                recompute_services_checks(app, true);
+                app.toast(ToastKind::Info, "re-running service checks");
                 return;
             }
             if app.tab == Tab::Tokens {
@@ -3515,8 +3565,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
-            } else if app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail {
-                app.plugin.focus = PluginFocus::List;
+            } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+                app.services.focus = ServicesFocus::List;
             } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
                 app.token_view = TokenView::Dashboard;
             }
@@ -3534,8 +3584,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     leave_fallback_detail(app);
                 } else if app.tab == Tab::Tokens {
                     app.token_view = TokenView::Dashboard;
-                } else if app.tab == Tab::Plugin {
-                    app.plugin.focus = PluginFocus::List;
+                } else if app.tab == Tab::Services {
+                    app.services.focus = ServicesFocus::List;
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -3575,7 +3625,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Fallback => handle_fallback_key(app, key),
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
-        Tab::Plugin => handle_plugin_key(app, key),
+        Tab::Services => handle_services_key(app, key),
     }
 }
 
@@ -3689,6 +3739,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
+    // Leaving the Services tab cancels a still-pending herdr landing: the user
+    // has moved on, so a later recompute must not yank the cursor back.
+    app.services.land_on_herdr = false;
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
@@ -3721,16 +3774,16 @@ fn switch_tab(app: &mut App, tab: Tab) {
             // Keep the incident cursor; reset focus to the list per the contract.
             app.status.focus = StatusFocus::List;
         }
-        Tab::Plugin => {
-            app.plugin.focus = PluginFocus::List;
-            app.plugin.cursor = 0;
-            app.plugin.detail_scroll = 0;
+        Tab::Services => {
+            app.services.focus = ServicesFocus::List;
+            app.services.cursor = 0;
+            app.services.detail_scroll = 0;
             // Entering the tab clears an open tag editor the same way the
             // Config tab clears its drafts; `switch_tab` matches the
             // destination, so the clear runs on entry, not on exit.
-            app.plugin.herdr_tag_draft = None;
+            app.services.herdr_tag_draft = None;
             // Recompute on focus; the cached `claude --version` is not re-probed.
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
     }
 }
@@ -3831,52 +3884,71 @@ fn trigger_status_refresh(app: &mut App) {
     app.toast(ToastKind::Info, "refreshing status");
 }
 
-/// Plugin tab keymap. List focus: ↑↓ moves the cursor (wrapping over both
-/// groups), ⏎ descends to the detail pane, `f` applies the selected row's fix.
-/// Detail focus: the herdr detail walks its focusable options rows, every
-/// other detail scrolls (clamped by the render pass); `f` still fixes.
-fn handle_plugin_key(app: &mut App, key: KeyEvent) {
-    match app.plugin.focus {
-        PluginFocus::List => {
-            let len = app.plugin.row_count();
+/// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
+/// to the detail pane (the `delegates` detail binds no key, so ⏎ does not
+/// descend into it), `f` applies the selected row's fix. Detail focus: the
+/// plugin detail walks its fixable problems, the herdr detail walks its
+/// options rows, every other detail scrolls (clamped by the render pass);
+/// `f` still fixes the focused problem.
+fn handle_services_key(app: &mut App, key: KeyEvent) {
+    match app.services.focus {
+        ServicesFocus::List => {
+            let len = app.services.row_count();
             match key.code {
                 KeyCode::Up if len > 0 => {
-                    app.plugin.cursor = (app.plugin.cursor + len - 1) % len;
-                    app.plugin.detail_scroll = 0;
+                    app.services.cursor = (app.services.cursor + len - 1) % len;
+                    app.services.detail_scroll = 0;
+                    app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
-                    app.plugin.cursor = (app.plugin.cursor + 1) % len;
-                    app.plugin.detail_scroll = 0;
+                    app.services.cursor = (app.services.cursor + 1) % len;
+                    app.services.detail_scroll = 0;
+                    app.services.land_on_herdr = false;
                 }
                 KeyCode::Enter if len > 0 => {
-                    app.plugin.focus = PluginFocus::Detail;
-                    app.plugin.detail_scroll = 0;
+                    // The user has acted: any still-pending herdr landing is
+                    // cancelled, whether or not this descends.
+                    app.services.land_on_herdr = false;
+                    // The delegates detail binds no key, so it never takes
+                    // pane focus.
+                    if !app
+                        .services
+                        .selected_check()
+                        .is_some_and(|c| c.label == "delegates")
+                    {
+                        app.services.focus = ServicesFocus::Detail;
+                        app.services.detail_scroll = 0;
+                    }
                 }
-                KeyCode::Char('f') => apply_plugin_fix(app),
+                KeyCode::Char('f') => apply_service_fix(app),
                 _ => {}
             }
         }
-        PluginFocus::Detail => {
-            if app
-                .plugin
-                .selected_check()
-                .is_some_and(|c| c.label == "herdr")
-            {
+        ServicesFocus::Detail => {
+            let label = app.services.selected_check().map(|c| c.label);
+            if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
+            } else if label == Some("plugin")
+                && app
+                    .services
+                    .selected_check()
+                    .is_some_and(|c| !c.problems.is_empty())
+            {
+                handle_plugin_problems_key(app, key);
             } else {
                 match key.code {
                     KeyCode::Up => {
                         // Clamp before stepping — see the Status detail pane's ↑ arm.
-                        let max = app.plugin.detail_max_scroll.get();
-                        app.plugin.detail_scroll =
-                            app.plugin.detail_scroll.min(max).saturating_sub(1);
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll =
+                            app.services.detail_scroll.min(max).saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        let max = app.plugin.detail_max_scroll.get();
-                        app.plugin.detail_scroll =
-                            app.plugin.detail_scroll.saturating_add(1).min(max);
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll =
+                            app.services.detail_scroll.saturating_add(1).min(max);
                     }
-                    KeyCode::Char('f') => apply_plugin_fix(app),
+                    KeyCode::Char('f') => apply_service_fix(app),
                     _ => {}
                 }
             }
@@ -3884,14 +3956,36 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Apply the selected row's fix. `WireMcpServers` opens a confirm modal; a
-/// diverged active profile re-raises the existing 3-way divergence resolver.
-fn apply_plugin_fix(app: &mut App) {
-    let Some(fix) = app.plugin.selected_fix().cloned() else {
+/// The plugin detail's problem walk: ↑↓ moves over the fixable problems
+/// (wrapping), `f` applies the focused one. The render keeps the focused line
+/// on screen; there is no manual scroll offset to maintain here.
+fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
+    let len = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0);
+    match key.code {
+        KeyCode::Up if len > 0 => {
+            app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
+        }
+        KeyCode::Down if len > 0 => {
+            app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
+        }
+        KeyCode::Char('f') => apply_service_fix(app),
+        _ => {}
+    }
+}
+
+/// Apply the focused fix. `WireMcpServers` opens a confirm modal; a diverged
+/// active profile's repair lives on the divergence resolver's own `d` prompt,
+/// never on this tab.
+fn apply_service_fix(app: &mut App) {
+    let Some(fix) = app.services.focused_fix().cloned() else {
         return;
     };
     match fix {
-        PluginFix::WireMcpServers => {
+        ServiceFix::WireMcpServers => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: "wire clauth into claude code's mcpServers?".to_string(),
@@ -3903,22 +3997,7 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::WireMcpServers,
             }));
         }
-        PluginFix::RepairDivergence(name) => {
-            app.disarm_quit();
-            open_divergence_modal(app, &name);
-        }
-        PluginFix::RelinkCredentials(name) => {
-            app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("relink ~/.claude credentials to '{name}'?"),
-                detail: Some(
-                    "re-points .credentials.json at the account's own stored tokens; spends nothing.".to_string(),
-                ),
-                choice: false,
-                on_confirm: ConfirmAction::RelinkCredentials(name),
-            }));
-        }
-        PluginFix::HealHerdrConfig(path) => {
+        ServiceFix::HealHerdrConfig(path) => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: "add the keybinding and sidebar row to herdr's config?".to_string(),
@@ -3929,7 +4008,7 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
-        PluginFix::InstallPlugin => {
+        ServiceFix::InstallPlugin => {
             app.disarm_quit();
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: "install the clauth plugin into claude code?".to_string(),
@@ -3949,12 +4028,12 @@ fn apply_plugin_fix(app: &mut App) {
 /// still applies the check's fix. Only the herdr detail routes here — every
 /// other detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
-    let cursor = app.plugin.herdr_options_cursor;
+    let cursor = app.services.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
-        KeyCode::Up => app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows,
-        KeyCode::Down => app.plugin.herdr_options_cursor = (cursor + 1) % rows,
-        KeyCode::Char('f') => apply_plugin_fix(app),
+        KeyCode::Up => app.services.herdr_options_cursor = (cursor + rows - 1) % rows,
+        KeyCode::Down => app.services.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Char('f') => apply_service_fix(app),
         KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
         KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
         KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
@@ -3994,13 +4073,13 @@ fn activate_herdr_option(app: &mut App, row: HerdrOption) {
 /// no config path) and `parsed == false` both read as not writable. Shared by
 /// the key handler and the render so the inert row and the no-op key agree.
 pub(crate) fn herdr_config_writable(app: &App) -> bool {
-    app.plugin.herdr_config.as_ref().is_some_and(|c| c.parsed)
+    app.services.herdr_config.as_ref().is_some_and(|c| c.parsed)
 }
 
 /// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
 /// every other row.
 fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
-    if HERDR_OPTIONS[app.plugin.herdr_options_cursor] != HerdrOption::TagRefresh {
+    if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
         return;
     }
     {
@@ -4118,16 +4197,16 @@ fn cycle_herdr_popup_width(app: &mut App) {
 /// refresh-interval editor's mechanism.
 fn begin_herdr_tag_edit(app: &mut App) {
     let secs = app.config().state.herdr.tag_watch_secs;
-    app.plugin.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+    app.services.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
 }
 
 /// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
 fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.plugin.herdr_tag_draft = None,
+        KeyCode::Esc => app.services.herdr_tag_draft = None,
         KeyCode::Enter => commit_herdr_tag_edit(app),
         _ => {
-            if let Some(input) = app.plugin.herdr_tag_draft.as_mut() {
+            if let Some(input) = app.services.herdr_tag_draft.as_mut() {
                 apply_input_edit(input, key);
             }
         }
@@ -4137,7 +4216,7 @@ fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
 /// draft open so the inline Invalid-input treatment stays on screen — no toast.
 fn commit_herdr_tag_edit(app: &mut App) {
-    let Some(raw) = app.plugin.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
+    let Some(raw) = app.services.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
         return;
     };
     let Some(secs) = parse_herdr_tag_secs(raw) else {
@@ -4149,7 +4228,7 @@ fn commit_herdr_tag_edit(app: &mut App) {
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
-    app.plugin.herdr_tag_draft = None;
+    app.services.herdr_tag_draft = None;
 }
 
 /// A typed tag-refresh value is valid only as a whole number of seconds, at
@@ -4161,11 +4240,11 @@ pub(crate) fn parse_herdr_tag_secs(raw: &str) -> Option<u64> {
 
 /// Open the confirm before flipping `delegate row text`: the flip rewrites
 /// herdr's own config (the row `clauth herdr install` appended), so it carries
-/// the same confirm gate as the `[f]` heal. The copy names the delegate token
+/// the same confirm gate as the heal fix. The copy names the delegate token
 /// so the confirm says what it will write; cancel is the default choice.
 fn open_herdr_row_text_confirm(app: &mut App) {
     let Some(path) = app
-        .plugin
+        .services
         .herdr
         .as_ref()
         .and_then(|probe| probe.as_ref())
@@ -4217,7 +4296,7 @@ fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
     }
 }
 
-/// The Plugin tab's `herdr` row: the installed herdr's clauth plugin plus the
+/// The Services tab's `herdr` row: the installed herdr's clauth plugin plus the
 /// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
 /// logic unit-tests without an `App`; the caller supplies the probe and the
 /// config readout (`None` when the config file could not be read at all).
@@ -4233,7 +4312,8 @@ pub(crate) fn herdr_check(
 
     let mut danger = false;
     let mut warn = false;
-    let mut fix = None;
+    let mut fixed = None;
+    let mut problems: Vec<Problem> = Vec::new();
 
     // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
     if let Some(error) = &probe.error {
@@ -4300,8 +4380,17 @@ pub(crate) fn herdr_check(
 
         if parsed && (config.and_then(|c| c.bound_key.as_deref()).is_none() || !templated) {
             detail.push(String::new());
-            detail.push("[f] add the keybinding and sidebar row to herdr's config".to_string());
-            fix = probe.config_path.clone().map(PluginFix::HealHerdrConfig);
+            detail.push("adds the keybinding and sidebar row to herdr's config".to_string());
+            let line = detail.len();
+            let fix = probe.config_path.clone().map(ServiceFix::HealHerdrConfig);
+            if let Some(f) = &fix {
+                detail.push(fix_line(f));
+                problems.push(Problem {
+                    line,
+                    fix: f.clone(),
+                });
+            }
+            fixed = fix;
         }
     } else if probe.error.is_none() {
         warn = true;
@@ -4322,88 +4411,42 @@ pub(crate) fn herdr_check(
         label: "herdr",
         health,
         detail,
-        fix,
+        fix: fixed,
+        problems,
     }
 }
 
-/// Recompute the Plugin tab's integration checks; the last (`runtime`) folds every
-/// profile into one summary. Every read is a local FS/`PATH` check; `claude
-/// --version` runs only when `refresh_version` is set or the cached result is
-/// absent. Synchronous — no background thread.
-fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
+/// Recompute the Services tab's rows: `delegates` (its detail is the job list),
+/// `plugin` (the four integration readouts in one detail), `herdr`.
+/// Every read is a local FS/`PATH` check; `claude --version` runs only when
+/// `refresh_version` is set or the cached result is absent. Synchronous — no
+/// background thread.
+fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     use crate::plugin_probe as probe;
 
-    app.plugin.error = None;
+    app.services.error = None;
 
     // CC version is cached; only `r` probes. Construction and a tab switch
     // leave it unprobed rather than spawning `claude --version` synchronously
     // — construction must not block the first paint. Skipped under test so
     // the suite never spawns the real `claude` binary.
     if refresh_version {
-        app.plugin.fetching = true;
-        app.plugin.cc_version = Some(if cfg!(test) {
+        app.services.fetching = true;
+        app.services.cc_version = Some(if cfg!(test) {
             None
         } else {
             probe::cc_version()
         });
-        app.plugin.fetching = false;
+        app.services.fetching = false;
     }
-
-    let mut checks: Vec<Check> = Vec::with_capacity(4);
-
-    // about — clauth's data dir + PATH resolution (CC spawns `clauth mcp` by
-    // name, so resolution is load-bearing) and the Claude Code version. Combined
-    // health: clauth missing is danger (server can't start), CC missing is warn.
-    let clauth_path = probe::on_path("clauth");
-    let mut about_detail = vec![format!(
-        "data: {}",
-        crate::profile::clauth_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "\u{2014}".to_string())
-    )];
-    match &clauth_path {
-        Some(path) => about_detail.push(format!("path: {}", path.display())),
-        None => {
-            about_detail.push("path: not on PATH".to_string());
-            about_detail.push(
-                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
-            );
-            about_detail.push("install clauth so its bin directory is on PATH".to_string());
-        }
-    }
-    match &app.plugin.cc_version {
-        Some(Some(version)) => about_detail.push(format!("claude: {version}")),
-        Some(None) => {
-            about_detail.push("claude: not found".to_string());
-            about_detail.push("claude --version failed or claude is not on PATH".to_string());
-            about_detail.push("install claude code so the claude binary resolves".to_string());
-        }
-        // Unprobed is not missing: the probe is `r`-gated, so before the first
-        // `r` the row names the key that fills the line in instead of claiming
-        // a binary is absent.
-        None => about_detail.push("claude: press r to probe".to_string()),
-    }
-    checks.push(Check {
-        label: "about",
-        health: if clauth_path.is_none() {
-            Health::Danger
-        } else if matches!(app.plugin.cc_version, Some(None)) {
-            // Probed and missing is the only version verdict that warns; an
-            // unprobed version is not evidence of anything.
-            Health::Warn
-        } else {
-            Health::Ok
-        },
-        detail: about_detail,
-        fix: None,
-    });
 
     // `clauth mcp` boot self-probe — `r`-gated only (heavier than the other reads:
     // it spawns the real server). Cleared when clauth no longer resolves so a stale
     // "boots" can't linger. Skipped under test so the suite never boots the server.
+    let clauth_path = probe::on_path("clauth");
     if refresh_version {
-        app.plugin.fetching = true;
-        app.plugin.mcp_boot = if clauth_path.is_some() {
+        app.services.fetching = true;
+        app.services.mcp_boot = if clauth_path.is_some() {
             Some(if cfg!(test) {
                 probe::McpProbe::Ok
             } else {
@@ -4412,27 +4455,173 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         } else {
             None
         };
-        app.plugin.fetching = false;
+        app.services.fetching = false;
     }
-    let mcp_boot = app.plugin.mcp_boot.clone();
 
     // herdr probe — three subprocesses, so it is `r`-gated like `mcp_boot`.
     // Skipped under test rather than set to a fixed value, so a test that
     // injected a probe keeps it.
     if refresh_version && !cfg!(test) {
-        app.plugin.herdr = Some(crate::herdr::probe());
+        app.services.herdr = Some(crate::herdr::probe());
     }
 
-    // "global" == active in every project: a CC `user`-scope plugin install. A
-    // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    // The delegates detail names the profiles whose delegate traffic is
+    // rate-limited. Snapshot the names under the config lock, then read each
+    // profile's throughput cache outside it.
+    let now_secs = (crate::usage::now_ms() / 1000) as i64;
+    let profile_names: Vec<crate::profile::ProfileName> = {
+        let cfg = app.config();
+        cfg.profiles.iter().map(|p| p.name.clone()).collect()
+    };
+    let rate_limited: Vec<String> = profile_names
+        .iter()
+        .filter(|name| {
+            crate::throughput::summary(name, now_secs)
+                .iter()
+                .any(|t| t.rate_limited_recent)
+        })
+        .map(|name| name.to_string())
+        .collect();
+
+    // delegates row — the job store is also its detail, so read it first and
+    // derive the dot from what it holds now, not the previous tick's.
+    app.services.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
+    checks.push(delegates_check(&app.services.delegates, &rate_limited));
+
+    // plugin row — the folded readout, over the cached probes + the PATH read.
+    checks.push(plugin_check(
+        clauth_path.as_deref(),
+        app.services.cc_version.clone(),
+        app.services.mcp_boot.clone(),
+    ));
+
+    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
+    // The probe is cached (`r`-gated, three subprocesses); the config read is a
+    // cheap `fs::read_to_string` that rides the tick, using the path the probe
+    // already resolved. No row when herdr does not resolve or was never probed.
+    if let Some(Some(probe)) = &app.services.herdr {
+        let config = probe
+            .config_path
+            .as_deref()
+            .map(crate::herdr::read_config)
+            .and_then(Result::ok)
+            .map(|text| crate::herdr::config_status(&text));
+        checks.push(herdr_check(probe, config.as_ref()));
+        // The options section reads this verdict (writable vs inert) off the
+        // cache — recompute already paid for the file read, so neither the
+        // render nor the key handler re-reads per frame.
+        app.services.herdr_config = config;
+    } else {
+        // No herdr row renders without a probe, so its verdict must not
+        // outlive the probe (a stale writable verdict would arm the
+        // delegate-row confirm against a file that no longer resolves).
+        app.services.herdr_config = None;
+    }
+
+    app.services.checks = checks;
+
+    // Keep the cursors in range after the row/problem sets change.
+    let max = app.services.row_count().saturating_sub(1);
+    if app.services.cursor > max {
+        app.services.cursor = max;
+    }
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0)
+        .saturating_sub(1);
+    if app.services.problem_cursor > problems {
+        app.services.problem_cursor = problems;
+    }
+
+    // A pending herdr landing (first herdr launch whose construction probe did
+    // not resolve) selects the herdr row the moment it appears — by label, not
+    // by a stale index — and descends into its detail. The intent clears on
+    // landing; when herdr still does not resolve, the cursor parks on the last
+    // row and the intent survives for the next recompute.
+    if app.services.land_on_herdr {
+        if let Some(idx) = app.services.checks.iter().position(|c| c.label == "herdr") {
+            app.services.cursor = idx;
+            app.services.focus = ServicesFocus::Detail;
+            app.services.land_on_herdr = false;
+        } else {
+            app.services.cursor = app.services.row_count().saturating_sub(1);
+        }
+    }
+}
+
+/// The `delegates` row: a selector whose detail is the job list. Green while a
+/// job runs (running or blocking), dim when none — finished and orphaned rows
+/// are not a running job. A profile's rate-limited delegate traffic names
+/// itself in the detail; it never moves the dot (the dot is the two-state
+/// running/none signal).
+pub(crate) fn delegates_check(
+    stored: &[crate::mcp::jobs::StoredJob],
+    rate_limited: &[String],
+) -> Check {
+    use crate::mcp::jobs::JobPhase;
+    let running = stored
+        .iter()
+        .any(|j| matches!(j.phase(), JobPhase::Running | JobPhase::Blocking));
+    let mut detail = Vec::new();
+    if !rate_limited.is_empty() {
+        detail.push(format!(
+            "delegate: rate-limited ({})",
+            rate_limited.join(", ")
+        ));
+    }
+    Check {
+        label: "delegates",
+        health: if running { Health::Ok } else { Health::Idle },
+        detail,
+        fix: None,
+        problems: Vec::new(),
+    }
+}
+
+/// The `plugin` row: one detail holding clauth on PATH (+ the data dir), the
+/// mcpServers wiring (+ the `r`-gated boot probe), the plugin install, then the
+/// Claude Code version. Health is the worst of the four; the fixable problems
+/// walk in the same order. `clauth_path` is passed in (the recompute also gates
+/// the boot probe on it) so the verdict logic unit-tests without a live `PATH`.
+fn plugin_check(
+    clauth_path: Option<&std::path::Path>,
+    cc_version: Option<Option<String>>,
+    mcp_boot: Option<crate::plugin_probe::McpProbe>,
+) -> Check {
+    use crate::plugin_probe as probe;
+
+    let mut detail: Vec<String> = Vec::new();
+    let mut health = Health::Ok;
+
+    // clauth on PATH + the data dir.
+    detail.push(format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    ));
+    match &clauth_path {
+        Some(path) => detail.push(format!("path: {}", path.display())),
+        None => {
+            detail.push("path: not on PATH".to_string());
+            detail.push(
+                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
+            );
+            detail.push("install clauth so its bin directory is on PATH".to_string());
+            health = worst(health, Health::Danger);
+        }
+    }
+
+    // mcpServers wiring + boot probe. "global" == active in every project: a CC
+    // `user`-scope plugin install. A `local`/`project` install (or a `./.mcp.json`)
+    // binds clauth to one repo.
     let records = probe::installed_records();
     let installed = !records.is_empty();
     let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
-
-    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
-    // Globally wired = a `user`-scope plugin or the `~/.claude.json` entry; a
-    // project-scope plugin or a `./.mcp.json` wires this repo only, so it warns and
-    // offers the same global write fix as a missing wiring does.
     let wiring = probe::manual_mcp_wiring();
     let wired = installed || wiring != probe::McpWiring::None;
     let manual_global = wiring == probe::McpWiring::GlobalConfig;
@@ -4444,53 +4633,57 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let globally_wired = plugin_global || (manual_global && !drifted);
     let project_only = wired && !globally_wired && !drifted;
     let source = if plugin_global {
-        "source: plugin install (user)"
+        "mcp source: plugin install (user)"
     } else if manual_global {
-        "source: ~/.claude.json (manual)"
+        "mcp source: ~/.claude.json (manual)"
     } else if installed {
-        "source: plugin install (project)"
+        "mcp source: plugin install (project)"
     } else if wiring == probe::McpWiring::ProjectFile {
-        "source: ./.mcp.json (manual)"
+        "mcp source: ./.mcp.json (manual)"
     } else {
-        "source: none"
+        "mcp source: none"
     };
-    let mut mcp_detail = vec![
-        format!("present: {}", if wired { "yes" } else { "no" }),
-        source.to_string(),
-    ];
+    detail.push(format!("mcp wired: {}", if wired { "yes" } else { "no" }));
+    detail.push(source.to_string());
     match &mcp_boot {
-        Some(probe::McpProbe::Ok) => mcp_detail.push("server: boots".to_string()),
+        Some(probe::McpProbe::Ok) => detail.push("mcp server: boots".to_string()),
         Some(probe::McpProbe::Failed(reason)) => {
-            mcp_detail.push(format!("server: failed ({reason})"));
+            detail.push(format!("mcp server: failed ({reason})"));
         }
         None => {}
     }
     let needs_wire = !globally_wired || drifted;
-    if needs_wire {
-        mcp_detail.push(String::new());
-        if drifted {
-            mcp_detail.push("entry doesn't match the current launch line".to_string());
-        } else if project_only {
-            mcp_detail.push("wired for this project only, not global".to_string());
-        }
-        mcp_detail.push("[f] wire mcpServers into ~/.claude.json".to_string());
-    }
     let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
-    checks.push(Check {
-        label: "mcp servers",
-        health: if boot_failed {
+    health = worst(
+        health,
+        if boot_failed {
             Health::Danger
         } else if needs_wire {
             Health::Warn
         } else {
             Health::Ok
         },
-        detail: mcp_detail,
-        fix: needs_wire.then_some(PluginFix::WireMcpServers),
-    });
+    );
+    let mut problems: Vec<Problem> = Vec::new();
+    if needs_wire {
+        detail.push(String::new());
+        if drifted {
+            detail.push("entry doesn't match the current launch line".to_string());
+        } else if project_only {
+            detail.push("wired for this project only, not global".to_string());
+        }
+        detail.push("writes the clauth entry into ~/.claude.json".to_string());
+        let line = detail.len();
+        detail.push(fix_line(&ServiceFix::WireMcpServers));
+        problems.push(Problem {
+            line,
+            fix: ServiceFix::WireMcpServers,
+        });
+    }
 
-    // plugin install record — installed-only verdict (CC exposes no clean per-scope
-    // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
+    // plugin install record — installed-only verdict (CC exposes no clean
+    // per-scope "enabled" boolean, so the row reports presence + scope, not
+    // enabled/disabled).
     let marketplace = probe::marketplace_known();
     // The operative record is the `user`-scope install when one exists; a stale
     // project/local row that sorts first must not name the install beside a
@@ -4499,9 +4692,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         .iter()
         .find(|r| r.scope.as_deref() == Some("user"))
         .or_else(|| records.first());
-    let plugin_check = if let Some(record) = record_for_check {
+    if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
-        let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
+        detail.push(format!("installed: yes ({})", scope.unwrap_or("?")));
         if let Some(version) = &record.version {
             detail.push(format!("version: {version}"));
         }
@@ -4524,279 +4717,82 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         if plugin_global {
-            Check {
-                label: "plugin",
-                health: Health::Ok,
-                detail,
-                fix: None,
-            }
+            health = worst(health, Health::Ok);
         } else {
             detail.push(String::new());
             detail.push("installed for this project only, not global".to_string());
-            detail.push("[f] install globally (user scope)".to_string());
-            Check {
-                label: "plugin",
-                health: Health::Warn,
-                detail,
-                fix: Some(PluginFix::InstallPlugin),
-            }
+            detail.push("installs at user scope".to_string());
+            let line = detail.len();
+            detail.push(fix_line(&ServiceFix::InstallPlugin));
+            problems.push(Problem {
+                line,
+                fix: ServiceFix::InstallPlugin,
+            });
+            health = worst(health, Health::Warn);
         }
     } else {
         let known = marketplace.is_some();
-        let mut detail = vec![format!(
+        detail.push(format!(
             "installed: no ({})",
             if known {
                 "marketplace known"
             } else {
                 "marketplace unknown"
             }
-        )];
+        ));
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("[f] install the clauth plugin".to_string());
-        Check {
-            label: "plugin",
-            health: Health::Warn,
-            detail,
-            fix: Some(PluginFix::InstallPlugin),
-        }
-    };
-    checks.push(plugin_check);
+        detail.push("installs at user scope".to_string());
+        let line = detail.len();
+        detail.push(fix_line(&ServiceFix::InstallPlugin));
+        problems.push(Problem {
+            line,
+            fix: ServiceFix::InstallPlugin,
+        });
+        health = worst(health, Health::Warn);
+    }
 
-    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
-    // The probe is cached (`r`-gated, three subprocesses); the config read is a
-    // cheap `fs::read_to_string` that rides the tick, using the path the probe
-    // already resolved. No row when herdr does not resolve or was never probed.
-    if let Some(Some(probe)) = &app.plugin.herdr {
-        let config = probe
-            .config_path
-            .as_deref()
-            .map(crate::herdr::read_config)
-            .and_then(Result::ok)
-            .map(|text| crate::herdr::config_status(&text));
-        checks.push(herdr_check(probe, config.as_ref()));
-        // The options section reads this verdict (writable vs inert) off the
-        // cache — recompute already paid for the file read, so neither the
-        // render nor the key handler re-reads per frame.
-        app.plugin.herdr_config = config;
+    // Claude Code version, last.
+    match &cc_version {
+        Some(Some(version)) => detail.push(format!("claude: {version}")),
+        Some(None) => {
+            detail.push("claude: not found".to_string());
+            detail.push("claude --version failed or claude is not on PATH".to_string());
+            detail.push("install claude code so the claude binary resolves".to_string());
+            health = worst(health, Health::Warn);
+        }
+        // Unprobed is not missing: the probe is `r`-gated, so before the first
+        // `r` the row names the key that fills the line in instead of claiming
+        // a binary is absent.
+        None => detail.push("claude: press r to probe".to_string()),
+    }
+
+    // List-focus `f` fixes the first fixable problem shown, in the same order
+    // the detail walk presents them (wire, then install).
+    let fix = problems.first().map(|p| p.fix.clone());
+
+    Check {
+        label: "plugin",
+        health,
+        detail,
+        fix,
+        problems,
+    }
+}
+
+/// The more severe of two health buckets (Ok < Warn < Danger), for folding the
+/// plugin row's four sub-checks into one dot. `Idle` is neutral and never
+/// outranks a verdict.
+fn worst(a: Health, b: Health) -> Health {
+    use Health::{Danger, Warn};
+    if a == Danger || b == Danger {
+        Danger
+    } else if a == Warn || b == Warn {
+        Warn
     } else {
-        // No herdr row renders without a probe, so its verdict must not
-        // outlive the probe (a stale writable verdict would arm the
-        // delegate-row confirm against a file that no longer resolves).
-        app.plugin.herdr_config = None;
-    }
-
-    // runtime — fold every profile's live sessions / credential link / token
-    // freshness into one summary row. Snapshot the names under the config lock,
-    // then drop it before the FS reads (`classify_credentials_link`) so no lock
-    // is held across I/O.
-    struct Snap {
-        name: ProfileName,
-        active: bool,
-        expires_at: Option<i64>,
-    }
-    let snaps: Vec<Snap> = {
-        let cfg = app.config();
-        cfg.profiles
-            .iter()
-            .map(|p| Snap {
-                name: p.name.clone(),
-                active: cfg.is_active(&p.name),
-                expires_at: p.access_token_expires_at(),
-            })
-            .collect()
-    };
-
-    let now_secs = (crate::usage::now_ms() / 1000) as i64;
-    let total = snaps.len();
-    let mut live_sessions: usize = 0;
-    let mut live_profiles: usize = 0;
-    let mut live_names: Vec<String> = Vec::new();
-    let mut rate_limited_names: Vec<String> = Vec::new();
-    // The active profile's link readout plus the one fix it can offer. Divergence
-    // and missing-link are meaningful only for the active profile — its creds are
-    // the ones linked into ~/.claude — so non-active profiles only contribute
-    // their live-session and rate-limit signal.
-    let mut active_name: Option<String> = None;
-    let mut active_link = "\u{2014}";
-    let mut active_expires = "\u{2014}".to_string();
-    let mut active_fix: Option<PluginFix> = None;
-    let mut active_bad = false; // diverged / missing / unknown link
-
-    // `r` means re-probe everything, so it re-collects rather than rendering the
-    // age the tick left. Sited next to the read, not at the top: the version
-    // probe above spawns `claude`, and a tally taken before that is already as
-    // stale as the subprocess is slow.
-    if refresh_version {
-        app.last_live_sessions_refresh = None;
-        poll_live_sessions(app);
-    }
-
-    // Otherwise the tick's fleet tally, never a second sweep: this row and the
-    // Overview's `live` column answer one question, and two independent reads of
-    // it can disagree inside a frame.
-    let tally = &app.live_sessions;
-    for snap in snaps {
-        let instances = tally.member(&snap.name).sessions;
-        live_sessions += instances;
-        if instances > 0 {
-            live_profiles += 1;
-            live_names.push(if instances > 1 {
-                format!("{} · {instances}", snap.name)
-            } else {
-                snap.name.to_string()
-            });
-        }
-        // Observed delegate throughput (MCP `delegate`); a recent rate-limit on any
-        // exercised model warns even when the credential link is healthy.
-        let throughput = crate::throughput::summary(&snap.name, now_secs);
-        if throughput.iter().any(|t| t.rate_limited_recent) {
-            rate_limited_names.push(snap.name.to_string());
-        }
-
-        if !snap.active {
-            continue;
-        }
-        active_name = Some(snap.name.to_string());
-
-        // A classify error (broken symlink mid-read, perms) must not read as
-        // healthy: surface it as a warn with an `unknown` link label rather than
-        // silently dropping to idle/ok.
-        let link_result = classify_credentials_link(&snap.name);
-        let link = link_result.as_ref().ok().copied();
-        let link_err = link_result.is_err();
-        let diverged = matches!(link, Some(LinkState::Diverged));
-        let missing = matches!(link, Some(LinkState::Missing));
-        // A `missing` link is repairable only when the profile still holds stored
-        // creds to relink to; with none it needs a fresh login, not a relink.
-        let stored_creds = crate::claude::install_source_path(&snap.name)
-            .map(|p| p.exists())
-            .unwrap_or(false);
-
-        active_link = if link_err {
-            "unknown"
-        } else {
-            match link {
-                Some(LinkState::LinkedTo) => "linked",
-                Some(LinkState::Diverged) => "diverged",
-                Some(LinkState::Missing) => "missing",
-                None => "\u{2014}",
-            }
-        };
-        active_bad = link_err || diverged || missing;
-        active_fix = if diverged {
-            Some(PluginFix::RepairDivergence(snap.name.to_string()))
-        } else if missing && stored_creds {
-            Some(PluginFix::RelinkCredentials(snap.name.to_string()))
-        } else {
-            None
-        };
-        // Access-token freshness as a relative span; `—` when no OAuth expiry is
-        // known (third-party / api-key profiles).
-        active_expires = match snap.expires_at {
-            Some(ms) => {
-                let secs = ms / 1000 - (crate::usage::now_ms() / 1000) as i64;
-                if secs <= 0 {
-                    "expired".to_string()
-                } else {
-                    crate::usage::humanize_duration(secs)
-                }
-            }
-            None => "\u{2014}".to_string(),
-        };
-    }
-
-    // Health: a bad active link (diverged/missing/unknown) or any recent delegate
-    // rate-limit warns; an active `linked` creds link or any live session is ok;
-    // otherwise the fleet is idle (neutral, not green).
-    let runtime_health = if active_bad || !rate_limited_names.is_empty() {
-        Health::Warn
-    } else if active_link == "linked" || live_sessions > 0 {
         Health::Ok
-    } else {
-        Health::Idle
-    };
-
-    let link_line = match &active_name {
-        Some(_) if active_expires != "\u{2014}" => format!("{active_link} · {active_expires}"),
-        Some(_) => active_link.to_string(),
-        None => "\u{2014}".to_string(),
-    };
-    // Runtime health only — config (type / model / overrides) lives on the Setup
-    // tab. This row answers "how many live sessions, is the active credential link
-    // healthy, and how fresh is its token?".
-    let mut runtime_detail = vec![format!("accounts: {total}")];
-    // A zero is hidden rather than printed, matching the Overview cell and the
-    // Fallback card — the row says nothing when there is nothing to say. `live`
-    // is the one noun every session-counting surface uses (the Overview column
-    // header, the Fallback card's key), so the figure reads the same everywhere.
-    if live_sessions > 0 {
-        runtime_detail.push(format!(
-            "live: {live_sessions} across {live_profiles} account{}",
-            crate::format::plural(live_profiles)
-        ));
-    }
-    // Name each account carrying a live session as an indented sub-line, so the
-    // spread is concrete rather than just a tally.
-    for name in &live_names {
-        runtime_detail.push(format!("  {name}"));
-    }
-    runtime_detail.push(format!(
-        "active: {}",
-        active_name.as_deref().unwrap_or("\u{2014}")
-    ));
-    runtime_detail.push(format!("link: {link_line}"));
-    if !rate_limited_names.is_empty() {
-        // "rate-limited" sits in the value so `value_tone` warns on it (the key is
-        // a plain label).
-        runtime_detail.push(format!(
-            "delegate: rate-limited ({})",
-            rate_limited_names.join(", ")
-        ));
-    }
-    match &active_fix {
-        Some(PluginFix::RepairDivergence(_)) => {
-            runtime_detail.push(String::new());
-            runtime_detail.push("[f] repair credentials".to_string());
-        }
-        Some(PluginFix::RelinkCredentials(_)) => {
-            runtime_detail.push(String::new());
-            runtime_detail.push("[f] relink credentials".to_string());
-        }
-        // The other fixes are produced on their own check rows (wire / herdr /
-        // install), never on this one; `None` is a healthy or inactive link.
-        // Named, so a new `PluginFix` variant fails the build instead of a
-        // silent no-op.
-        Some(
-            PluginFix::WireMcpServers | PluginFix::HealHerdrConfig(_) | PluginFix::InstallPlugin,
-        ) => {}
-        None => {}
-    }
-    checks.push(Check {
-        label: "runtime",
-        health: runtime_health,
-        detail: runtime_detail,
-        fix: active_fix,
-    });
-
-    app.plugin.checks = checks;
-
-    // The delegates pane's data. Read here rather than on its own timer so it
-    // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
-    // tick while focused) — a `clauth mcp` run is a different process, so a
-    // watcher would buy freshness this tab has never promised.
-    //
-    // `list_banded`, the same call `clauth jobs` and `monitor`'s listing make,
-    // so the pane's row order is not a second derivation of one. It arrives
-    // banded and the renderer sorts nothing.
-    app.plugin.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
-
-    // Keep the cursor in range after the check set changes.
-    let max = app.plugin.row_count().saturating_sub(1);
-    if app.plugin.cursor > max {
-        app.plugin.cursor = max;
     }
 }
 
@@ -7094,8 +7090,8 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
-        // Plugin: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
-        Tab::Plugin => {}
+        // Services: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        Tab::Services => {}
     }
     // Every tab: the daemon verb that applies, none while one is in flight.
     if !app.daemon_control_busy {
@@ -9785,7 +9781,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 
 /// Run `crate::herdr::heal` with the knob the state now holds and surface the
 /// outcome: success, non-empty refusal notes (warning), or failure (danger).
-/// Shared by the `[f]` fix and the `delegate row text` options row — the knob
+/// Shared by the heal fix and the `delegate row text` options row — the knob
 /// rides the heal the way `install` reads it, so the row written matches the
 /// `delegate_row_text` set in the TUI.
 fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
@@ -9808,7 +9804,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                     if delegate_row_text { "on" } else { "off" }
                 ),
             );
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
         Ok(notes) => {
             // Non-empty notes = pieces clauth refused to touch (a table it
@@ -9818,7 +9814,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                 ToastKind::Warning,
                 format!("herdr's config needs attention\n{}", notes.join("\n")),
             );
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
         Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
     }
@@ -9986,24 +9982,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
                     // Reflect the new wiring in the rows without a fresh version probe.
-                    recompute_plugin_checks(app, false);
+                    recompute_services_checks(app, false);
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
-            }
-        }
-        ConfirmAction::RelinkCredentials(name) => {
-            let name = ProfileName::from(name);
-            match force_link_profile_credentials(&name) {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.refresh_unsaved_live_login();
-                    app.toast(
-                        ToastKind::Success,
-                        format!("relinked credentials to '{name}'"),
-                    );
-                    recompute_plugin_checks(app, false);
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
             }
         }
         ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
@@ -10030,7 +10011,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     ToastKind::Warning,
                     "plugin install made no changes\ninstall claude code first, then try again",
                 );
-                recompute_plugin_checks(app, false);
+                recompute_services_checks(app, false);
             }
             // Installed / Repaired / Adopted / Updated, or anything agentgear
             // adds later: a real change happened, so the success toast is
@@ -10039,7 +10020,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(outcome) => {
                 app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
                 // Reflect the fresh install in the rows without a version probe.
-                recompute_plugin_checks(app, false);
+                recompute_services_checks(app, false);
             }
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
@@ -10852,12 +10833,10 @@ pub(crate) fn on_tick(app: &mut App) {
     maybe_spawn_bootstrap(app);
 
     poll_credentials_divergence(app);
-    // Before the plugin refresh, which folds the tally into its runtime row and
-    // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
     sync_broken_verdicts(app);
     poll_codex_rows(app);
-    poll_plugin_refresh(app);
+    poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
 
@@ -10925,12 +10904,11 @@ fn poll_daemon_health(app: &mut App) {
 }
 
 /// Re-tally the live-session registry for the Overview `live` column, the
-/// Fallback member card, the Plugin tab's `runtime` row and the header's fleet
-/// count, at most once a second — a readdir plus an `open` + `try_lock` per
-/// row is cheap but not per-frame cheap, and a session starting or exiting is
-/// a human-timescale event. Ungated by tab: the header reads it on every tab,
-/// and a snapshot a second stale on arrival would show the wrong fleet for
-/// that second.
+/// Fallback member card and the header's fleet count, at most once a second —
+/// a readdir plus an `open` + `try_lock` per row is cheap but not per-frame
+/// cheap, and a session starting or exiting is a human-timescale event. Ungated
+/// by tab: the header reads it on every tab, and a snapshot a second stale on
+/// arrival would show the wrong fleet for that second.
 fn poll_live_sessions(app: &mut App) {
     const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -11026,21 +11004,22 @@ fn sync_broken_verdicts(app: &mut App) {
     }
 }
 
-/// Plugin tab live refresh: re-run the cheap local checks (session counts + link
-/// state) at most once per interval while the tab is focused and no modal is open,
-/// so a session started elsewhere shows up without a manual `r`. Never re-probes
-/// `claude --version` or `clauth mcp` — both stay `r`-gated.
-fn poll_plugin_refresh(app: &mut App) {
-    const PLUGIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Services tab live refresh: re-run the cheap local reads (job store, wiring,
+/// herdr config) at most once per interval while the tab is focused and no
+/// modal is open, so a delegate started elsewhere shows up without a manual
+/// `r`. Never re-probes `claude --version` or `clauth mcp` — both stay
+/// `r`-gated.
+fn poll_services_refresh(app: &mut App) {
+    const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
-    if app.tab != Tab::Plugin || !app.modals.is_empty() {
+    if app.tab != Tab::Services || !app.modals.is_empty() {
         return;
     }
-    if app.last_plugin_refresh.elapsed() < PLUGIN_REFRESH_INTERVAL {
+    if app.last_services_refresh.elapsed() < SERVICES_REFRESH_INTERVAL {
         return;
     }
-    app.last_plugin_refresh = Instant::now();
-    recompute_plugin_checks(app, false);
+    app.last_services_refresh = Instant::now();
+    recompute_services_checks(app, false);
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.

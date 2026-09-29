@@ -8,7 +8,7 @@
 
 mod digest;
 mod herdr_report;
-/// Reachable outside this module because the TUI's delegates pane reads the same
+/// Reachable outside this module because the TUI's delegates detail reads the same
 /// store through the same parser: two readers of one store is a drift risk, and
 /// a second parser would be the drift itself. The pane calls [`jobs::list`] and
 /// [`jobs::running_liveness`] and writes nothing.
@@ -55,7 +55,7 @@ use digest::{DigestMode, DigestTracker};
 use render::{ProfileSnapshot, RosterRank};
 
 /// Marks the `clauth mcp` child that [`crate::plugin_probe::mcp_boots`] spawns
-/// for the Plugin tab's handshake check. clauth owns both sides of that spawn, so
+/// for the Services tab's handshake check. clauth owns both sides of that spawn, so
 /// an env marker beats inferring it from the client identity in a request.
 pub(crate) const MCP_PROBE_ENV: &str = "CLAUTH_MCP_PROBE";
 
@@ -2866,7 +2866,7 @@ fn read_collectable(job_id: &str) -> WaitOutcome {
 /// A delegate has no deadlines anymore, so a new record writes `0`/`None` and
 /// no countdown renders. `last_output_secs_ago` still renders off the
 /// heartbeat's `last_output_at` — output age is not a deadline. [`jobs::RunningLiveness`]
-/// holds that arithmetic, and holds it for the TUI's delegates pane as well, so
+/// holds that arithmetic, and holds it for the TUI's delegates detail as well, so
 /// the two surfaces cannot report one record differently. The throttle's
 /// accuracy bound is documented there.
 fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_json::Value {
@@ -2894,7 +2894,7 @@ fn running_payload(job_id: &str, record: &jobs::JobRecord, now: u64) -> serde_js
 }
 
 /// [`running_payload`] for the TUI's agreement pin, which has to compare what
-/// the delegates pane draws against what `monitor` tells the model about the
+/// the delegates detail draws against what `monitor` tells the model about the
 /// same record. Test-only on purpose: the pane derives its own figures from
 /// [`jobs::running_liveness`], which is the half both surfaces share, while this
 /// one also reads the target's usage cache off disk for the `quota` clause.
@@ -5540,7 +5540,7 @@ fn startup() -> Option<std::fs::File> {
     // handshake: the gate is two registry reads inline, and a needed heal runs
     // on its own thread (throttled inside `heal_detached`), never on stdout.
     //
-    // Not under the Plugin tab's boot probe, which spawns a real `clauth mcp`
+    // Not under the Services tab's boot probe, which spawns a real `clauth mcp`
     // and kills it within seconds: a heal started there is a mutating lifecycle
     // call the tab never confirmed, torn off mid-sequence, with the `claude`
     // grandchild left to finish its registry write unsignalled.

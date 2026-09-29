@@ -1,7 +1,7 @@
 use super::*;
 use crate::profile::{AppConfig, AppState};
 use crate::tui::app::{
-    App, ConfigFocus, FallbackFocus, PluginFocus, StatusFocus, TokenView, has_sub_focus,
+    App, ConfigFocus, FallbackFocus, ServicesFocus, StatusFocus, TokenView, has_sub_focus,
 };
 
 fn empty_app(tab: Tab) -> App {
@@ -32,7 +32,7 @@ fn every_sub_focus_tab_documents_esc_in_help() {
         app.config_focus = ConfigFocus::Actions;
         app.fallback_focus = FallbackFocus::Detail;
         app.status.focus = StatusFocus::Detail;
-        app.plugin.focus = PluginFocus::Detail;
+        app.services.focus = ServicesFocus::Detail;
         app.token_view = TokenView::Models;
 
         if !has_sub_focus(&app) {

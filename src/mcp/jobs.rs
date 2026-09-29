@@ -20,7 +20,7 @@
 //! written to keep the spent window's result rather than to answer that caller,
 //! and the id is recovered afterwards by ENUMERATION rather than by delivery:
 //! `monitor` with no `job_ids` lists it, `clauth jobs` prints it, and the TUI's
-//! delegates pane draws it. All three go through [`list_banded`], and so through
+//! delegates detail draws it. All three go through [`list_banded`], and so through
 //! [`list`] beneath it.
 //!
 //! A blocking delegate that is STILL attached to its caller keeps a second
@@ -1051,9 +1051,9 @@ pub(crate) enum JobLiveness {
 /// pair answers "is anything already waiting on this".
 ///
 /// One derivation for every surface that names a record's situation — `clauth
-/// jobs`, `monitor`'s listing and the TUI's delegates pane — so none of them can
+/// jobs`, `monitor`'s listing and the TUI's delegates detail — so none of them can
 /// give one record a different name, a different band, or a different word.
-/// `src/tui/render/plugin.rs` keeps only what a TERMINAL adds on top: the glyph
+/// `src/tui/render/services.rs` keeps only what a TERMINAL adds on top: the glyph
 /// and the hue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobPhase {
@@ -1144,7 +1144,7 @@ impl StoredJob {
     /// Which of the four situations this record is in.
     ///
     /// The one classification in the crate: `clauth jobs`, `monitor`'s listing
-    /// and the TUI's delegates pane all read a record's situation from here, so
+    /// and the TUI's delegates detail all read a record's situation from here, so
     /// none of them can answer differently about one file.
     ///
     /// The spelling on disk is the whole difference between the two live ones:
@@ -1255,9 +1255,8 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
 /// The sort is STABLE, so the band is the only thing that moves and `list`'s
 /// within-band order survives untouched.
 ///
-/// `src/tui/render/plugin.rs` bands its own rows the same way for the same
-/// reason, one layer later (it sorts already-rendered cells). Folding the two
-/// onto this one is owed.
+/// `src/tui/render/services.rs` renders the delegates detail straight from this
+/// order — its `delegate_cells` sorts nothing — so the banding lives here alone.
 pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
     let mut jobs = list(now);
     jobs.sort_by_key(|job| job.phase().rank());
@@ -1267,7 +1266,7 @@ pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
 /// Every liveness figure a `running` record yields at one instant.
 ///
 /// ONE derivation for two surfaces: `monitor`'s running payload renders it for
-/// the calling model, and the TUI's delegates pane draws it for the operator, so
+/// the calling model, and the TUI's delegates detail draws it for the operator, so
 /// neither can answer differently about the same file. A `None` is a figure the
 /// record structurally does not have, never an unknown one — the same rule the
 /// payload's absent keys already render by.

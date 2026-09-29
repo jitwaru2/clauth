@@ -40,7 +40,7 @@ pub(super) fn narrow(w: u16) -> bool {
 }
 
 /// The master-detail pane split shared by the Usage/Setup/Fallback/Status/
-/// Plugin tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
+/// Services tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
 /// selector-above-detail — the selector takes its `items` rows (+ box chrome)
 /// up to 40% of the body, the detail the rest, so both panes keep full-width
 /// lines on a phone. Rows, not columns, are the abundant resource there.

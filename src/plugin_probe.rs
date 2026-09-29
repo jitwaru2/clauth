@@ -1,10 +1,10 @@
-//! Local-read probes backing the Plugin tab: binary-on-`PATH` resolution, Claude
+//! Local-read probes backing the Services tab: binary-on-`PATH` resolution, Claude
 //! Code's plugin registry (`installed_plugins.json` / `known_marketplaces.json`),
 //! the manual `mcpServers` wiring, the `claude --version` string, and the one
 //! safe write the tab performs (wire `mcpServers.clauth`).
 //!
 //! Everything here is a cheap filesystem/`PATH` read except [`cc_version`], which
-//! runs one short subprocess; the Plugin tab caches that result. Nothing spawns a
+//! runs one short subprocess; the Services tab caches that result. Nothing spawns a
 //! background thread. All path reads route through the test-overridable
 //! `home_dir()` / `claude_dir()`, so the inline tests can sandbox `$HOME`.
 

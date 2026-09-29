@@ -1,7 +1,7 @@
 //! `clauth jobs` — the operator's enumeration of the delegate job store.
 //!
 //! Reads `~/.clauth/jobs/` through `mcp::jobs::list`, the same parser the MCP
-//! surface and the TUI's delegates pane read it through, and classifies each row
+//! surface and the TUI's delegates detail read it through, and classifies each row
 //! with the same `StoredJob::phase`. Two readers of one store is already a drift
 //! risk this store carries; a third PARSER would be the drift itself, so there
 //! is none here.

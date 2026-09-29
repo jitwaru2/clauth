@@ -9,9 +9,9 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, PluginFocus, StatusFocus, Tab,
-    TokenView, build_action_menu, config_rows, fallback_hint, has_sub_focus, herdr_config_writable,
-    keyboard_owner,
+    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServicesFocus, StatusFocus, Tab,
+    TokenView, build_action_menu, config_rows, fallback_hint, fix_verb, has_sub_focus,
+    herdr_config_writable, keyboard_owner,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -145,6 +145,14 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     // (While armed the alert row shows instead, so this label stays "quit".)
     let q_label: &str = if has_sub_focus(app) { "back" } else { "quit" };
 
+    // The Services hints carry a per-fix verb (a computed label), so they build
+    // a Vec instead of one of the static `&[...]` arms below.
+    if app.tab == Tab::Services {
+        let mut hints = services_hints(app);
+        hints.push(("q", q_label));
+        return hints;
+    }
+
     let tail: &[(&str, &str)] = match app.tab {
         Tab::Overview => &[
             ("⇧↑↓", "reorder"),
@@ -259,7 +267,7 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ],
             StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
         },
-        Tab::Plugin => plugin_hints(app),
+        Tab::Services => &[], // handled above: its hints carry a computed verb
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("a", "actions"), ("?", "help")],
             FallbackHint::ChainMember => &[
@@ -373,149 +381,106 @@ fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
     }
 }
 
-/// Plugin tab hints. `f` only fixes a row that actually offers one — never
-/// advertised where pressing it is a no-op. The herdr detail walks focusable
-/// option rows instead of scrolling, so its hints name the row's own keys.
-fn plugin_hints(app: &App) -> &'static [(&'static str, &'static str)] {
-    match app.plugin.focus {
-        PluginFocus::List => {
-            if app.plugin.selected_fix().is_some() {
-                &[
-                    ("↑↓", "row"),
-                    ("↵", "detail"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("↵", "detail"),
-                    ("r", "refresh"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+/// Services tab hints. `f` only fixes a row (or, on the plugin detail, a
+/// problem) that actually offers one — never advertised where pressing it is a
+/// no-op, and its label is the fix's verb. `pub(super)` so the Services render
+/// tests pin each focus state's whole hint list by equality.
+pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    match app.services.focus {
+        ServicesFocus::List => {
+            let mut hints = vec![("↑↓", "row")];
+            // The delegates detail binds no key, so ⏎ does not descend into it.
+            if !app
+                .services
+                .selected_check()
+                .is_some_and(|c| c.label == "delegates")
+            {
+                hints.push(("↵", "detail"));
             }
+            hints.push(("r", "refresh"));
+            if let Some(fix) = app.services.focused_fix() {
+                hints.push(("f", fix_verb(fix)));
+            }
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
         }
-        PluginFocus::Detail => plugin_detail_hints(app),
+        ServicesFocus::Detail => services_detail_hints(app),
     }
 }
 
-/// Plugin detail hints, row-aware for the herdr options section: the
-/// tag-refresh row advertises its stepper keys, the delegate-row row its
-/// confirm — and an inert delegate-row row advertises no activation key at
-/// all, since the key is a no-op there.
-fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
-    let fix = app.plugin.selected_fix().is_some();
-    if !app
-        .plugin
-        .selected_check()
-        .is_some_and(|c| c.label == "herdr")
-    {
-        return if fix {
-            &[
-                ("↑↓", "scroll"),
-                ("r", "refresh"),
-                ("f", "fix"),
-                ("a", "actions"),
-                ("?", "help"),
-            ]
+/// Services detail hints, row-aware: the herdr options rows name their own
+/// keys, the plugin detail walks its fixable problems, every other detail
+/// scrolls.
+fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let verb = app.services.focused_fix().map(fix_verb);
+    let label = app.services.selected_check().map(|c| c.label);
+
+    if label != Some("herdr") {
+        let walks_problems = label == Some("plugin")
+            && app
+                .services
+                .selected_check()
+                .is_some_and(|c| !c.problems.is_empty());
+        let mut hints = if walks_problems {
+            vec![("↑↓", "problem")]
         } else {
-            &[
-                ("↑↓", "scroll"),
-                ("r", "refresh"),
-                ("a", "actions"),
-                ("?", "help"),
-            ]
+            vec![("↑↓", "scroll")]
         };
+        hints.push(("r", "refresh"));
+        if let Some(v) = verb {
+            hints.push(("f", v));
+        }
+        hints.extend([("a", "actions"), ("?", "help")]);
+        return hints;
     }
-    // `r` and `f` keep working while the options rows hold the cursor, so they
-    // keep their hints (f only when the check offers a fix).
-    match HERDR_OPTIONS.get(app.plugin.herdr_options_cursor) {
+
+    // The herdr options rows: `r` and `f` keep working while the options rows
+    // hold the cursor, so they keep their hints (f only when the check offers
+    // a fix).
+    match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
         Some(HerdrOption::TagRefresh) => {
-            if fix {
-                &[
-                    ("↑↓", "row"),
-                    ("+", "raise"),
-                    ("-", "lower"),
-                    ("↵", "type"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("+", "raise"),
-                    ("-", "lower"),
-                    ("↵", "type"),
-                    ("r", "refresh"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+            let mut hints = vec![
+                ("↑↓", "row"),
+                ("+", "raise"),
+                ("-", "lower"),
+                ("↵", "type"),
+                ("r", "refresh"),
+            ];
+            if let Some(v) = verb {
+                hints.push(("f", v));
             }
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
         }
         Some(HerdrOption::DelegateRowText) if herdr_config_writable(app) => {
-            if fix {
-                &[
-                    ("↑↓", "row"),
-                    ("space/↵", "rewrite row"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("space/↵", "rewrite row"),
-                    ("r", "refresh"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+            let mut hints = vec![("↑↓", "row"), ("space/↵", "rewrite row"), ("r", "refresh")];
+            if let Some(v) = verb {
+                hints.push(("f", v));
             }
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
         }
         // The inert delegate-row row advertises no activation key — it is a
         // no-op there.
         Some(HerdrOption::DelegateRowText) => {
-            if fix {
-                &[
-                    ("↑↓", "row"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("r", "refresh"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+            let mut hints = vec![("↑↓", "row"), ("r", "refresh")];
+            if let Some(v) = verb {
+                hints.push(("f", v));
             }
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
         }
         _ => {
-            if fix {
-                &[
-                    ("↑↓", "row"),
-                    ("space/↵", "cycle / toggle"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            } else {
-                &[
-                    ("↑↓", "row"),
-                    ("space/↵", "cycle / toggle"),
-                    ("r", "refresh"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
+            let mut hints = vec![
+                ("↑↓", "row"),
+                ("space/↵", "cycle / toggle"),
+                ("r", "refresh"),
+            ];
+            if let Some(v) = verb {
+                hints.push(("f", v));
             }
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
         }
     }
 }

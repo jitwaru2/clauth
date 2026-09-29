@@ -500,7 +500,7 @@ pub(crate) fn plural(n: usize) -> &'static str {
 /// function's, so this is the zero boundary and nothing else.
 ///
 /// One helper because the rule kept being re-answered: three surfaces wrote
-/// their own guard and reached three different words. `src/tui/render/plugin.rs`
+/// their own guard and reached three different words. `src/tui/render/services.rs`
 /// still spells its own `just now`, deliberately — a pane's phrasing is its own
 /// — and folding that one in is owed.
 pub(crate) fn humanize_span(secs: u64) -> String {

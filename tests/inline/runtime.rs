@@ -5435,7 +5435,7 @@ fn gc_spares_the_keychain_item_a_reminted_acquire_claims_mid_sweep() {
     });
 }
 
-/// The Plugin tab's boot probe must not collect trees: its 3 s kill budget
+/// The Services tab's boot probe must not collect trees: its 3 s kill budget
 /// buys neither a per-pair state-flock wait nor — on macOS — the `security`
 /// delete that collects a removed tree's Keychain item, and a probe that
 /// removed the tree while skipping the item would strand that item
@@ -7825,7 +7825,7 @@ fn gc_spares_a_held_bare_session_marker() {
     });
 }
 
-/// The bare-marker sweep runs at every `clauth mcp` boot, the Plugin tab's
+/// The bare-marker sweep runs at every `clauth mcp` boot, the Services tab's
 /// 3s-budget probe child included, and the state flock waits up to
 /// `STATE_LOCK_TIMEOUT` behind a macOS switch's keychain shell-out. Every other
 /// acquisition inside this sweep is conditional on there being work; this one

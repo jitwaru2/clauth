@@ -1130,7 +1130,7 @@ pub(crate) fn salvage_delete_namespaced_item(
 /// untouched; an unreadable ledger or live set deletes nothing.
 ///
 /// Runs on every `clauth mcp` boot (accepted with the ruling). Skipped whole
-/// under the Plugin tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
+/// under the Services tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
 /// kill budget pays no `security` subprocess — the same gate `gc_stale_runtimes`
 /// reads for the tree sweep. The delete subprocesses stay outside any state
 /// lock, under one [`crate::lock::SharedSubprocessBudget`] so a stuck keychain

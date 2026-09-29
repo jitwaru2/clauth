@@ -709,17 +709,17 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("esc", "back to the list"),
             ][..],
         )],
-        Tab::Plugin => vec![(
-            "plugin",
+        Tab::Services => vec![(
+            "services",
             &[
                 (
                     "\u{2191} \u{2193}",
-                    "pick check · scroll detail · walk herdr options",
+                    "pick row · scroll detail · walk plugin problems · walk herdr options",
                 ),
                 ("\u{21b5}", "open detail · activate an option"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),
-                ("f", "apply the selected row's fix"),
+                ("f", "apply the focused fix"),
                 ("r", "re-run all checks"),
                 ("esc", "back to the list · close the editor"),
             ][..],

@@ -2454,21 +2454,25 @@ fn home_tab_round_trips_through_the_app_load_path() {
         "a default home_tab renders no key: {rendered}"
     );
 
-    // A written top-level home_tab loads, renders top-level (never inside
-    // `[herdr]`), and survives a save + reload.
+    // The retired `plugin` spelling loads as the Services tab (the
+    // `#[serde(alias = "plugin")]` on the variant) and writes back `services`.
     write_profiles_toml(
         "active_profile = \"acct\"\nprofiles = [\"acct\"]\nhome_tab = \"plugin\"\n",
     );
     let config = crate::profile::load_config().expect("load");
     assert_eq!(
         config.state.home_tab(),
-        HomeTab::Plugin,
-        "the written home_tab loads"
+        HomeTab::Services,
+        "the retired `plugin` spelling loads as the Services tab"
     );
     let rendered = toml::to_string_pretty(&config.state).expect("render");
     assert!(
-        rendered.contains("home_tab = \"plugin\""),
-        "an off-default home_tab renders as a top-level key: {rendered}"
+        rendered.contains("home_tab = \"services\""),
+        "the alias writes back the canonical spelling, never `plugin`: {rendered}"
+    );
+    assert!(
+        !rendered.contains("home_tab = \"plugin\""),
+        "the retired spelling is not round-tripped: {rendered}"
     );
     assert!(
         !rendered.contains("[herdr]"),
@@ -2478,7 +2482,7 @@ fn home_tab_round_trips_through_the_app_load_path() {
     let again = crate::profile::load_config().expect("reload");
     assert_eq!(
         again.state.home_tab(),
-        HomeTab::Plugin,
+        HomeTab::Services,
         "the home_tab survives a save + reload"
     );
 

@@ -158,20 +158,21 @@ fn write_plugin_install(scope: &str) {
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 }
 
+#[cfg(unix)]
 fn plugin_check(app: &App) -> &super::Check {
-    app.plugin
+    app.services
         .checks
         .iter()
         .find(|c| c.label == "plugin")
         .expect("plugin check present")
 }
 
-/// The delegates pane's rows arrive BANDED, from the store.
+/// The delegates detail's rows arrive BANDED, from the store.
 ///
-/// `recompute_plugin_checks` is the pane's only reader, and it must call
+/// `recompute_services_checks` is the detail's only reader, and it must call
 /// `jobs::list_banded` — the same function `clauth jobs` and `monitor`'s listing
 /// call — rather than `jobs::list`. The renderer sorts nothing any more, so this
-/// read is the whole of the pane's ordering: reverting it to the raw retention
+/// read is the whole of the detail's ordering: reverting it to the raw retention
 /// order silently drops a long-running delegate below a burst of completions,
 /// which is the defect the shared function exists to prevent, and no render test
 /// would catch it because they all feed their fixtures in directly.
@@ -179,7 +180,7 @@ fn plugin_check(app: &App) -> &super::Check {
 /// Cross-band on purpose, and the finished rows are anchored NEWER than the live
 /// one, so raw retention order and banded order disagree.
 #[test]
-fn the_delegates_pane_reads_the_store_in_banded_order() {
+fn the_delegates_detail_reads_the_store_in_banded_order() {
     use crate::mcp::jobs::{self, JobPhase};
 
     let _home = crate::testutil::HomeSandbox::new();
@@ -234,15 +235,15 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
     done("d-fin-b-0", 4_000);
 
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false);
 
     let ids: Vec<String> = app
-        .plugin
+        .services
         .delegates
         .iter()
         .map(|j| j.record.job_id.clone())
         .collect();
-    let phases: Vec<JobPhase> = app.plugin.delegates.iter().map(|j| j.phase()).collect();
+    let phases: Vec<JobPhase> = app.services.delegates.iter().map(|j| j.phase()).collect();
 
     assert_eq!(phases.len(), 4, "fixture control: every record was read");
     assert_eq!(
@@ -264,81 +265,264 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
     );
 }
 
+/// The folded plugin check's health is the worst of its four sub-checks (clauth
+/// on PATH, mcpServers wiring, plugin install, CC version). Driven through the
+/// pure `plugin_check` with a controlled PATH so each arm is deterministic.
 #[test]
-fn plugin_check_ok_when_installed_globally() {
+fn the_plugin_check_health_is_the_worst_of_the_four() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = std::path::PathBuf::from("/usr/bin/clauth");
+
+    // clauth missing alone is danger, whatever the others say.
+    let check = super::plugin_check(None, Some(Some("1.2.3".to_string())), Some(McpProbe::Ok));
+    assert_eq!(check.health, super::Health::Danger);
+
+    // clauth present, nothing wired or installed: both fixes warn.
+    let check = super::plugin_check(Some(&path), None, None);
+    assert_eq!(check.health, super::Health::Warn);
+    assert_eq!(check.fix, Some(super::ServiceFix::WireMcpServers));
+
+    // A user-scope install wires the server and installs globally: ok, no fix.
+    write_plugin_install("user");
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+    assert_eq!(check.health, super::Health::Ok);
+    assert!(check.fix.is_none());
+
+    // A boot failure is danger even when the wiring and install are fine.
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Failed("refused".to_string())),
+    );
+    assert_eq!(check.health, super::Health::Danger);
+}
+
+/// The folded plugin check carries every readout line in fold order (PATH,
+/// wiring, install, CC version), pinned by equality against the production
+/// builder — the four readouts plus the blank separators and the plain
+/// explanation line above each fix. Health is the worst, the problems walk in
+/// the same order, and the list `f` is the first problem's fix.
+#[test]
+fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = std::path::PathBuf::from("/usr/bin/clauth");
+    write_plugin_install("local");
+
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+
+    let data_line = format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    );
+    let expected = vec![
+        data_line,
+        "path: /usr/bin/clauth".to_string(),
+        "mcp wired: yes".to_string(),
+        "mcp source: plugin install (project)".to_string(),
+        "mcp server: boots".to_string(),
+        String::new(),
+        "wired for this project only, not global".to_string(),
+        "writes the clauth entry into ~/.claude.json".to_string(),
+        "f  wire mcp server".to_string(),
+        "installed: yes (local)".to_string(),
+        "version: 0.1.0".to_string(),
+        String::new(),
+        "installed for this project only, not global".to_string(),
+        "installs at user scope".to_string(),
+        "f  install plugin".to_string(),
+        "claude: 1.2.3".to_string(),
+    ];
+    assert_eq!(
+        check.detail, expected,
+        "the folded detail, its separators and its fix explanations, by equality"
+    );
+    assert_eq!(check.health, super::Health::Warn, "worst-of-four is warn");
+    assert_eq!(
+        check.fix,
+        Some(super::ServiceFix::WireMcpServers),
+        "list `f` fixes the first fixable problem shown"
+    );
+    assert_eq!(
+        check
+            .problems
+            .iter()
+            .map(|p| (p.line, super::fix_verb(&p.fix)))
+            .collect::<Vec<_>>(),
+        vec![(8, "wire mcp server"), (14, "install plugin")],
+        "the problems carry their detail-line indices and walk in order"
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.starts_with("[f]")),
+        "the bracketed `[f]` anti-pattern is gone: {:?}",
+        check.detail
+    );
+}
+
+/// A manual global `~/.claude.json` wire reads `mcp wired: yes` and leaves no
+/// wire fix; the only remaining problem is the (absent) install.
+#[test]
+fn the_plugin_check_reads_a_global_wire_as_wired() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "mcp wired: yes"),
+        "a globally wired server reads wired: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "mcp source: ~/.claude.json (manual)"),
+        "and the source names the manual global config: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .problems
+            .iter()
+            .all(|p| p.fix != super::ServiceFix::WireMcpServers),
+        "no wire fix when globally wired"
+    );
+}
+
+/// A user-scope install wires the server globally and installs the plugin:
+/// healthy, no wire fix, no install fix.
+#[test]
+fn the_plugin_check_reads_a_user_install_as_healthy() {
+    use crate::plugin_probe::McpProbe;
     let _home = crate::testutil::HomeSandbox::new();
     write_plugin_install("user");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
     assert_eq!(check.health, super::Health::Ok);
     assert!(
-        check
-            .detail
-            .iter()
-            .any(|line| line.starts_with("installed: yes")),
-        "global install should read installed, got {:?}",
+        check.detail.iter().any(|l| l == "installed: yes (user)"),
+        "the install readout names the user scope: {:?}",
         check.detail
     );
+    assert!(
+        check.problems.is_empty(),
+        "no problems on a healthy global install"
+    );
+    assert!(check.fix.is_none());
 }
 
+/// A recent delegate rate-limit on any profile names itself in the delegates
+/// detail; the dot stays dim (green only while a job runs).
 #[test]
-fn plugin_check_warns_and_offers_global_install_when_project_local() {
+fn the_delegates_detail_names_rate_limited_traffic() {
+    use crate::profile::{AppConfig, AppState, Profile};
     let _home = crate::testutil::HomeSandbox::new();
-    write_plugin_install("local");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check.detail.iter().any(|line| line.contains("(local)")),
-        "the project-local scope should surface in the readout, got {:?}",
-        check.detail
-    );
-    // The old shell copy-paste hint is gone; the row now offers the one-key
-    // user-scope install fix instead.
-    assert!(
-        check.fix.is_some(),
-        "non-global install should offer the install fix, got {:?}",
-        check.detail
-    );
-    assert!(
-        check.detail.iter().any(|line| line.starts_with("[f]")),
-        "the detail should show the install fix hint, got {:?}",
-        check.detail
+    let now_secs = (crate::usage::now_ms() / 1000) as i64;
+    let profile = Profile::new("acct".to_string(), None, None);
+    // `record_rate_limit` writes through `write_profile_cache`, which persists
+    // only for a profile the saved app state names as configured.
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::throughput::record_rate_limit(&profile.name, None, None, now_secs);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    super::recompute_services_checks(&mut app, false);
+    let check = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "delegates")
+        .expect("delegates row");
+    assert_eq!(check.health, super::Health::Idle, "the dot stays dim");
+    assert_eq!(
+        check.detail,
+        vec!["delegate: rate-limited (acct)".to_string()],
+        "the detail names the rate-limited accounts"
     );
 }
 
+/// A fix landing under a focused problem shrinks the problem set; the recompute
+/// clamps the cursor so the surviving problem is the one `f` fixes.
 #[test]
-fn plugin_check_offers_install_fix_when_missing() {
+fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check
-            .detail
-            .iter()
-            .any(|line| line.starts_with("installed: no")),
-        "an absent plugin should read not installed, got {:?}",
-        check.detail
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    let check = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "plugin")
+        .expect("plugin row");
+    assert_eq!(check.problems.len(), 2, "fixture: wire + install problems");
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services.problem_cursor = 1;
+    // Wire the server: the wire problem leaves, the install problem stays.
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    super::recompute_services_checks(&mut app, false);
+    assert_eq!(
+        app.services.problem_cursor, 0,
+        "the cursor clamps onto the surviving problem"
     );
-    assert!(
-        check.fix.is_some(),
-        "a missing plugin should offer the install fix, got {:?}",
-        check.detail
-    );
-    assert!(
-        check.detail.iter().any(|line| line.starts_with("[f]")),
-        "the detail should show the install fix hint, got {:?}",
-        check.detail
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&super::ServiceFix::InstallPlugin),
+        "and `f` fixes the surviving install problem"
     );
 }
 
-/// The install row must name the OPERATIVE record, not whichever row sorts first
-/// on disk: a stale project/local row ahead of the live `user`-scope row used to
-/// print the wrong scope and version beside a verdict computed off the user row.
+/// ↵ never descends into the delegates detail (it binds no key).
+#[test]
+fn enter_does_not_descend_into_the_delegates_detail() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = 0; // delegates is the first row
+    app.services.focus = super::ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::List,
+        "↵ does not descend into the delegates detail"
+    );
+}
+
+/// The install readout must name the OPERATIVE record, not whichever row sorts
+/// first on disk: a stale project/local row ahead of the live `user`-scope row
+/// used to print the wrong scope and version beside a verdict computed off the
+/// user row.
 #[test]
 fn plugin_check_names_the_user_scope_record_when_one_exists() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -355,9 +539,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
     });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
+    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
     assert_eq!(
         check.health,
         super::Health::Ok,
@@ -395,21 +577,23 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
 /// The confirm gate every mutating fix owes (tab spec: "confirm modal first,
 /// default choice = cancel"): `f` on the plugin row must open a
 /// [`ConfirmAction::InstallPlugin`] modal that defaults to cancel and runs
-/// nothing until confirmed.
+/// nothing until confirmed. The server is already wired so the install is the
+/// first fixable problem the list `f` reaches.
 #[test]
 fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     let _home = crate::testutil::HomeSandbox::new();
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false);
     let idx = app
-        .plugin
+        .services
         .checks
         .iter()
         .position(|c| c.label == "plugin")
         .expect("plugin check present");
-    app.plugin.cursor = idx;
+    app.services.cursor = idx;
 
-    super::apply_plugin_fix(&mut app);
+    super::apply_service_fix(&mut app);
 
     let Some(super::Modal::Confirm(state)) = app.modals.last() else {
         panic!(
@@ -433,7 +617,7 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
 /// agentgear's `install(Scope::User, Source::Embedded)` — visible here as the
 /// exact `claude plugin` invocations the fake CLI records (user scope on both
 /// the marketplace add and the install, exactly one install per confirm), the
-/// materialized tree landing under the hermetic data dir, and the Plugin tab
+/// materialized tree landing under the hermetic data dir, and the Services tab
 /// recomputing to `installed`.
 #[cfg(unix)]
 #[test]
@@ -499,15 +683,14 @@ fn the_install_fix_runs_agentgear_user_scope_install() {
         app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
     let check = plugin_check(&app);
-    assert_eq!(
-        check.health,
-        super::Health::Ok,
-        "the recomputed row reads installed and healthy, got {:?}",
-        check.detail
-    );
     assert!(
         check.detail.iter().any(|l| l.starts_with("installed: yes")),
         "the row reflects the user-scope install, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.fix.is_none(),
+        "a global install leaves no install or wire fix, got {:?}",
         check.detail
     );
 }
@@ -542,205 +725,9 @@ fn the_install_fix_warns_when_claude_is_missing() {
         app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
     let check = plugin_check(&app);
-    assert_eq!(
-        check.health,
-        super::Health::Warn,
-        "the row must stay not-installed, got {:?}",
-        check.detail
-    );
     assert!(
         check.detail.iter().any(|l| l.starts_with("installed: no")),
         "the row still reads not installed, got {:?}",
-        check.detail
-    );
-}
-
-fn mcp_check(app: &App) -> &super::Check {
-    app.plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "mcp servers")
-        .expect("mcp servers check present")
-}
-
-#[test]
-fn mcp_check_ok_when_globally_wired() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = mcp_check(&app);
-    assert_eq!(check.health, super::Health::Ok);
-    assert!(
-        check.detail.iter().any(|line| line == "present: yes"),
-        "a globally wired server should read present, got {:?}",
-        check.detail
-    );
-    assert!(check.fix.is_none());
-}
-
-#[test]
-fn mcp_check_warns_project_only_for_local_plugin() {
-    let _home = crate::testutil::HomeSandbox::new();
-    // A project-scope plugin advertises the server for one repo only, and no
-    // global `~/.claude.json` entry exists in the sandbox to make it global.
-    write_plugin_install("local");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = mcp_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check
-            .detail
-            .iter()
-            .any(|line| line == "wired for this project only, not global"),
-        "project-only wiring should say so in the readout, got {:?}",
-        check.detail
-    );
-    assert!(check.fix.is_some(), "should offer the global write fix");
-}
-
-#[test]
-fn runtime_check_summarizes_profiles() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("acct".to_string(), None, None)],
-    });
-    super::recompute_plugin_checks(&mut app, false);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    // One idle, non-active, credential-less profile: no active link, no live
-    // sessions → a neutral dot (not green) and no fix.
-    assert_eq!(check.health, super::Health::Idle);
-    assert!(check.fix.is_none());
-    assert!(check.detail.iter().any(|l| l == "accounts: 1"));
-    // A zero count prints NOTHING — no row, and specifically not `live: 0`
-    // or a `—` placeholder. The Overview cell and the Fallback card both hide
-    // their zero; this row was the one surface still announcing it.
-    assert!(
-        !check.detail.iter().any(|l| l.starts_with("live:")),
-        "an idle fleet says nothing about sessions, got {:?}",
-        check.detail
-    );
-    assert!(check.detail.iter().any(|l| l == "active: \u{2014}"));
-    assert!(check.detail.iter().any(|l| l == "link: \u{2014}"));
-}
-
-/// A session that swapped A→B holds BOTH accounts' liveness markers: B's
-/// because that is what it authenticates as, A's because the chain the child
-/// still holds in memory must not rotate underneath it. Summing per-profile
-/// marker
-/// counts therefore reports one child as two sessions and names an account
-/// nothing authenticates as — A is the wrong answer, not a changed one. Only the
-/// registry can tell the two apart.
-///
-/// Driven through `r` (`refresh_version`), the one path that re-collects the
-/// fleet tally instead of folding in whatever the tick last left in
-/// `app.live_sessions` — so this also pins that `r` re-reads the registry.
-#[test]
-fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            Profile::new("swap-a".to_string(), None, None),
-            Profile::new("swap-b".to_string(), None, None),
-        ],
-    });
-
-    let sid = "4242-0";
-    let mut row = crate::testutil::live_row(sid, "swap-a");
-    row.current_member = Some("swap-b".to_string());
-    row.last_swap_at = Some(1_700_000_060_000);
-    crate::live_sessions::register(&row).expect("register row");
-    // Both markers, exactly as a swapped session holds them.
-    let _launch = crate::runtime::hold_session_row_marker(
-        &crate::profile::ProfileName::from("swap-a"),
-        false,
-        sid,
-    )
-    .expect("hold the launch member's marker");
-    let _landed = crate::runtime::hold_session_row_marker(
-        &crate::profile::ProfileName::from("swap-b"),
-        false,
-        sid,
-    )
-    .expect("hold the swapped-onto member's marker");
-
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .find(|l| l.starts_with("live:"))
-            .map(String::as_str),
-        Some("live: 1 across 1 account"),
-        "one child is one session on one account, got {:?}",
-        check.detail
-    );
-    assert!(
-        check.detail.iter().any(|l| l == "  swap-b"),
-        "the account the session moved ONTO is the one it runs as, got {:?}",
-        check.detail
-    );
-    assert!(
-        !check.detail.iter().any(|l| l == "  swap-a"),
-        "nothing authenticates as the launch member any more, got {:?}",
-        check.detail
-    );
-}
-
-/// The runtime row folds in the tally the tick already collected, never a sweep
-/// of its own: `LiveTally::collect` is two readdirs plus an `open` + `try_lock`
-/// per row plus a credential read, and the render thread ran it once a second
-/// for an answer `poll_live_sessions` had put in `app.live_sessions` the same
-/// tick. Two independent derivations of one number can also disagree inside a
-/// frame, which no amount of caching fixes.
-///
-/// The seeded fleet is one the registry does NOT hold, so a recompute that
-/// collects again reports an empty fleet and reds here.
-#[test]
-fn the_runtime_check_reads_the_ticks_tally_rather_than_sweeping_again() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("acct".to_string(), None, None)],
-    });
-    app.live_sessions =
-        crate::live_sessions::LiveTally::of([crate::testutil::live_row("4242-0", "acct")]);
-
-    super::recompute_plugin_checks(&mut app, false);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .find(|l| l.starts_with("live:"))
-            .map(String::as_str),
-        Some("live: 1 across 1 account"),
-        "the row renders the tick's tally, got {:?}",
         check.detail
     );
 }
@@ -5300,7 +5287,7 @@ fn status_detail_up_steps_back_from_the_published_bound() {
 /// Plugin's detail pane, same defect and same fix as the Status one above.
 #[test]
 fn plugin_detail_up_steps_back_from_the_published_bound() {
-    use super::{KeyCode, PluginFocus, Tab, handle_key};
+    use super::{KeyCode, ServicesFocus, Tab, handle_key};
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -5308,19 +5295,19 @@ fn plugin_detail_up_steps_back_from_the_published_bound() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.tab = Tab::Plugin;
-    app.plugin.focus = PluginFocus::Detail;
+    app.tab = Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
 
-    app.plugin.detail_max_scroll.set(40);
+    app.services.detail_max_scroll.set(40);
     for _ in 0..60 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
-    assert_eq!(app.plugin.detail_scroll, 40, "↓ stops at the bound");
+    assert_eq!(app.services.detail_scroll, 40, "↓ stops at the bound");
 
-    app.plugin.detail_max_scroll.set(12);
+    app.services.detail_max_scroll.set(12);
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(
-        app.plugin.detail_scroll, 11,
+        app.services.detail_scroll, 11,
         "↑ steps back from the bound, not the stale offset"
     );
 }
@@ -10536,147 +10523,6 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     }
 }
 
-/// Two `clauth start` children on one account plus a third on another — the only
-/// shape that reaches BOTH the summary line's plural and the per-account
-/// sub-line's `·` count. Every other `runtime_check_*` fixture is single-session,
-/// so `instances > 1` never executed and the `{name} · {instances}` sub-line
-/// shipped with no pin: reverting it left the suite fully green. The summary's
-/// `account`/`accounts` split needs two hosting accounts for the same reason,
-/// and only this fixture has them, so one test carries both.
-#[test]
-fn runtime_check_names_a_multi_session_account_with_its_count() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            Profile::new("busy".to_string(), None, None),
-            Profile::new("solo".to_string(), None, None),
-        ],
-    });
-
-    let mut markers = Vec::new();
-    for (name, sid) in [("busy", "4242-0"), ("busy", "4242-1"), ("solo", "4343-0")] {
-        crate::live_sessions::register(&crate::live_sessions::LiveSession {
-            session_id: sid.to_string(),
-            start_profile: name.to_string(),
-            harness: crate::harness::Harness::Claude,
-            pid: 4242,
-            started_at: 1_700_000_000_000,
-            cwd: None,
-            isolated: false,
-            follows_chain: false,
-            intended_member: None,
-            chain_cursor: None,
-            current_member: None,
-            last_swap_at: None,
-            launch_store: None,
-        })
-        .expect("register row");
-        markers.push(
-            crate::runtime::hold_session_row_marker(
-                &crate::profile::ProfileName::from(name),
-                false,
-                sid,
-            )
-            .expect("hold the marker"),
-        );
-    }
-
-    // `r`, the one path that re-collects the fleet tally these rows seed.
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![
-            "live: 3 across 2 accounts".to_string(),
-            "  busy · 2".to_string(),
-            "  solo".to_string(),
-        ],
-        "got {:?}",
-        check.detail
-    );
-}
-
-/// The singular half of the same summary line, which the fixture above cannot
-/// reach: at 3 sessions across 2 accounts BOTH counts pluralize, so swapping
-/// the `plural()` argument from the account count to the session count changes
-/// nothing and the mutant ships green. Two sessions on ONE account is the
-/// smallest shape where the two counts disagree, so it is the only shape that
-/// proves the suffix tracks the accounts.
-#[test]
-fn runtime_check_says_one_account_when_every_live_session_shares_it() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("busy".to_string(), None, None)],
-    });
-
-    let mut markers = Vec::new();
-    for sid in ["5151-0", "5151-1"] {
-        crate::live_sessions::register(&crate::live_sessions::LiveSession {
-            session_id: sid.to_string(),
-            start_profile: "busy".to_string(),
-            harness: crate::harness::Harness::Claude,
-            pid: 5151,
-            started_at: 1_700_000_000_000,
-            cwd: None,
-            isolated: false,
-            follows_chain: false,
-            intended_member: None,
-            chain_cursor: None,
-            current_member: None,
-            last_swap_at: None,
-            launch_store: None,
-        })
-        .expect("register row");
-        markers.push(
-            crate::runtime::hold_session_row_marker(
-                &crate::profile::ProfileName::from("busy"),
-                false,
-                sid,
-            )
-            .expect("hold the marker"),
-        );
-    }
-
-    // `r`, the one path that re-collects the fleet tally these rows seed.
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![
-            "live: 2 across 1 account".to_string(),
-            "  busy · 2".to_string()
-        ],
-        "got {:?}",
-        check.detail
-    );
-}
-
 // ── chain_would_mix ──────────────────────────────────────────────────────────
 // Adding an api-key account to an all-oauth chain (or vice versa) lands a
 // confirm modal. Silent on already-mixed chains, empty chains, same-kind adds,
@@ -11754,7 +11600,7 @@ fn the_login_row_keeps_its_other_two_flows() {
     );
 }
 
-// ── herdr row (Plugin tab) ──────────────────────────────────────────────────
+// ── herdr row (Services tab) ──────────────────────────────────────────────────
 
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 
@@ -11919,7 +11765,7 @@ fn herdr_check_warns_and_offers_fix_when_key_unbound() {
     assert!(check.detail.iter().any(|l| l == "key: not bound"));
     assert!(matches!(
         &check.fix,
-        Some(super::PluginFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
+        Some(super::ServiceFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
     ));
 }
 
@@ -11968,12 +11814,12 @@ fn version_satisfies_stays_quiet_on_unparseable() {
 fn herdr_row_absent_when_herdr_does_not_resolve() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.plugin.herdr = Some(None);
-    super::recompute_plugin_checks(&mut app, false);
+    app.services.herdr = Some(None);
+    super::recompute_services_checks(&mut app, false);
     assert!(
-        !app.plugin.checks.iter().any(|c| c.label == "herdr"),
+        !app.services.checks.iter().any(|c| c.label == "herdr"),
         "a resolved-but-absent herdr must not render a row, got {:?}",
-        app.plugin
+        app.services
             .checks
             .iter()
             .map(|c| c.label)
@@ -12086,15 +11932,15 @@ fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
 /// at their shipped defaults.
 fn herdr_options_app() -> App {
     let mut app = bare_app();
-    app.tab = super::Tab::Plugin;
-    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
-    app.plugin.herdr_config = Some(healthy_herdr_config());
-    app.plugin.checks = vec![super::herdr_check(
+    app.tab = super::Tab::Services;
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    app.services.herdr_config = Some(healthy_herdr_config());
+    app.services.checks = vec![super::herdr_check(
         &healthy_herdr_probe(),
         Some(&healthy_herdr_config()),
     )];
-    app.plugin.cursor = 0;
-    app.plugin.focus = super::PluginFocus::Detail;
+    app.services.cursor = 0;
+    app.services.focus = super::ServicesFocus::Detail;
     app
 }
 
@@ -12155,7 +12001,7 @@ fn herdr_pane_tag_toggles_and_persists() {
     let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
     let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 1;
+    app.services.herdr_options_cursor = 1;
     let space = crate::testutil::key(KeyCode::Char(' '));
 
     handle_key(&mut app, space);
@@ -12172,7 +12018,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 2;
+    app.services.herdr_options_cursor = 2;
 
     for _ in 0..4 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('-')));
@@ -12186,7 +12032,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     // ⏎ opens the typed editor, seeded with the current value.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
-        app.plugin.herdr_tag_draft.is_some(),
+        app.services.herdr_tag_draft.is_some(),
         "⏎ opens the typed editor"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
@@ -12194,7 +12040,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(herdr_knobs().tag_watch_secs, 30, "the typed value commits");
-    assert!(app.plugin.herdr_tag_draft.is_none());
+    assert!(app.services.herdr_tag_draft.is_none());
 
     // An under-floor value keeps the editor open and persists nothing.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -12204,12 +12050,15 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
-        app.plugin.herdr_tag_draft.is_some(),
+        app.services.herdr_tag_draft.is_some(),
         "an invalid value stays in the editor"
     );
     assert_eq!(herdr_knobs().tag_watch_secs, 30, "and persists nothing");
     handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
-    assert!(app.plugin.herdr_tag_draft.is_none(), "⎋ discards the draft");
+    assert!(
+        app.services.herdr_tag_draft.is_none(),
+        "⎋ discards the draft"
+    );
     assert_eq!(herdr_knobs().tag_watch_secs, 30);
 }
 
@@ -12224,7 +12073,7 @@ fn herdr_border_label_toggles_and_persists() {
     let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
     let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -12259,7 +12108,7 @@ fn herdr_border_label_toggle_reruns_the_pane_report_per_pane() {
     );
     let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), true);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -12302,7 +12151,7 @@ fn herdr_border_label_toggle_spawns_nothing_outside_herdr() {
     );
     let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -12327,7 +12176,7 @@ fn herdr_delegate_dot_toggles_and_persists() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 4;
+    app.services.herdr_options_cursor = 4;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -12346,8 +12195,8 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_config = Some(herdr_config(false, None, SidebarState::Absent));
-    app.plugin.herdr_options_cursor = 5;
+    app.services.herdr_config = Some(herdr_config(false, None, SidebarState::Absent));
+    app.services.herdr_options_cursor = 5;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -12357,11 +12206,11 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
     assert!(!herdr_knobs().delegate_row_text);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
-        app.plugin.herdr_options_cursor, 0,
+        app.services.herdr_options_cursor, 0,
         "selection wraps past the inert row"
     );
 
-    app.plugin.herdr_options_cursor = 4;
+    app.services.herdr_options_cursor = 4;
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(!herdr_knobs().delegate_dot, "the other rows stay live");
 }
@@ -12375,18 +12224,23 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
 /// list that a recompute would strand on `about`).
 fn herdr_options_app_with_config(path: &std::path::Path) -> App {
     let mut app = bare_app();
-    app.tab = super::Tab::Plugin;
+    app.tab = super::Tab::Services;
     let probe = crate::herdr::HerdrProbe {
         version: Some("0.8.0".to_string()),
         entry: Some(herdr_entry(true, Some("0.8.0"), vec![])),
         config_path: Some(path.to_path_buf()),
         error: None,
     };
-    app.plugin.herdr = Some(Some(probe));
-    app.plugin.focus = super::PluginFocus::Detail;
-    super::recompute_plugin_checks(&mut app, false);
-    app.plugin.cursor = super::HERDR_SELECTOR_ROW;
-    app.plugin.herdr_options_cursor = 5;
+    app.services.herdr = Some(Some(probe));
+    app.services.focus = super::ServicesFocus::Detail;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "herdr")
+        .expect("herdr row present");
+    app.services.herdr_options_cursor = 5;
     app
 }
 
@@ -12621,87 +12475,168 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
 
 // ── landing ──────────────────────────────────────────────────────────────────
 
-/// `with_herdr_mode(true)` on the FIRST herdr launch lands on the Plugin tab
+/// `with_herdr_mode(true)` on the FIRST herdr launch lands on the Services tab
 /// with the herdr selector row under the cursor and its detail pane descended
 /// (the `↵` shape), checks already recomputed so the first paint is not empty,
 /// and marks the landing done in `[herdr] first_landing_done` — once, forever.
 /// Construction probes herdr right away — `HERDR_ENV=1` proves herdr is
 /// present — so on a real run the row is there at first paint; the probe is
-/// skipped under test (it would read the real registry), and the
-/// injected-probe half below pins the landed cursor. The `claude --version`
-/// probe stays `r`-gated: construction must not block the first paint on a
-/// spawn.
+/// skipped under test (it would read the real registry), which stands in for a
+/// probe that does not resolve: the landing stays PENDING (parked on the last
+/// row, list focus) and re-lands on the herdr row by label the moment a later
+/// recompute resolves it. The `claude --version` probe stays `r`-gated:
+/// construction must not block the first paint on a spawn.
 #[test]
 fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app().with_herdr_mode(true);
 
-    assert_eq!(app.tab, super::Tab::Plugin, "herdr mode opens on Plugin");
-    assert!(app.herdr_mode);
     assert_eq!(
-        app.plugin.focus,
-        super::PluginFocus::Detail,
-        "the first herdr landing descends into the selected row's detail pane"
+        app.tab,
+        super::Tab::Services,
+        "herdr mode opens on Services"
+    );
+    assert!(app.herdr_mode);
+    assert!(
+        app.services.land_on_herdr,
+        "the landing intent is pending while herdr is unresolved"
     );
     assert_eq!(
-        app.plugin.herdr_options_cursor, 0,
+        app.services.focus,
+        super::ServicesFocus::List,
+        "with no herdr resolved the landing does not descend into another row"
+    );
+    assert_eq!(
+        app.services.herdr_options_cursor, 0,
         "the landed options cursor starts on the first row"
     );
     assert!(
-        matches!(app.plugin.herdr, Some(None)),
+        matches!(app.services.herdr, Some(None)),
         "construction ran the probe (skipped under test, standing in as no herdr)"
     );
     assert!(
-        app.plugin.cc_version.is_none(),
+        app.services.cc_version.is_none(),
         "construction must not spawn `claude --version`; the probe stays `r`-gated"
     );
-    let labels: Vec<&str> = app.plugin.checks.iter().map(|c| c.label).collect();
+    let labels: Vec<&str> = app.services.checks.iter().map(|c| c.label).collect();
     assert_eq!(
         labels,
-        vec!["about", "mcp servers", "plugin", "runtime"],
-        "construction recomputes the checks, so the first paint is not empty"
+        vec!["delegates", "plugin"],
+        "construction recomputes the checks, so the first paint is not empty \
+         (herdr does not render until its probe resolves)"
     );
-    assert_eq!(app.plugin.cursor, 3, "the landing cursor is the herdr slot");
     assert_eq!(
-        app.plugin.selected_check().map(|c| c.label),
-        Some("runtime"),
-        "with no herdr resolved the same index rests on the last row"
+        app.services.cursor, 1,
+        "the pending landing parks on the last row"
+    );
+    assert_eq!(
+        app.services.selected_check().map(|c| c.label),
+        Some("plugin"),
+        "with no herdr resolved the parked cursor rests on the last row"
     );
     // Unprobed must read as unprobed, never as a missing binary.
-    let about = &app.plugin.checks[0];
-    assert_eq!(about.label, "about");
+    let plugin = &app.services.checks[1];
+    assert_eq!(plugin.label, "plugin");
     assert!(
-        about.detail.iter().any(|l| l == "claude: press r to probe"),
-        "the about row invites the `r` probe: {:?}",
-        about.detail
+        plugin
+            .detail
+            .iter()
+            .any(|l| l == "claude: press r to probe"),
+        "the plugin row invites the `r` probe: {:?}",
+        plugin.detail
     );
     assert!(
-        !about.detail.iter().any(|l| l == "claude: not found"),
+        !plugin.detail.iter().any(|l| l == "claude: not found"),
         "an unprobed version must not claim claude is missing: {:?}",
-        about.detail
+        plugin.detail
     );
 
     // The probe resolves (a real construction runs it, `r` re-runs it): the
-    // herdr row inserts at the landing index and the cursor is on it without
-    // any key handling.
-    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_plugin_checks(&mut app, false);
-    assert_eq!(app.plugin.cursor, 3);
+    // herdr row inserts and the pending landing selects it by label.
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false);
+    assert!(app.services.checks.iter().any(|c| c.label == "herdr"));
     assert_eq!(
-        app.plugin.selected_check().map(|c| c.label),
+        app.services.selected_check().map(|c| c.label),
         Some("herdr"),
-        "the landing row is the herdr check once it renders"
+        "the pending landing re-lands on the herdr row once it appears"
     );
     assert_eq!(
-        app.plugin.focus,
-        super::PluginFocus::Detail,
-        "the recompute keeps the landing descended into the detail pane"
+        app.services.focus,
+        super::ServicesFocus::Detail,
+        "and descends into the herdr detail"
+    );
+    assert!(
+        !app.services.land_on_herdr,
+        "landing clears the pending intent"
+    );
+
+    // The landing slot itself: with herdr present at construction (the real
+    // production path, where `HERDR_ENV=1` proves herdr resolves), the pending
+    // intent lands on the herdr row in the same recompute.
+    let mut landed = bare_app();
+    landed.services.land_on_herdr = true;
+    landed.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut landed, false);
+    assert_eq!(
+        landed.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "a pending landing selects the herdr row once it renders"
+    );
+
+    // A user cursor move while the landing is still pending cancels it: the
+    // user has taken over, so a later herdr resolve must not yank the cursor.
+    let mut moved = bare_app();
+    moved.tab = super::Tab::Services;
+    moved.services.land_on_herdr = true;
+    moved.services.herdr = Some(None);
+    super::recompute_services_checks(&mut moved, false);
+    assert!(
+        moved.services.land_on_herdr,
+        "fixture control: still pending"
+    );
+    super::handle_key(&mut moved, crate::testutil::key(super::KeyCode::Up));
+    assert!(
+        !moved.services.land_on_herdr,
+        "moving the cursor clears the pending landing"
+    );
+    moved.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut moved, false);
+    assert_ne!(
+        moved.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "a cancelled landing does not re-land when herdr later resolves"
+    );
+
+    // ↵ also clears the intent: the user has descended, so focus must not move.
+    let mut descended = bare_app();
+    descended.tab = super::Tab::Services;
+    descended.services.land_on_herdr = true;
+    descended.services.herdr = Some(None);
+    super::recompute_services_checks(&mut descended, false);
+    super::handle_key(&mut descended, crate::testutil::key(super::KeyCode::Enter));
+    assert!(
+        !descended.services.land_on_herdr,
+        "↵ clears the pending landing"
+    );
+
+    // A tab switch clears the intent too: leaving the tab means no later
+    // recompute may yank the cursor back to herdr.
+    let mut left = bare_app();
+    left.tab = super::Tab::Services;
+    left.services.land_on_herdr = true;
+    left.services.herdr = Some(None);
+    super::recompute_services_checks(&mut left, false);
+    super::switch_tab(&mut left, super::Tab::Overview);
+    assert!(
+        !left.services.land_on_herdr,
+        "a tab switch clears the pending landing"
     );
 
     // `r` is still the only thing that probes the version.
-    super::recompute_plugin_checks(&mut app, true);
+    super::recompute_services_checks(&mut app, true);
     assert!(
-        app.plugin.cc_version.is_some(),
+        app.services.cc_version.is_some(),
         "`r` runs the version probe"
     );
 
@@ -12737,9 +12672,9 @@ fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
         "a plain app opens the home tab (overview by default)"
     );
     assert!(!app.herdr_mode);
-    assert_eq!(app.plugin.cursor, 0);
+    assert_eq!(app.services.cursor, 0);
     assert!(
-        app.plugin.checks.is_empty(),
+        app.services.checks.is_empty(),
         "no construction recompute outside the first herdr landing"
     );
     let saved = std::fs::read_to_string(
@@ -12764,7 +12699,7 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
     let first = bare_app().with_herdr_mode(true);
     assert_eq!(
         first.tab,
-        super::Tab::Plugin,
+        super::Tab::Services,
         "the first herdr launch lands on Plugin"
     );
     let saved = std::fs::read_to_string(
@@ -12786,13 +12721,14 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
         "the second herdr launch opens the home tab (overview by default)"
     );
     assert!(
-        second.plugin.checks.is_empty(),
+        second.services.checks.is_empty(),
         "a later herdr launch skips the eager probe the first landing paid for"
     );
 }
 
 /// A plain launch honors the configured home tab: a top-level `home_tab = "plugin"`
-/// in profiles.toml opens the Plugin tab, with no herdr-mode flag and no eager probe.
+/// in profiles.toml loads through the alias onto the Services tab, with no
+/// herdr-mode flag and no eager probe.
 #[test]
 fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -12808,12 +12744,12 @@ fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
     let app = App::new(config).with_herdr_mode(false);
     assert_eq!(
         app.tab,
-        super::Tab::Plugin,
+        super::Tab::Services,
         "the configured home tab decides a plain launch"
     );
     assert!(!app.herdr_mode);
     assert!(
-        app.plugin.checks.is_empty(),
+        app.services.checks.is_empty(),
         "a plain launch runs no eager probe, whatever the home tab"
     );
     let saved = std::fs::read_to_string(

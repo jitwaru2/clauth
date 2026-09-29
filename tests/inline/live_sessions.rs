@@ -265,7 +265,7 @@ fn a_session_that_never_swapped_counts_on_the_account_it_launched_on() {
 
 /// The other direction: once a session has swapped, the launch account is a
 /// place nothing authenticates as, and counting it there is the exact defect
-/// that made the Plugin tab report one child as two.
+/// that made the Services tab report one child as two.
 #[test]
 fn a_swapped_session_counts_on_its_current_member_and_not_its_launch_one() {
     let mut swapped = row("4242-0", "work");

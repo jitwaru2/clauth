@@ -363,7 +363,7 @@ pub(crate) fn read_config(path: &Path) -> Result<String> {
     }
 }
 
-/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Plugin tab reads CC's registry.
+/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Services tab reads CC's registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryEntry {
     pub(crate) enabled: bool,
@@ -383,7 +383,7 @@ pub(crate) struct RegistryEntry {
     pub(crate) warnings: Vec<String>,
 }
 
-/// Everything the Plugin tab's herdr row needs that costs a subprocess.
+/// Everything the Services tab's herdr row needs that costs a subprocess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HerdrProbe {
     /// The version token after `herdr ` in `herdr --version`.
@@ -414,7 +414,7 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 
 /// The herdr binary to drive: `HERDR_BIN_PATH` when it names an existing file,
 /// else a `PATH`-resolved herdr. `None` when herdr is not installed. Shared by
-/// the Plugin tab probe and the pane reporter, so both resolve one name.
+/// the Services tab probe and the pane reporter, so both resolve one name.
 pub(crate) fn resolved_bin() -> Option<PathBuf> {
     let raw = herdr_bin();
     let candidate = Path::new(&raw);
@@ -473,7 +473,7 @@ pub(crate) fn strip_session_env(cmd: &mut Command) {
 
 /// [`bounded_output`] plus [`strip_session_env`] at a per-call deadline: the
 /// bounded herdr call shape every daemon-side spawn uses. Pane-side callers
-/// (the T6 pane reporter, the Plugin tab) keep plain [`bounded_output`],
+/// (the T6 pane reporter, the Services tab) keep plain [`bounded_output`],
 /// because a call made from inside a pane must target that pane's own session.
 pub(crate) fn daemon_bounded_output_deadline(
     bin: &str,
@@ -1195,7 +1195,7 @@ pub(crate) enum SidebarState {
     Absent,
 }
 
-/// The config-side verdicts the Plugin tab's herdr row shows, read straight from the parsed document. `parsed` is false when the file does not parse.
+/// The config-side verdicts the Services tab's herdr row shows, read straight from the parsed document. `parsed` is false when the file does not parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigStatus {
     pub(crate) parsed: bool,

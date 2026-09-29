@@ -446,8 +446,8 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
 /// when that happened and the caveat that makes the figure honest.
 ///
 /// `live` is the one word every TUI surface counting sessions uses (the
-/// Overview column header, the Plugin runtime row, the Setup tab's disable
-/// gate), so the count reads the same wherever the operator meets it on screen.
+/// Overview column header and the Setup tab's disable gate), so the count
+/// reads the same wherever the operator meets it on screen.
 /// The CLI's refusals share the noun but not the phrasing — they answer a
 /// different question (why a command was refused), so they word it their own
 /// way.

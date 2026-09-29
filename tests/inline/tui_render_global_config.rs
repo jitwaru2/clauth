@@ -133,7 +133,7 @@ fn home_tab_renders_in_the_appearance_band_at_the_shared_value_column() {
         if line.contains("home tab") {
             found = true;
             for name in [
-                "overview", "usage", "tokens", "setup", "fallback", "config", "status", "plugin",
+                "overview", "usage", "tokens", "setup", "fallback", "config", "status", "services",
             ] {
                 assert!(line.contains(name), "the home tab row lists {name}: {line}");
             }

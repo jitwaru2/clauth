@@ -662,7 +662,7 @@ pub(crate) enum ClockFormat {
 /// The tab a launch opens on: the Config tab's `home tab` row, persisted as a
 /// top-level `home_tab` key in profiles.toml beside `theme` /
 /// `reset_display` / `clock_format`. Read by the TUI at construction; the
-/// first herdr launch overrides it (Plugin tab, herdr row selected, detail
+/// first herdr launch overrides it (Services tab, herdr row selected, detail
 /// open) and then marks the landing done in `[herdr] first_landing_done`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -675,7 +675,11 @@ pub(crate) enum HomeTab {
     Fallback,
     Config,
     Status,
-    Plugin,
+    /// The retired spelling `plugin` deserializes as this tab (the renamed
+    /// `PopupWidth::Fit`'s `#[serde(alias = "full")]` precedent), so a
+    /// profiles.toml written before the tab became Services still loads.
+    #[serde(alias = "plugin")]
+    Services,
 }
 
 impl HomeTab {
@@ -688,7 +692,7 @@ impl HomeTab {
         HomeTab::Fallback,
         HomeTab::Config,
         HomeTab::Status,
-        HomeTab::Plugin,
+        HomeTab::Services,
     ];
 
     /// The on-disk spelling, doubled as the cycle row's chip label.
@@ -701,7 +705,7 @@ impl HomeTab {
             HomeTab::Fallback => "fallback",
             HomeTab::Config => "config",
             HomeTab::Status => "status",
-            HomeTab::Plugin => "plugin",
+            HomeTab::Services => "services",
         }
     }
 }
@@ -744,7 +748,7 @@ impl PopupWidth {
 }
 
 /// The herdr knobs, persisted under `[herdr]` in profiles.toml. Written by the
-/// Plugin tab's herdr-options form rows, read by the plugin scripts through
+/// Services tab's herdr-options form rows, read by the plugin scripts through
 /// `clauth herdr config get <key>` and by the TUI at launch — so the on-disk
 /// shape is also a published read contract. The `[herdr]` table itself may be
 /// absent (defaults) or partial: a missing field fills from [`Default`]

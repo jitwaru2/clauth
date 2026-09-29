@@ -796,7 +796,7 @@ case "$1" in
       install)
         : > "$CLAUDE_SHIM_STATE"
         # The registry clauth's own probe reads: write the user-scope entry so
-        # the Plugin tab recompute after the install sees it.
+        # the Services tab recompute after the install sees it.
         mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
         printf '{"plugins":{"clauth@clauth":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
         ;;

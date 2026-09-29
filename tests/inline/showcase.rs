@@ -828,11 +828,11 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Status);
     press(&mut app, KeyCode::Right);
-    assert_eq!(app.tab, Tab::Plugin);
+    assert_eq!(app.tab, Tab::Services);
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Plugin, "← wraps to the last tab");
+    assert_eq!(app.tab, Tab::Services, "← wraps to the last tab");
     // Seven ← from the last tab walk back to the first.
     for _ in 0..7 {
         press(&mut app, KeyCode::Left);
@@ -1177,12 +1177,12 @@ fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Status);
     press(&mut app, KeyCode::Tab);
-    assert_eq!(app.tab, Tab::Plugin);
+    assert_eq!(app.tab, Tab::Services);
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
 
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(app.tab, Tab::Plugin, "BackTab wraps to the last tab");
+    assert_eq!(app.tab, Tab::Services, "BackTab wraps to the last tab");
     // Seven BackTab from the last tab walk back to the first, same as ←.
     for _ in 0..7 {
         press(&mut app, KeyCode::BackTab);

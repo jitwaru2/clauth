@@ -265,7 +265,7 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             ClockFormat::H12 => "write reset times as 9:20pm, in your local timezone",
         }),
         GlobalConfigRow::HomeTab => String::from(
-            "the tab clauth opens on; the first herdr launch opens the plugin tab with the herdr row selected",
+            "the tab clauth opens on; the first herdr launch opens the services tab with the herdr row selected",
         ),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",

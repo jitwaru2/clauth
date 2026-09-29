@@ -791,7 +791,7 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
 /// across every marker dir, one per session. Reports 1 on an unknown, so it never
 /// contradicts [`has_live_session`] within a tick.
 ///
-/// TEST-ONLY since 2026-07-25. Its one production consumer, the Plugin tab's
+/// TEST-ONLY since 2026-07-25. Its one production consumer, the Services tab's
 /// fleet tally, moved to `live_sessions::LiveTally`: this counts markers per
 /// profile, so a session that swapped A→B reads as one session on each of two
 /// accounts, and only the registry can tell those apart.
@@ -919,7 +919,7 @@ pub(crate) fn gc_stale_runtimes() {
     // wider one is adopted rather than replaced.
     #[cfg(target_os = "macos")]
     let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
-    // The Plugin tab's boot probe kills its `clauth mcp` child within 3 s, so
+    // The Services tab's boot probe kills its `clauth mcp` child within 3 s, so
     // the tree sweep skips there WHOLE: on macOS it spends `security`
     // subprocesses collecting the removed trees' Keychain items, and on every
     // platform it takes the state flock per pair against the 25 s deadline a
@@ -1669,7 +1669,7 @@ fn gc_bare_markers() {
         return;
     };
     // Peek before locking. This runs at every `clauth mcp` boot — including the
-    // Plugin tab's probe child, which dies at 3s — while the state flock waits up
+    // Services tab's probe child, which dies at 3s — while the state flock waits up
     // to `STATE_LOCK_TIMEOUT` and is legitimately held ~20s by a macOS switch's
     // keychain shell-out. Nothing to prune must not pay that wait. A marker that
     // appears after the peek is collected by the next sweep, which is the whole

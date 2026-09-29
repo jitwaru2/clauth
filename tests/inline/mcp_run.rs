@@ -4799,7 +4799,7 @@ fn only_a_globally_authenticated_server_registers_a_bare_marker() {
     assert!(!bare_marker_wanted(&SessionAuth::IsolatedCustom, false));
 }
 
-/// The Plugin tab's `r` handshake boots a real `clauth mcp` child. Without the
+/// The Services tab's `r` handshake boots a real `clauth mcp` child. Without the
 /// marker its 3s life would land on the tally as a session nobody is running —
 /// and the probe inherits no `CLAUDE_CONFIG_DIR` of its own to be caught by.
 #[test]

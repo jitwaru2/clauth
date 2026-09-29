@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::account_tier;
+use crate::format::{account_tier, truncate};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -40,6 +40,22 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
     }
     let pad = " ".repeat(width - count);
     (content, pad)
+}
+
+/// Middle-ellipsis truncation (for paths / URLs / IDs — both ends carry
+/// meaning). The head and tail share what the ellipsis does not use; an odd
+/// budget spends its extra char on the head.
+pub(super) fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return truncate(s, max);
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let front: String = chars[..head].iter().collect();
+    let back: String = chars[chars.len() - tail..].iter().collect();
+    format!("{front}…{back}")
 }
 
 #[cfg(test)]

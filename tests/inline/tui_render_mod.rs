@@ -969,7 +969,7 @@ fn narrow_master_detail_stacks_wide_stays_side_by_side() {
         Tab::Setup,
         Tab::Fallback,
         Tab::Status,
-        Tab::Plugin,
+        Tab::Services,
         Tab::Tokens,
     ] {
         app.tab = tab;
@@ -1122,11 +1122,11 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
         out.contains("a actions"),
         "the daemon verb alone keeps it advertised:\n{out}"
     );
-    app.tab = Tab::Plugin;
+    app.tab = Tab::Services;
     let out = dump(&app, 120, 30);
     assert!(
         out.contains("a actions"),
-        "the Plugin tab's menu holds the daemon verb too:\n{out}"
+        "the Services tab's menu holds the daemon verb too:\n{out}"
     );
 }
 
@@ -1559,7 +1559,7 @@ fn the_home_tab_row_wraps_between_chips_at_a_narrow_pane() {
 
     let mut app = App::new(AppConfig {
         state: AppState {
-            home_tab: Some(HomeTab::Plugin),
+            home_tab: Some(HomeTab::Services),
             ..AppState::default()
         },
         profiles: Vec::new(),
@@ -1571,14 +1571,14 @@ fn the_home_tab_row_wraps_between_chips_at_a_narrow_pane() {
         .expect("home tab row");
 
     // 60 cols: the first line holds the key cell plus four chips, the rest of
-    // the run — including the selected `[plugin]` — continues below.
+    // the run — including the selected `[services]` — continues below.
     let screen = dump(&app, 60, 24);
     assert!(
         screen.contains("home tab"),
         "the home tab row renders:\n{screen}"
     );
     assert!(
-        screen.contains("[plugin]"),
+        screen.contains("[services]"),
         "the selected value must stay visible at a narrow pane:\n{screen}"
     );
     assert!(
@@ -2231,7 +2231,7 @@ fn fallback_preferred_days_footer_hints() {
 fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::testutil::key;
-    use crate::tui::app::{FALLBACK_ROWS, FallbackRow, InputState, PluginFocus, Tab, handle_key};
+    use crate::tui::app::{FALLBACK_ROWS, FallbackRow, InputState, ServicesFocus, Tab, handle_key};
     use ratatui::crossterm::event::KeyCode;
     const TYPED: &str = "↵ save   ←→ caret   esc revert";
 
@@ -2255,8 +2255,8 @@ fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
         app
     };
     let press_enter = |app: &mut App| handle_key(app, key(KeyCode::Enter));
-    let mut plugin = on_tab(Tab::Plugin);
-    plugin.plugin.focus = PluginFocus::Detail;
+    let mut plugin = on_tab(Tab::Services);
+    plugin.services.focus = ServicesFocus::Detail;
 
     type Open = Box<dyn Fn(&mut App)>;
     let cases: Vec<(&str, App, Open, &str)> = vec![
@@ -2305,7 +2305,7 @@ fn an_editor_owning_the_arrows_names_them_and_drops_the_tab_hint() {
         (
             "herdr tag refresh",
             plugin,
-            Box::new(|app| app.plugin.herdr_tag_draft = Some(InputState::new("5"))),
+            Box::new(|app| app.services.herdr_tag_draft = Some(InputState::new("5"))),
             TYPED,
         ),
         ("setup name", setup(), Box::new(press_enter), TYPED),

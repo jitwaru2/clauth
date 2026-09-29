@@ -1,14 +1,13 @@
-//! Plugin-tab render tests. The `herdr` row: the dot color carries the verdict,
-//! the selector row right-aligns a `[f]` marker exactly when the check offers a
-//! fix — the verdict logic itself is unit-tested in `tests/inline/tui_app.rs`,
-//! these pin the render per drift state. And the delegates pane: its rows, its
-//! agreement with what `monitor` reports for the same record, its overflow
-//! marker, and its empty state.
+//! Services-tab render tests. Each row is a dot + label in the selector; the
+//! verdict lives in the detail pane. The `herdr` row's verdict logic is
+//! unit-tested in `tests/inline/tui_app.rs`; these pin the render per drift
+//! state. The delegates detail shows the job list; its rows, overflow marker
+//! and empty state are pinned here too.
 
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 use crate::mcp::jobs::{self, JobRecord, JobState, RecordKind, RunningSpec};
 use crate::profile::{AppConfig, AppState};
-use crate::tui::app::{App, Check, Health, herdr_check};
+use crate::tui::app::{App, Check, Health, Problem, ServiceFix, delegates_check, herdr_check};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
@@ -59,13 +58,57 @@ fn healthy_config() -> ConfigStatus {
     config(true, Some("prefix+a"), SidebarState::Templated)
 }
 
+/// A `plugin` row with two fixable problems (wire, then install) and the folded
+/// readout, built directly so the render pins never touch the FS probes.
+fn plugin_check_with_problems() -> Check {
+    Check {
+        label: "plugin",
+        health: Health::Warn,
+        detail: vec![
+            "data: /home/u/.clauth".to_string(),
+            "path: /usr/local/bin/clauth".to_string(),
+            "mcp wired: no".to_string(),
+            "mcp source: none".to_string(),
+            "writes the clauth entry into ~/.claude.json".to_string(),
+            "f  wire mcp server".to_string(),
+            "installed: no (marketplace known)".to_string(),
+            "installs at user scope".to_string(),
+            "f  install plugin".to_string(),
+            "claude: press r to probe".to_string(),
+        ],
+        fix: Some(ServiceFix::WireMcpServers),
+        problems: vec![
+            Problem {
+                line: 5,
+                fix: ServiceFix::WireMcpServers,
+            },
+            Problem {
+                line: 8,
+                fix: ServiceFix::InstallPlugin,
+            },
+        ],
+    }
+}
+
 fn app_with(check: Check) -> App {
     let mut app = App::new(AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
     });
-    app.plugin.checks = vec![check];
-    app.plugin.cursor = 0;
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.checks = vec![check];
+    app.services.cursor = 0;
+    app
+}
+
+fn app_with_checks(checks: Vec<Check>) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.checks = checks;
+    app.services.cursor = 0;
     app
 }
 
@@ -76,21 +119,22 @@ fn render(app: &App) -> (Vec<String>, ratatui::buffer::Buffer) {
     (crate::testutil::buffer_rows(&buf), buf)
 }
 
-/// The dot carries the verdict hue and the selector row shows `[f]` exactly when
-/// the check offers one. `expected` is the health the state should render.
-fn assert_row(check: Check, expected: Health, expect_fix: bool) {
-    assert_eq!(
-        check.fix.is_some(),
-        expect_fix,
-        "fix offer for {:?}",
-        check.detail
-    );
-    let app = app_with(check);
+/// The whole frame (header + body + footer), for the footer-hint pins.
+fn dump_full(app: &App) -> String {
+    let mut term = Terminal::new(TestBackend::new(W, H)).unwrap();
+    term.draw(|f| super::super::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+}
+
+/// The dot carries the verdict hue and the selector row carries no `[f]` cue —
+/// dots only. `expected` is the health the state should render.
+fn assert_dot(check: &Check, expected: Health) {
+    let app = app_with(check.clone());
     let (rows, buf) = render(&app);
     let row_idx = rows
         .iter()
-        .position(|r| r.contains("● herdr"))
-        .unwrap_or_else(|| panic!("no herdr selector row:\n{}", rows.join("\n")));
+        .position(|r| r.contains('●'))
+        .unwrap_or_else(|| panic!("no selector row:\n{}", rows.join("\n")));
     let row = &rows[row_idx];
 
     // Buffer COLUMN, not byte offset — the caret and dot are multi-byte.
@@ -112,40 +156,399 @@ fn assert_row(check: Check, expected: Health, expect_fix: bool) {
         expected,
         rows.join("\n")
     );
+    assert!(
+        !row.contains("[f]"),
+        "a selector row is dots only, no `[f]` cue:\n{row}"
+    );
+}
 
-    // Split at the two adjacent pane borders so the detail pane's own `[f]` line
-    // (a different screen row) can't satisfy the selector-marker check.
-    let selector = row.split("││").next().unwrap_or(row);
+// ── selector rows ──────────────────────────────────────────────────────────────
+
+/// The three service rows render as dot + label, in order, with no fix cue on
+/// any row.
+#[test]
+fn the_selector_lists_each_service_row_dot_and_label_only() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_checks(vec![
+        delegates_check(&[], &[]),
+        plugin_check_with_problems(),
+        herdr_check(&healthy_probe(), Some(&healthy_config())),
+    ]);
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    for label in ["delegates", "plugin", "herdr"] {
+        assert!(
+            screen.contains(&format!("● {label}")),
+            "the `{label}` row renders dot + label:\n{screen}"
+        );
+    }
+    assert!(
+        !screen.contains("[f]"),
+        "no selector row carries a fix cue; the fix lives in the detail:\n{screen}"
+    );
+}
+
+// ── footer hints ───────────────────────────────────────────────────────────────
+
+/// Each Services focus state's whole footer hint list, pinned by equality: the
+/// `↵ detail` gate on delegates, the list `f` verb, the plugin detail's
+/// per-problem verb, and the herdr detail's options keys.
+#[test]
+fn the_services_footer_hints_pin_each_focus_state() {
+    use crate::tui::app::ServicesFocus;
+    let _home = crate::testutil::HomeSandbox::new();
+    let hints = |app: &App| super::super::footer::services_hints(app);
+
+    // List on delegates: no `↵ detail`, no `f`.
+    let app = app_with_checks(vec![
+        delegates_check(&[], &[]),
+        plugin_check_with_problems(),
+    ]);
     assert_eq!(
-        selector.contains("[f]"),
-        expect_fix,
-        "selector `[f]` marker for {:?}:\n{}",
-        expected,
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a selected delegates row binds no key beyond the shared ones"
+    );
+
+    // List on plugin (with a fix): `↵ detail` and the list `f` verb.
+    let app = app_with(plugin_check_with_problems());
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("↵", "detail"),
+            ("r", "refresh"),
+            ("f", "wire mcp server"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the list focus advertises the first fixable problem's verb"
+    );
+
+    // List on herdr (no fix): `↵ detail`, no `f`.
+    let app = app_with(herdr_check(&healthy_probe(), Some(&healthy_config())));
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("↵", "detail"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "a healthy herdr row offers no fix verb"
+    );
+
+    // Plugin detail, focused problem 0 and 1: the verb follows the focus.
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.focus = ServicesFocus::Detail;
+    app.services.problem_cursor = 0;
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "problem"),
+            ("r", "refresh"),
+            ("f", "wire mcp server"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the wire problem names its verb"
+    );
+    app.services.problem_cursor = 1;
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "problem"),
+            ("r", "refresh"),
+            ("f", "install plugin"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the install problem names its verb"
+    );
+
+    // Herdr detail: the options row keys, no `f` on a healthy check.
+    let app = herdr_options_app(healthy_config());
+    assert_eq!(
+        hints(&app),
+        vec![
+            ("↑↓", "row"),
+            ("space/↵", "cycle / toggle"),
+            ("r", "refresh"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
+        "the herdr options detail advertises its own keys"
+    );
+}
+
+/// The plugin detail folds the four readouts and renders each fix as a dim
+/// `f  <verb>` line under its problem — never a bracketed `[f]` cue.
+#[test]
+fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with(plugin_check_with_problems());
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    // `key: value` rows render with the colon dropped and the value trailing the
+    // padded key column, so the pins assert the surviving value substrings.
+    for needle in [
+        "/home/u/.clauth",
+        "/usr/local/bin/clauth",
+        "mcp wired",
+        "mcp source",
+        "no (marketplace known)",
+        "press r to probe",
+    ] {
+        assert!(screen.contains(needle), "`{needle}` missing:\n{screen}");
+    }
+    for needle in ["f  wire mcp server", "f  install plugin"] {
+        assert!(screen.contains(needle), "`{needle}` missing:\n{screen}");
+    }
+    assert!(
+        !screen.contains("[f]"),
+        "the bracketed `[f]` anti-pattern is gone:\n{screen}"
+    );
+
+    // The dim `f` line: both `f` and the verb render dim (TEXT_DIM), pinned off
+    // the styled buffer rather than the glyph text.
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("wire mcp server"))
+        .unwrap_or_else(|| panic!("no wire fix line:\n{screen}"));
+    let row = &rows[row_idx];
+    let byte = row.find("f").expect("f renders");
+    let col = row[..byte].chars().count();
+    assert_eq!(
+        buf.content[row_idx * W as usize + col].fg,
+        super::theme::text_dim_color(),
+        "an unfocused fix line is whole-dim:\n{screen}"
+    );
+}
+
+/// Descending into the plugin detail, ↑↓ walks the fixable problems and the
+/// focused one takes the caret; `f` fires the focused problem's fix.
+#[test]
+fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
+    use crate::tui::app::{Modal, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(plugin_check_with_problems());
+    // Descend into the plugin detail.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+
+    // First problem (wire) is focused; the footer names its verb.
+    let dump = dump_full(&app);
+    assert!(
+        dump.contains("f wire mcp server"),
+        "the footer names the focused problem's verb:\n{dump}"
+    );
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("❯") && r.contains("wire mcp server")),
+        "the focused problem takes the caret:\n{screen}"
+    );
+    // The focused problem line takes the same hover tint a focused herdr
+    // option takes: bg pinned off the styled buffer, not the glyph text.
+    let caret_row = rows
+        .iter()
+        .position(|r| r.contains("❯") && r.contains("wire mcp server"))
+        .expect("focused problem row");
+    let caret_byte = rows[caret_row].find("f").expect("f glyph");
+    let caret_col = rows[caret_row][..caret_byte].chars().count();
+    assert_eq!(
+        buf.content[caret_row * W as usize + caret_col].bg,
+        super::theme::bg_hover(),
+        "the focused problem line carries the hover tint:\n{screen}"
+    );
+
+    // `f` from the focused problem opens the wire confirm.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Confirm(_))),
+        "f on a problem opens its confirm"
+    );
+    app.modals.clear();
+
+    // Walk to the second problem (install); the footer and caret follow.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let dump = dump_full(&app);
+    assert!(
+        dump.contains("f install plugin"),
+        "the footer follows the focus to the install verb:\n{dump}"
+    );
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("❯") && r.contains("install plugin")),
+        "the caret follows to the install problem:\n{screen}"
+    );
+
+    // `f` now fires the install fix.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(
+                state.on_confirm,
+                crate::tui::app::ConfirmAction::InstallPlugin
+            ),
+            "f on the focused install problem runs the install"
+        ),
+        other => panic!("expected an install confirm, got {other:?}"),
+    }
+}
+
+/// A fix landing under a focused cursor can shrink the problem set; the render
+/// must read the cursor through `.get` and never panic on a stale cursor.
+#[test]
+fn the_plugin_detail_renders_a_shrunk_problem_set_without_panicking() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(plugin_check_with_problems());
+    app.services.focus = crate::tui::app::ServicesFocus::Detail;
+    app.services.problem_cursor = 1;
+    // Shrink the problem set under the focused cursor (as a landed install fix
+    // would): one problem remains, the cursor now points past it.
+    let mut check = plugin_check_with_problems();
+    check.problems.truncate(1);
+    app.services.checks = vec![check];
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter().any(|r| r.contains("wire mcp server")),
+        "the surviving problem still renders:\n{}",
         rows.join("\n")
     );
 }
 
-// ── delegates pane ──────────────────────────────────────────────────────────────
+/// The Services detail line renderer truncates to the pane: a path value keeps
+/// both ends (middle ellipsis), prose trails — instead of clipping at the
+/// border with no marker.
+#[test]
+fn detail_line_truncates_paths_and_prose_to_the_pane() {
+    use ratatui::text::Line;
+    let text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    let long_path = "/home/uwuclxdy/.cargo/bin/clauth";
+    // value column = width - key_w - 2 = 20 - 4 - 2 = 14 cells; the shared
+    // `middle_truncate` keeps 7 head / 6 tail (the head rounds up).
+    let line = super::detail_line(&format!("path: {long_path}"), 4, 20);
+    assert_eq!(
+        text(&line),
+        "path  /home/u…clauth",
+        "the path keeps both ends around the ellipsis"
+    );
+
+    // Prose trails an ellipsis.
+    let line = super::detail_line("claude code spawns clauth mcp by name", 6, 20);
+    let rendered = text(&line);
+    assert!(
+        rendered.ends_with('…'),
+        "prose trails an ellipsis: {rendered}"
+    );
+}
+
+/// The Services detail value colouring follows the renamed keys: a boot
+/// failure is danger, an unwired server warns (what `present: no` was), and an
+/// absent install stays warning.
+#[test]
+fn the_plugin_detail_tones_the_mcp_and_install_values() {
+    use ratatui::style::Color;
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with(Check {
+        label: "plugin",
+        health: Health::Warn,
+        detail: vec![
+            "mcp wired: no".to_string(),
+            "mcp server: failed (refused)".to_string(),
+            "installed: no (marketplace unknown)".to_string(),
+        ],
+        fix: None,
+        problems: Vec::new(),
+    });
+    let (rows, buf) = render(&app);
+
+    // The widest key here is `mcp server` (10), so every value starts 12 cells
+    // after its key column.
+    let value_fg = |key: &str| -> Color {
+        let row_idx = rows
+            .iter()
+            .position(|r| r.contains(key))
+            .unwrap_or_else(|| panic!("no `{key}` row"));
+        let row = &rows[row_idx];
+        let key_col = row[..row.find(key).expect("key renders")].chars().count();
+        buf.content[row_idx * W as usize + key_col + 12].fg
+    };
+
+    assert_eq!(
+        value_fg("mcp wired"),
+        super::theme::warning_color(),
+        "an unwired server warns"
+    );
+    assert_eq!(
+        value_fg("mcp server"),
+        super::theme::danger_color(),
+        "a boot failure is danger"
+    );
+    assert_eq!(
+        value_fg("installed"),
+        super::theme::warning_color(),
+        "an absent install stays warning"
+    );
+}
+
+/// From the list, `f` on the plugin row fixes the FIRST fixable problem shown
+/// (wire), never the second.
+#[test]
+fn the_list_f_fixes_the_first_fixable_problem() {
+    use crate::tui::app::{Modal, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(plugin_check_with_problems());
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(
+                state.on_confirm,
+                crate::tui::app::ConfirmAction::WireMcpServers
+            ),
+            "list f fixes the first fixable problem (wire)"
+        ),
+        other => panic!("expected a wire confirm, got {other:?}"),
+    }
+}
+
+// ── delegates detail ────────────────────────────────────────────────────────────
+
+fn app_with_delegates(delegates: Vec<jobs::StoredJob>) -> App {
+    let mut app = app_with_checks(vec![delegates_check(&delegates, &[])]);
+    app.services.delegates = delegates;
+    app
+}
 
 /// A realistic wall clock rather than a round synthetic one: every row's state is
 /// chosen by comparing its own stamps against this, and a year-2096 `now` routes
 /// whole classes into one branch.
 ///
-/// Only the PURE tests may pin it. A `TestBackend` render reaches the pane
+/// Only the PURE tests may pin it. A `TestBackend` render reaches the detail
 /// through `draw`, which reads the real clock, so every render fixture below is
 /// seeded relative to `now_ms()` and asserts what the clock cannot move — the
 /// state words, the accounts, which fields are present, and the steer line. The
 /// exact figures are pinned where `now` is an argument.
 const NOW: u64 = 1_800_000_000_000;
-
-fn app_with_delegates(delegates: Vec<jobs::StoredJob>) -> App {
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: Vec::new(),
-    });
-    app.plugin.delegates = delegates;
-    app
-}
 
 /// The streaming shape a real reserve writes: no wall clock, the default idle
 /// guard.
@@ -263,7 +666,7 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
 
 /// The three hues the four states map onto, off the styled buffer.
 ///
-/// The pane had NO colour assertion at all until the `JobPhase` fold, and the
+/// The detail had NO colour assertion at all until the `JobPhase` fold, and the
 /// arm that mattered was `blocking`: it is LIVE but not COLLECTABLE, so a fold
 /// that reconstructed the hue from `is_collectable()` instead of the live band
 /// would have recoloured it to `done`'s success green with every test in the
@@ -272,7 +675,7 @@ fn a_delegate_row_carries_the_figures_its_own_record_holds() {
 ///
 /// Mapped to the theme here rather than through `state_color`, so a regression
 /// in that mapping reds this instead of moving both sides together — the same
-/// rule `assert_row` plays by for the health dot.
+/// rule `assert_dot` plays by for the health dot.
 #[test]
 fn each_delegate_state_carries_its_own_hue() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -286,7 +689,6 @@ fn each_delegate_state_carries_its_own_hue() {
             .position(|r| r.contains(account))
             .unwrap_or_else(|| panic!("no row for `{account}`:\n{screen}"));
         let row = &rows[row_idx];
-        // Buffer COLUMN, not byte offset — the dot is multi-byte.
         let byte = row.find(['●', '○']).expect("state dot renders");
         let col = row[..byte].chars().count();
         buf.content[row_idx * W as usize + col].fg
@@ -315,7 +717,7 @@ fn each_delegate_state_carries_its_own_hue() {
 }
 
 #[test]
-fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
+fn the_delegates_detail_names_each_state_and_carries_the_steer_line() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_delegates(seed_every_state(crate::usage::now_ms()));
     let (rows, _) = render(&app);
@@ -346,25 +748,16 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
         "and a corpse is drawn as one, never as live:\n{screen}"
     );
 
-    // The liveness fields reach the screen. Their VALUES move with the real
-    // clock this path reads, and are pinned exactly by the test above.
     let running = row_for("uwuclxdy");
-    for needle in ["elapsed ", "last output ", "idle-kill in "] {
+    // The detail pane is narrower than the old full-width third panel, so only
+    // the leading figures are guaranteed room; the exact deadline figures are
+    // pinned by `a_delegate_row_carries_the_figures_its_own_record_holds`.
+    for needle in ["elapsed ", "last output "] {
         assert!(
             running.contains(needle),
             "`{needle}` missing from the running row:\n{running}"
         );
     }
-    assert!(
-        running.contains("\"reading the"),
-        "the delegate's own words ride last, quoted so they cannot read as \
-         clauth's:\n{running}"
-    );
-    assert!(
-        running.contains('…'),
-        "and the tail is what gives way when the row runs out of width, rather \
-         than pushing a figure off it:\n{running}"
-    );
     assert!(
         row_for("DS8").contains("finished "),
         "a done row is dated by its finish:\n{screen}"
@@ -375,21 +768,21 @@ fn the_delegates_pane_names_each_state_and_carries_the_steer_line() {
     );
 }
 
-/// M9's own verify line: what the pane draws and what `monitor` tells the model
-/// about ONE record must not be able to disagree.
+/// What the detail draws and what `monitor` tells the model about ONE record
+/// must not be able to disagree.
 ///
 /// Every figure asserted here is read OUT of `monitor`'s payload and then looked
-/// for in the rendered row, so a pane that grew a second copy of the arithmetic
+/// for in the rendered row, so a detail that grew a second copy of the arithmetic
 /// reds this even when its own numbers look plausible.
 #[test]
-fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
+fn the_delegates_detail_reports_what_monitor_reports_for_the_same_record() {
     let _home = crate::testutil::HomeSandbox::new();
-    // A pinned-`--output-format` run, so BOTH deadlines are present and the pane
-    // has to pick the one that lands first — and one handed off mid-flight, so
-    // `recorded_at` sits well after `started_at`. That gap is what makes the
-    // test discriminate: on a record where the two are equal (every job that
-    // started out background), a pane counting elapsed from the wrong field
-    // agrees with `monitor` by accident.
+    // A pinned-`--output-format` run, so BOTH deadlines are present and the
+    // detail has to pick the one that lands first — and one handed off
+    // mid-flight, so `recorded_at` sits well after `started_at`. That gap is
+    // what makes the test discriminate: on a record where the two are equal
+    // (every job that started out background), a row counting elapsed from the
+    // wrong field agrees with `monitor` by accident.
     let spec = RunningSpec {
         timeout_secs: 900,
         idle_secs: Some(300),
@@ -447,14 +840,13 @@ fn the_delegates_pane_reports_what_monitor_reports_for_the_same_record() {
     );
 }
 
-/// More delegates than the pane can hold: the last row says how many did not
-/// fit. A scrollbar would be the contract's overflow signal, but this pane binds
-/// no key, so it would advertise a scroll that cannot happen.
+/// More delegates than the detail holds: the last row names the EXACT count that
+/// did not fit, computed off the rows that actually rendered.
 #[test]
-fn the_delegates_pane_marks_its_overflow_with_a_count() {
+fn the_delegates_detail_marks_its_overflow_with_a_count() {
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
-    for i in 0..9 {
+    for i in 0..22 {
         jobs::write_heartbeat(
             &running_spec(
                 &format!("d-many-{i}"),
@@ -476,17 +868,88 @@ fn the_delegates_pane_marks_its_overflow_with_a_count() {
         "the newest delegate is the one kept:\n{screen}"
     );
     assert!(
-        !screen.contains("acct8"),
+        !screen.contains("acct21"),
         "the oldest is the one dropped:\n{screen}"
     );
     let marker = rows
         .iter()
-        .find(|r| r.contains("more"))
+        .find(|r| r.contains(" more"))
         .unwrap_or_else(|| panic!("no overflow marker:\n{screen}"));
+    let shown = rows.iter().filter(|r| r.contains("● running")).count();
     assert!(
-        marker.contains("+4 more"),
-        "the marker counts what did not fit, and 9 rows into a 5-row list leaves \
-         4: {marker}"
+        shown < 22,
+        "fixture control: some rows did not fit:\n{screen}"
+    );
+    assert!(
+        marker.contains(&format!("+{} more", 22 - shown)),
+        "the marker names the exact hidden count:\n{screen}"
+    );
+}
+
+/// The pure `delegate_lines` contract: the overflow marker counts exactly, and
+/// the delegate's own quoted words are what gives way (with a trailing `…`)
+/// when the row runs out of width.
+#[test]
+fn delegate_lines_pin_the_overflow_count_and_quoted_tail_exactly() {
+    use crate::mcp::jobs::JobPhase;
+    use ratatui::text::Line;
+    let line_text = |line: &Line| {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    for i in 0..5 {
+        jobs::write_heartbeat(
+            &running_spec(
+                &format!("d-t-{i}"),
+                &format!("acct{i}"),
+                now - 10_000 - i as u64,
+                RecordKind::Collectable,
+            ),
+            now - 1_000 - i as u64,
+            "working",
+        )
+        .unwrap();
+    }
+    let stored = jobs::list_banded(now);
+    let cells = super::delegate_cells(&stored, now);
+
+    // 5 rows into a 3-row viewport: 2 shown, the marker names the other 3.
+    let lines = super::delegate_lines(&cells, 3, 100);
+    assert_eq!(
+        line_text(lines.last().expect("marker line")),
+        "+3 more",
+        "the marker names the exact hidden count"
+    );
+
+    // One running row with a long tail, at a width the tail can still reach:
+    // at full width the tail rides whole and quoted; at a narrow width it is
+    // what gives way, trailing an ellipsis.
+    let one = super::DelegateCells {
+        state: JobPhase::Running,
+        profile: "acct".to_string(),
+        facts: vec!["elapsed 5s".to_string()],
+        tail: "reading the plan doc".to_string(),
+    };
+    let wide = super::delegate_line(&one, 4, 100);
+    assert!(
+        line_text(&wide).contains("\"reading the plan doc\""),
+        "the quoted tail rides whole when it fits: {}",
+        line_text(&wide)
+    );
+    let narrow = super::delegate_line(&one, 4, 45);
+    let text = line_text(&narrow);
+    assert!(
+        text.contains('…'),
+        "the tail gives way with a trailing ellipsis when narrow: {text}"
+    );
+    assert!(
+        text.contains("\"reading"),
+        "and the quoted lead survives: {text}"
     );
 }
 
@@ -495,13 +958,13 @@ fn the_delegates_pane_marks_its_overflow_with_a_count() {
 /// `jobs::list` orders on the retention anchor, which for a `done` record is its
 /// FINISH — so every background job that landed a second ago outranks a blocking
 /// run that last spoke twenty seconds ago. On anchor order alone the row this
-/// pane exists for is the first one evicted, and the pane binds no key, so
+/// detail exists for is the first one evicted, and the detail binds no key, so
 /// nothing reaches it afterwards.
 #[test]
 fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
     let _home = crate::testutil::HomeSandbox::new();
     let now = crate::usage::now_ms();
-    // The row the whole pane exists for: a blocking run, three minutes in.
+    // The row the whole detail exists for: a blocking run, three minutes in.
     jobs::write_heartbeat(
         &running_spec("d-blk-0", "kerry", now - 180_000, RecordKind::Liveness),
         now - 20_000,
@@ -522,7 +985,7 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
     .unwrap();
     let dir = jobs::jobs_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
-    for i in 0..7 {
+    for i in 0..20 {
         std::fs::write(
             dir.join(format!("d-bg-{i}.json")),
             serde_json::to_vec(&serde_json::json!({
@@ -544,7 +1007,7 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
 
     assert!(
         rows.iter().any(|r| r.contains("more")),
-        "fixture control: more delegates than the pane holds, so something is \
+        "fixture control: more delegates than the detail holds, so something is \
          evicted:\n{screen}"
     );
     assert!(
@@ -555,52 +1018,6 @@ fn a_live_delegate_outranks_finished_ones_however_recently_they_landed() {
         rows.iter()
             .any(|r| r.contains("kerry") && r.contains("● blocking")),
         "which still reads as what it is:\n{screen}"
-    );
-}
-
-/// The height negotiation, pinned from BOTH sides of every constant it reads.
-/// No render test reaches it — every one of them runs at 100x24, where the room
-/// always exceeds what the pane wants — so without this the whole
-/// drop-rather-than-clip half of the function is unexecuted, including the floor
-/// pairing its own doc comment leans on.
-#[test]
-fn the_delegates_pane_drops_whole_rather_than_clipping_when_the_tab_needs_the_rows() {
-    use super::delegates_height;
-
-    // An empty store wants the empty state's own 4 rows plus chrome, and the
-    // empty state is the one thing that cannot be shown in part.
-    assert_eq!(delegates_height(0, 19), 0, "one row short: the pane drops");
-    assert_eq!(delegates_height(0, 20), 7, "exactly enough: it draws");
-
-    // One delegate wants 4 rows, which is under the clipping floor — the floor
-    // must not refuse a pane that already fits.
-    assert_eq!(delegates_height(1, 16), 0);
-    assert_eq!(
-        delegates_height(1, 17),
-        4,
-        "a pane that fits is not refused"
-    );
-
-    // Two or more want at least 5, which IS the floor, so the list can never be
-    // left with a single row holding nothing but an overflow marker.
-    assert_eq!(delegates_height(2, 17), 0);
-    assert_eq!(delegates_height(2, 18), 5);
-
-    // Past the cap the pane stops growing and the marker carries the rest.
-    assert_eq!(
-        delegates_height(9, 24),
-        9,
-        "capped at DELEGATE_ROWS_MAX + chrome"
-    );
-    assert_eq!(
-        delegates_height(9, 200),
-        9,
-        "and a tall terminal buys no more"
-    );
-    assert_eq!(
-        delegates_height(9, 20),
-        7,
-        "while a short one clips to what is left, never past it",
     );
 }
 
@@ -661,10 +1078,10 @@ fn the_band_sort_keeps_each_band_newest_first() {
     );
 }
 
-/// An empty store still renders the pane, so the steer line is reachable before
+/// An empty store still renders the detail, so the steer line is reachable before
 /// anyone has ever run a delegate.
 #[test]
-fn the_delegates_pane_renders_its_empty_state_with_the_steer_line() {
+fn the_delegates_detail_renders_its_empty_state_with_the_steer_line() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_delegates(Vec::new());
     let (rows, _) = render(&app);
@@ -680,23 +1097,60 @@ fn the_delegates_pane_renders_its_empty_state_with_the_steer_line() {
     );
 }
 
+/// The delegates row's dot is green while a job runs and dim when none, and a
+/// profile's rate-limited delegate traffic never moves it.
+#[test]
+fn the_delegates_dot_is_green_while_a_job_runs_and_dim_when_none() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_ms();
+    jobs::write_heartbeat(
+        &running_spec("d-run-0", "acct", now - 5_000, RecordKind::Collectable),
+        now,
+        "working",
+    )
+    .unwrap();
+    assert_dot(&delegates_check(&jobs::list_banded(now), &[]), Health::Ok);
+    assert_dot(&delegates_check(&[], &[]), Health::Idle);
+    assert_dot(&delegates_check(&[], &["acct".to_string()]), Health::Idle);
+    assert_dot(
+        &delegates_check(&jobs::list_banded(now), &["acct".to_string()]),
+        Health::Ok,
+    );
+}
+
+/// The delegates detail renders the rate-limit warning line above the list when
+/// a profile's delegate traffic is rate-limited.
+#[test]
+fn the_delegates_detail_renders_the_rate_limit_warning() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with(delegates_check(&[], &["acct".to_string()]));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains("rate-limited (acct)"),
+        "the warning line renders in the delegates detail:\n{screen}"
+    );
+}
+
 #[test]
 fn the_pane_title_opens_with_the_corner_dash() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with_delegates(Vec::new());
     let (rows, _) = render(&app);
     assert!(
-        rows.iter().any(|r| r.starts_with("╭─ PLUGIN ")),
+        rows.iter().any(|r| r.starts_with("╭─ SERVICES ")),
         "the pane title carries the corner-adjacent dash:\n{:?}",
         rows.iter().take(3).collect::<Vec<_>>()
     );
 }
 
+// ── herdr row ──────────────────────────────────────────────────────────────────
+
 #[test]
 fn herdr_row_renders_ok_dot_without_fix() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(&healthy_probe(), Some(&healthy_config()));
-    assert_row(check, Health::Ok, false);
+    assert_dot(&check, Health::Ok);
 }
 
 #[test]
@@ -708,7 +1162,7 @@ fn herdr_row_renders_danger_dot_on_registry_warnings() {
         None,
     );
     let check = herdr_check(&probe, Some(&healthy_config()));
-    assert_row(check, Health::Danger, false);
+    assert_dot(&check, Health::Danger);
 }
 
 #[test]
@@ -720,14 +1174,14 @@ fn herdr_row_renders_danger_dot_on_registry_error() {
         Some("herdr's plugin list did not parse"),
     );
     let check = herdr_check(&probe, Some(&healthy_config()));
-    assert_row(check, Health::Danger, false);
+    assert_dot(&check, Health::Danger);
 }
 
 #[test]
 fn herdr_row_renders_warn_dot_without_fix_when_not_installed() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(&probe(Some("0.8.0"), None, None), Some(&healthy_config()));
-    assert_row(check, Health::Warn, false);
+    assert_dot(&check, Health::Warn);
 }
 
 #[test]
@@ -739,7 +1193,7 @@ fn herdr_row_renders_warn_dot_without_fix_when_version_too_old() {
         None,
     );
     let check = herdr_check(&probe, Some(&healthy_config()));
-    assert_row(check, Health::Warn, false);
+    assert_dot(&check, Health::Warn);
 }
 
 #[test]
@@ -749,34 +1203,37 @@ fn herdr_row_renders_warn_dot_without_fix_when_config_does_not_parse() {
         &healthy_probe(),
         Some(&config(false, None, SidebarState::Absent)),
     );
-    assert_row(check, Health::Warn, false);
+    assert_dot(&check, Health::Warn);
 }
 
 #[test]
-fn herdr_row_renders_warn_dot_and_offers_fix_when_key_unbound() {
+fn herdr_row_renders_warn_dot_and_a_bare_f_line_when_key_unbound() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(
         &healthy_probe(),
         Some(&config(true, None, SidebarState::Templated)),
     );
-    assert_row(check, Health::Warn, true);
+    assert_dot(&check, Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "f  heal herdr config"));
+    assert!(!check.detail.iter().any(|l| l.starts_with("[f]")));
 }
 
 #[test]
-fn herdr_row_renders_warn_dot_and_offers_fix_when_sidebar_untemplated() {
+fn herdr_row_renders_warn_dot_and_a_bare_f_line_when_sidebar_untemplated() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(
         &healthy_probe(),
         Some(&config(true, Some("prefix+a"), SidebarState::Absent)),
     );
-    assert_row(check, Health::Warn, true);
+    assert_dot(&check, Health::Warn);
+    assert!(check.detail.iter().any(|l| l == "f  heal herdr config"));
 }
 
 #[test]
 fn herdr_row_renders_warn_dot_without_fix_when_config_unreadable() {
     let _home = crate::testutil::HomeSandbox::new();
     let check = herdr_check(&healthy_probe(), None);
-    assert_row(check, Health::Warn, false);
+    assert_dot(&check, Health::Warn);
 }
 
 // ── herdr options ─────────────────────────────────────────────────────────────
@@ -790,11 +1247,11 @@ fn herdr_options_app(config: ConfigStatus) -> App {
         profiles: Vec::new(),
     });
     let probe = healthy_probe();
-    app.plugin.herdr = Some(Some(probe.clone()));
-    app.plugin.herdr_config = Some(config.clone());
-    app.plugin.checks = vec![herdr_check(&probe, Some(&config))];
-    app.plugin.cursor = 0;
-    app.plugin.focus = crate::tui::app::PluginFocus::Detail;
+    app.services.herdr = Some(Some(probe.clone()));
+    app.services.herdr_config = Some(config.clone());
+    app.services.checks = vec![herdr_check(&probe, Some(&config))];
+    app.services.cursor = 0;
+    app.services.focus = crate::tui::app::ServicesFocus::Detail;
     app
 }
 
@@ -869,7 +1326,7 @@ fn herdr_options_render_all_six_rows_on_both_tiers() {
 fn herdr_options_render_blurred_when_focus_sits_on_the_selector() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(healthy_config());
-    app.plugin.focus = crate::tui::app::PluginFocus::List;
+    app.services.focus = crate::tui::app::ServicesFocus::List;
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
     let width_row = rows
@@ -894,7 +1351,7 @@ fn herdr_options_render_blurred_when_focus_sits_on_the_selector() {
 fn delegate_row_text_renders_inert_with_tooltip_when_herdr_config_does_not_parse() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(config(false, None, SidebarState::Absent));
-    app.plugin.herdr_options_cursor = 5;
+    app.services.herdr_options_cursor = 5;
     let (rows, buf) = render(&app);
     let screen = rows.join("\n");
 
@@ -926,8 +1383,8 @@ fn delegate_row_text_renders_inert_with_tooltip_when_herdr_config_does_not_parse
 fn herdr_tag_refresh_editor_renders_the_edit_state() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app(healthy_config());
-    app.plugin.herdr_options_cursor = 2;
-    app.plugin.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
+    app.services.herdr_options_cursor = 2;
+    app.services.herdr_tag_draft = Some(crate::tui::app::InputState::new("5"));
     let (rows, _) = render(&app);
     let screen = rows.join("\n");
     let tag_row = rows
