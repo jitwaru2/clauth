@@ -18,12 +18,11 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-/// The contract major this clauth speaks; `/health` naming another stops the
-/// check, since no route shape below applies to it.
-const SPOKEN_MAJOR: u64 = 1;
+use crate::proxy::{SPOKEN_MAJOR, contract_version};
+
 const CONTROL: &str = "/clauth/v1";
 /// An account id, flow id, action name and setting key no proxy holds: the
 /// safe run's mutating requests aim here so they can only be refused.
@@ -183,22 +182,15 @@ pub(crate) fn render(report: &Report) -> String {
     out
 }
 
-/// The `clauth proxy check <url>` entry: the report on stdout, and exit 1
+/// The `clauth proxy check <target>` entry: the report on stdout, and exit 1
 /// when it names any violation.
 pub(crate) fn run(
-    url: &str,
-    admin_file: &Path,
-    key_file: &Path,
+    target: &str,
+    admin_file: Option<&Path>,
+    key_file: Option<&Path>,
     destructive: Option<String>,
 ) -> Result<()> {
-    let base = base_url(url)?;
-    let admin = read_secret_file(admin_file, "admin token")?;
-    let key = read_secret_file(key_file, "key")?;
-    let mode = match destructive {
-        Some(account) => Mode::Destructive { account },
-        None => Mode::Safe,
-    };
-    let report = check(&base, &admin, &key, &mode)?;
+    let (base, report) = check_target(target, admin_file, key_file, destructive)?;
     crate::out::out!("{}", render(&report));
     if report.violations.is_empty() {
         Ok(())
@@ -209,6 +201,177 @@ pub(crate) fn run(
             if n == 1 { "" } else { "s" }
         )
     }
+}
+
+/// [`run`]'s check: the target resolved, and the base URL with its report.
+fn check_target(
+    target: &str,
+    admin_file: Option<&Path>,
+    key_file: Option<&Path>,
+    destructive: Option<String>,
+) -> Result<(String, Report)> {
+    let Target {
+        base,
+        admin,
+        key,
+        service,
+    } = resolve_target(target, admin_file, key_file, || {
+        Ok(crate::profile::load_config()?.profiles)
+    })?;
+    if destructive.is_some() && key_file.is_none() {
+        return Err(crate::usage_error(
+            "--destructive needs --key-file holding the named account's key: a registered proxy's key is picked from a profile, which need not be that account's, and the proxy is your live one",
+        ));
+    }
+    let mode = match destructive {
+        Some(account) => Mode::Destructive { account },
+        None => Mode::Safe,
+    };
+    let report = match &service {
+        Some(service) => check_registered(&base, &admin, &key, &mode, service)?,
+        None => check(&base, &admin, &key, &mode)?,
+    };
+    Ok((base, report))
+}
+
+/// What a check runs against: the proxy's base URL, the two credentials,
+/// and for a registered proxy the service its `/health` must name.
+pub(crate) struct Target {
+    pub(crate) base: String,
+    pub(crate) admin: Secret,
+    pub(crate) key: Secret,
+    pub(crate) service: Option<crate::proxy::Service>,
+}
+
+/// `clauth proxy check`'s positional and flags, resolved. A value with an
+/// `http://` or `https://` scheme is the proxy's base URL and both files are
+/// required; a proxy service names a registered proxy, whose bind, admin
+/// token file and the one profile on its bind stand in for any flag not
+/// given. `profiles` is read only when that profile is needed.
+pub(crate) fn resolve_target(
+    target: &str,
+    admin_file: Option<&Path>,
+    key_file: Option<&Path>,
+    profiles: impl FnOnce() -> Result<Vec<crate::profile::Profile>>,
+) -> Result<Target> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let base = base_url(target)?;
+        let admin_file = admin_file.ok_or_else(|| {
+            crate::usage_error(
+                "checking a proxy by URL needs --admin-token-file, the file holding its admin token",
+            )
+        })?;
+        let key_file = key_file.ok_or_else(|| {
+            crate::usage_error(
+                "checking a proxy by URL needs --key-file, the file holding an inference key of one of its accounts",
+            )
+        })?;
+        return Ok(Target {
+            base,
+            admin: read_secret_file(admin_file, "admin token")?,
+            key: read_secret_file(key_file, "key")?,
+            service: None,
+        });
+    }
+    let Ok(service) = crate::proxy::Service::parse(target) else {
+        return Err(crate::usage_error(format!(
+            "expected a proxy's base URL, like http://127.0.0.1:9101, or the service of a proxy registered with `clauth proxy enable`, like zcode; got {target:?}"
+        )));
+    };
+    let Some(row) = crate::proxy::Registry::load()?.get(&service).cloned() else {
+        return Err(crate::proxy::not_registered(&service));
+    };
+    let admin = match admin_file {
+        Some(path) => read_secret_file(path, "admin token")?,
+        None => {
+            let path = crate::proxy::admin_token_path(&service)?;
+            if !path
+                .try_exists()
+                .with_context(|| format!("failed to inspect {}", path.display()))?
+            {
+                return Err(crate::usage_error(format!(
+                    "proxy {:?} has no admin token file {path:?}; run `clauth proxy enable {service}` to mint it",
+                    service.as_str()
+                )));
+            }
+            read_secret_file(&path, "admin token")?
+        }
+    };
+    let key = match key_file {
+        Some(path) => read_secret_file(path, "key")?,
+        None => key_on_bind(&profiles()?, &service, row.port)?,
+    };
+    Ok(Target {
+        base: format!("http://{}", crate::proxy::bind(row.port)),
+        admin,
+        key,
+        service: Some(service),
+    })
+}
+
+/// The api key of the one profile whose `base_url` is the proxy's bind: a
+/// proxy account is a profile pointed at it, and its key is the inference
+/// key the check sends.
+fn key_on_bind(
+    profiles: &[crate::profile::Profile],
+    service: &crate::proxy::Service,
+    port: u16,
+) -> Result<Secret> {
+    let on_bind: Vec<&crate::profile::Profile> = profiles
+        .iter()
+        .filter(|profile| {
+            profile
+                .base_url
+                .as_deref()
+                .is_some_and(|url| is_loopback_url_on(url, port))
+        })
+        .collect();
+    let bind = crate::proxy::bind(port);
+    match on_bind.as_slice() {
+        [] => Err(crate::usage_error(format!(
+            "no profile's base_url is proxy {:?}'s bind http://{bind}; pass --key-file with an inference key of one of its accounts",
+            service.as_str()
+        ))),
+        [profile] => match profile.api_key.as_deref().filter(|key| !key.is_empty()) {
+            Some(key) => Ok(Secret(key.to_string())),
+            None => Err(crate::usage_error(format!(
+                "profile {:?} points at proxy {:?} and holds no api key; pass --key-file",
+                profile.name.as_str(),
+                service.as_str()
+            ))),
+        },
+        several => {
+            let names: Vec<String> = several
+                .iter()
+                .map(|profile| format!("{:?}", profile.name.as_str()))
+                .collect();
+            Err(crate::usage_error(format!(
+                "profiles {} all point at proxy {:?} (http://{bind}); pass --key-file with the key to check with",
+                names.join(", "),
+                service.as_str()
+            )))
+        }
+    }
+}
+
+/// Whether `url` is `http://` on a loopback host (`127.0.0.1`, `localhost`,
+/// `[::1]`) and `port`, with nothing after but an optional trailing slash.
+fn is_loopback_url_on(url: &str, port: u16) -> bool {
+    let Some(rest) = url
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .and_then(|_| url.get(7..))
+    else {
+        return false;
+    };
+    let Some((host, url_port)) = rest.trim_end_matches('/').rsplit_once(':') else {
+        return false;
+    };
+    ["127.0.0.1", "localhost", "[::1]"]
+        .iter()
+        .any(|loopback| host.eq_ignore_ascii_case(loopback))
+        && url_port.bytes().all(|b| b.is_ascii_digit())
+        && url_port.parse::<u16>() == Ok(port)
 }
 
 // ── the wire ────────────────────────────────────────────────────────────────
@@ -573,6 +736,9 @@ struct AccountView {
 
 struct Checker<'a> {
     base: &'a str,
+    /// The service a registered proxy's `/health` must name; `None` for a
+    /// proxy checked by URL, which clauth holds no expectation of.
+    expected_service: Option<&'a str>,
     admin: &'a Secret,
     key: &'a Secret,
     /// Every credential this run holds, the re-minted key included: redacted
@@ -596,8 +762,31 @@ struct Accounts {
 /// proxy does not list; every departure from the contract is a violation in
 /// the report.
 pub(crate) fn check(base: &str, admin: &Secret, key: &Secret, mode: &Mode) -> Result<Report> {
+    check_expecting(base, admin, key, mode, None)
+}
+
+/// [`check`] on a registered proxy: a `/health` naming another service than
+/// `service` stops the run there, before the admin token or the key is sent.
+pub(crate) fn check_registered(
+    base: &str,
+    admin: &Secret,
+    key: &Secret,
+    mode: &Mode,
+    service: &crate::proxy::Service,
+) -> Result<Report> {
+    check_expecting(base, admin, key, mode, Some(service.as_str()))
+}
+
+fn check_expecting(
+    base: &str,
+    admin: &Secret,
+    key: &Secret,
+    mode: &Mode,
+    expected_service: Option<&str>,
+) -> Result<Report> {
     let mut c = Checker {
         base,
+        expected_service,
         admin,
         key,
         secrets: vec![admin.expose().to_string(), key.expose().to_string()],
@@ -968,15 +1157,24 @@ impl Checker<'_> {
         };
         self.equals(ROUTE, body.get("status"), "status", &json!("ok"));
         self.req(ROUTE, &body, "", "service", Kind::Id);
+        if let Some(expected) = self.expected_service {
+            self.report.checks += 1;
+            if body.get("service") != Some(&json!(expected)) {
+                self.violation(
+                    ROUTE,
+                    format!("service: {expected:?}, the registered proxy"),
+                    body.get("service")
+                        .map_or_else(|| "nothing".to_string(), repr),
+                );
+                return Ok(None);
+            }
+        }
         self.req(ROUTE, &body, "", "version", Kind::Str);
         let Some(contract) = self.req(ROUTE, &body, "", "contract", Kind::Str) else {
             return Ok(None);
         };
-        let major = contract
-            .as_str()
-            .and_then(|c| c.split_once('.'))
-            .filter(|(_, minor)| minor.parse::<u64>().is_ok())
-            .and_then(|(major, _)| major.parse::<u64>().ok());
+        let version = contract.as_str().and_then(contract_version);
+        let major = version.map(|(major, _)| major);
         self.report.checks += 1;
         if major != Some(SPOKEN_MAJOR) {
             self.violation(
@@ -986,10 +1184,7 @@ impl Checker<'_> {
             );
             return Ok(None);
         }
-        let minor = contract
-            .as_str()
-            .and_then(|c| c.split_once('.'))
-            .and_then(|(_, minor)| minor.parse::<u64>().ok());
+        let minor = version.map(|(_, minor)| minor);
         if minor.is_some_and(|m| m > 0) {
             self.skip(format!(
                 "fields contract {} adds beyond 1.0: this clauth knows 1.0",

@@ -706,6 +706,29 @@ pub(crate) enum HerdrCommand {
 /// `clauth proxy <cmd>`.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProxyCommand {
+    /// Record a proxy found on PATH, for the daemon to run
+    ///
+    /// Reads `clauth-<service>-proxy manifest` and refuses a proxy speaking a
+    /// contract major clauth does not. The first enable picks a free loopback
+    /// port and mints the proxy's admin token; a later one keeps both, since
+    /// the proxy's profiles carry the port in their base_url.
+    Enable {
+        /// The proxy's service, the <service> in clauth-<service>-proxy.
+        service: String,
+        /// Loopback port to serve on, first enable only. Default: a free one.
+        #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+    },
+
+    /// Stop running a proxy, keeping its port, admin token and state
+    ///
+    /// Its profiles work again after `clauth proxy enable`. Nothing is
+    /// deleted.
+    Disable {
+        /// The proxy's service, the <service> in clauth-<service>-proxy.
+        service: String,
+    },
+
     /// Check a running proxy against the clauth proxy contract
     ///
     /// Drives every contract route and prints one line per departure (the
@@ -714,19 +737,23 @@ pub(crate) enum ProxyCommand {
     /// at an account id no proxy holds, and the one login flow it starts is
     /// cancelled. It does send one real inference request on the key's account.
     Check {
-        /// The proxy's base URL, like http://127.0.0.1:9101.
-        url: String,
+        /// The proxy's base URL, like http://127.0.0.1:9101, or the service of
+        /// a proxy registered with `clauth proxy enable`, like zcode.
+        target: String,
         /// File holding the proxy's admin token, alone, readable by you only.
+        /// Required with a URL; a registered proxy's is read from clauth's own.
         #[arg(long, value_name = "PATH")]
-        admin_token_file: PathBuf,
+        admin_token_file: Option<PathBuf>,
         /// File holding an inference key of one of the proxy's accounts,
-        /// alone, readable by you only.
+        /// alone, readable by you only. Required with a URL; a registered
+        /// proxy's is the key of the one profile whose base_url is its bind.
         #[arg(long, value_name = "PATH")]
-        key_file: PathBuf,
+        key_file: Option<PathBuf>,
         /// Also run the mutating routes for real on this account: change and
         /// restore each setting it can, run each action, re-mint its key, then delete
-        /// it. The key file must hold this account's key. Meant for a proxy's
-        /// CI against a stub upstream.
+        /// it. Requires --key-file holding this account's key, in both forms:
+        /// a registered proxy's profile key is never used for it. Meant for a
+        /// proxy's CI against a stub upstream.
         #[arg(long, value_name = "ACCOUNT")]
         destructive: Option<String>,
     },

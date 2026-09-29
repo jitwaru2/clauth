@@ -2179,6 +2179,8 @@ mod api_key_helper_tests {
 
 /// `clauth proxy check`: both secret files are flags holding paths, never the
 /// secrets themselves, and `--destructive` takes the account it may consume.
+/// Both files are optional to the parser: a registered service's come from
+/// clauth, and the URL form refuses a missing one by name at run time.
 #[test]
 fn proxy_check_parses_its_paths_and_the_destructive_account() {
     let safe = command(&[
@@ -2193,7 +2195,7 @@ fn proxy_check_parses_its_paths_and_the_destructive_account() {
     let Command::Proxy {
         cmd:
             crate::cli::ProxyCommand::Check {
-                url,
+                target,
                 admin_token_file,
                 key_file,
                 destructive,
@@ -2202,9 +2204,9 @@ fn proxy_check_parses_its_paths_and_the_destructive_account() {
     else {
         panic!("`proxy check` must select the check arm");
     };
-    assert_eq!(url, "http://127.0.0.1:9101");
-    assert_eq!(admin_token_file, std::path::PathBuf::from("/t/admin"));
-    assert_eq!(key_file, std::path::PathBuf::from("/t/key"));
+    assert_eq!(target, "http://127.0.0.1:9101");
+    assert_eq!(admin_token_file, Some(std::path::PathBuf::from("/t/admin")));
+    assert_eq!(key_file, Some(std::path::PathBuf::from("/t/key")));
     assert_eq!(destructive, None);
 
     let Command::Proxy {
@@ -2225,16 +2227,63 @@ fn proxy_check_parses_its_paths_and_the_destructive_account() {
     };
     assert_eq!(destructive.as_deref(), Some("acct-ci-1"));
 
-    for missing in [
-        &["proxy", "check", "http://x", "--key-file", "/k"][..],
-        &["proxy", "check", "http://x", "--admin-token-file", "/a"],
-    ] {
-        let argv: Vec<&str> = std::iter::once("clauth")
-            .chain(missing.iter().copied())
-            .collect();
-        let err = <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
-            .expect_err("both secret files are required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    let bare = parse(&["proxy", "check", "zcode"]).map(|cli| match cli.command {
+        Some(Command::Proxy {
+            cmd:
+                crate::cli::ProxyCommand::Check {
+                    target,
+                    admin_token_file,
+                    key_file,
+                    destructive,
+                },
+        }) => Some((target, admin_token_file, key_file, destructive)),
+        _ => None,
+    });
+    assert_eq!(
+        bare.map_err(|e| e.kind()),
+        Ok(Some(("zcode".to_string(), None, None, None))),
+        "a service needs neither file"
+    );
+}
+
+/// `clauth proxy enable <service> [--port N]` and `disable <service>`; a port
+/// outside 1..=65535 is refused by the parser.
+#[test]
+fn proxy_enable_and_disable_parse_their_service_and_port() {
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Enable { service, port },
+    } = command(&["proxy", "enable", "zcode", "--port", "9101"])
+    else {
+        panic!("`proxy enable` must select the enable arm");
+    };
+    assert_eq!((service.as_str(), port), ("zcode", Some(9101)));
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Enable { port, .. },
+    } = command(&["proxy", "enable", "zcode"])
+    else {
+        panic!("`proxy enable` must select the enable arm");
+    };
+    assert_eq!(port, None);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Disable { service },
+    } = command(&["proxy", "disable", "zcode"])
+    else {
+        panic!("`proxy disable` must select the disable arm");
+    };
+    assert_eq!(service, "zcode");
+
+    for port in ["0", "65536"] {
+        let err = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "clauth", "proxy", "enable", "zcode", "--port", port,
+        ])
+        .expect_err(port);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{port}"
+        );
     }
 }
 

@@ -467,6 +467,38 @@ fn devices_flags_are_offered_only_under_pair_and_add() {
     );
 }
 
+/// `clauth proxy enable|disable` reuse the names of the profile verbs, and
+/// fish's `__fish_seen_subcommand_from` matches its words anywhere on the
+/// line, so the profile offer and `disable`'s `--yes`/`-y` stand down once
+/// `proxy` is on it: clap takes a service there, and no `--yes`. Each guarded
+/// line is the only one offering its token under those verbs.
+#[test]
+fn fish_keeps_the_profile_verb_offers_out_of_proxy_enable_and_disable() {
+    for (guarded, ungated) in [
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile"#,
+            r#"__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a --yes -d "Skip the confirm prompt""#,
+            r#"__fish_seen_subcommand_from disable" -a --yes"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a -y -d "Skip the confirm prompt""#,
+            r#"__fish_seen_subcommand_from disable" -a -y"#,
+        ),
+    ] {
+        assert!(
+            FISH.lines().any(|line| line == guarded),
+            "fish must gate this offer off `proxy`: {guarded}"
+        );
+        assert!(
+            !FISH.contains(ungated),
+            "an ungated twin still offers it under `proxy`: {ungated}"
+        );
+    }
+}
+
 /// The scripts are hand-written (clap_complete's stable generator can't
 /// reproduce the live `clauth __complete` profile-name shellout), so nothing
 /// structural keeps them level with the grammar — they had already drifted three

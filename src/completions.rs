@@ -63,7 +63,9 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "proxy" ]; then
-        COMPREPLY=( $(compgen -W "check" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "enable disable check" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "enable" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--port" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && { [ "$prev" = "--admin-token-file" ] || [ "$prev" = "--key-file" ]; }; then
         COMPREPLY=( $(compgen -f -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
@@ -116,7 +118,7 @@ _clauth() {
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
-            'proxy[check a clauth-compatible proxy against the contract]' \
+            'proxy[register clauth-compatible proxies and check them against the contract]' \
             'completions[emit shell completion script]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
@@ -154,7 +156,11 @@ _clauth() {
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
-        _values 'subcommand' 'check[check a running proxy against the clauth proxy contract]'
+        _values 'subcommand' 'enable[record a proxy found on PATH, for the daemon to run]' \
+            'disable[stop running a proxy, keeping its port, admin token and state]' \
+            'check[check a running proxy against the clauth proxy contract]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
+        _values 'flag' '--port[loopback port to serve on, first enable only]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check && "${words[CURRENT-1]}" == (--admin-token-file|--key-file) ]]; then
         _files
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check ]]; then
@@ -258,15 +264,18 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
-complete -c clauth -f -n __fish_is_first_token -a proxy -d "Check a clauth-compatible proxy against the contract"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a enable -d "Record a proxy found on PATH, for the daemon to run"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a disable -d "Stop running a proxy, keeping its port, admin token and state"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a check -d "Check a running proxy against the clauth proxy contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from enable" -a --port -d "Loopback port to serve on, first enable only"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --admin-token-file -d "File holding the proxy admin token"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --key-file -d "File holding an inference key of one of its accounts"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --destructive -d "Also run the mutating routes for real on this account"
 complete -c clauth -F -n 'set -l t (commandline -opc); and contains -- "$t[-1]" --admin-token-file --key-file'
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
-complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token; and not __fish_seen_subcommand_from proxy" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
@@ -287,8 +296,8 @@ complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Ove
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --clear -d "Remove the long-lived token"
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a -y -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
-complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --list -d "Show the resets and which one would be used; spend none"
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Skip the confirm prompt"

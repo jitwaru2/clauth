@@ -4,9 +4,10 @@
 //! version floor and the standalone-store move.
 //!
 //! No function here spawns, signals or supervises a process other than the
-//! `shunt check` child it runs itself; the daemon and the Setup card call
-//! these. Every edit of the user's config lands only after `shunt check`
-//! passed on a sibling copy run with the gateway's env file and stores over
+//! bounded children [`run_bounded`] runs (`shunt check`, and a clauth proxy's
+//! `manifest` for `crate::proxy`); the daemon and the Setup card call these.
+//! Every edit of the user's config lands only after `shunt check` passed on
+//! a sibling copy run with the gateway's env file and stores over
 //! the calling process's own env; the supervisor must spawn with the same
 //! [`GatewayEnv::apply`] over the same inherited env.
 
@@ -18,10 +19,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -253,9 +254,10 @@ fn is_yaml(path: &Path) -> bool {
 
 // ── the admin token ─────────────────────────────────────────────────────────
 
-/// The gateway admin token, alone in a clauth-owned 0600 file. No `Display`,
-/// a `Debug` that never prints the value, and no `PartialEq` outside tests,
-/// where a plain compare would be a timing side channel.
+/// An admin token (the gateway's, or a clauth proxy's), alone in a
+/// clauth-owned 0600 file. No `Display`, a `Debug` that never prints the
+/// value, and no `PartialEq` outside tests, where a plain compare would be a
+/// timing side channel.
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) struct AdminToken(String);
@@ -277,33 +279,44 @@ pub(crate) fn admin_token_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("gateway-admin-token"))
 }
 
-/// The admin token, minted from the CSPRNG and written 0600 on first use.
-/// Under the state flock, so two first uses cannot mint two tokens.
+/// The gateway's admin token, minted on first use.
 pub(crate) fn ensure_admin_token() -> Result<AdminToken> {
-    with_state_lock(|_held| {
-        let path = admin_token_path()?;
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                // shunt trims a `${file:}` reference's contents too.
-                let token = text.trim();
-                if token.len() < MIN_ADMIN_KEY_LEN {
-                    bail!(
-                        "the gateway admin token in {} is shorter than {MIN_ADMIN_KEY_LEN} characters, which shunt refuses; delete the file and clauth mints a new one",
-                        path.display()
-                    );
-                }
-                Ok(AdminToken(token.to_string()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut seed = [0u8; 32];
-                getrandom::fill(&mut seed).map_err(|e| anyhow!("CSPRNG failure: {e}"))?;
-                let token = AdminToken(hex::encode(seed));
-                atomic_write_600(&path, token.expose())
-                    .with_context(|| format!("failed to write {}", path.display()))?;
-                Ok(token)
-            }
-            Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    let path = admin_token_path()?;
+    ensure_token_file(&path, |token| {
+        if token.len() < MIN_ADMIN_KEY_LEN {
+            bail!(
+                "the gateway admin token in {} is shorter than {MIN_ADMIN_KEY_LEN} characters, which shunt refuses; delete the file and clauth mints a new one",
+                path.display()
+            );
         }
+        Ok(())
+    })
+}
+
+/// The token alone in `path`, trimmed and handed to `accept` when the file
+/// exists, else minted from the CSPRNG (32 bytes, hex) and written 0600.
+/// Under the state flock, so two first uses cannot mint two tokens.
+pub(crate) fn ensure_token_file(
+    path: &Path,
+    accept: impl FnOnce(&str) -> Result<()>,
+) -> Result<AdminToken> {
+    with_state_lock(|_held| match std::fs::read_to_string(path) {
+        Ok(text) => {
+            // shunt trims a `${file:}` reference's contents too, and a clauth
+            // proxy trims the token file it is handed.
+            let token = text.trim();
+            accept(token)?;
+            Ok(AdminToken(token.to_string()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut seed = [0u8; 32];
+            getrandom::fill(&mut seed).map_err(|e| anyhow!("CSPRNG failure: {e}"))?;
+            let token = AdminToken(hex::encode(seed));
+            atomic_write_600(path, token.expose())
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            Ok(token)
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     })
 }
 
@@ -1729,7 +1742,7 @@ fn write_checked(record: &GatewayRecord, original: &[u8], candidate: &str) -> Re
 /// while the caller waits.
 pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often a running check's exit is polled.
+/// How often a bounded child's exit is polled.
 const CHECK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 fn check_timeout() -> Duration {
@@ -1790,23 +1803,109 @@ fn run_check(
         .arg("check")
         .arg("--config")
         .arg(candidate)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .current_dir(cwd);
     env.apply(&mut command);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    let bound = check_timeout();
+    let exited = match run_bounded(&mut command, binary, bound, None)? {
+        Bounded::Missing => {
             return Err(ConfigEditRefusal::ShuntMissing {
                 binary: binary.to_path_buf(),
             }
             .into());
         }
+        Bounded::TimedOut => {
+            return Err(ConfigEditRefusal::CheckTimedOut {
+                binary: binary.to_path_buf(),
+                config: config.to_path_buf(),
+                after: bound,
+            }
+            .into());
+        }
+        Bounded::Exited(exited) => exited,
+    };
+    if exited.status.success() {
+        return Ok(());
+    }
+    Err(ConfigEditRefusal::CheckFailed {
+        binary: binary.to_path_buf(),
+        config: config.to_path_buf(),
+        code: exited.status.code(),
+        stderr: CheckStderr(String::from_utf8_lossy(&exited.stderr()).trim().to_string()),
+    }
+    .into())
+}
+
+/// How a [`run_bounded`] child ended.
+pub(crate) enum Bounded {
+    /// `binary` is not there to run.
+    Missing,
+    /// The child outran its bound and was killed and reaped.
+    TimedOut,
+    Exited(Exited),
+}
+
+/// A bounded child that exited on its own, its output still arriving on the
+/// drain threads.
+pub(crate) struct Exited {
+    pub(crate) status: std::process::ExitStatus,
+    stdout: Option<Receiver<Vec<u8>>>,
+    stderr: Option<Receiver<Vec<u8>>>,
+    deadline: Instant,
+}
+
+impl Exited {
+    /// The stdout that arrived before the run's deadline, up to the limit the
+    /// run was given.
+    pub(crate) fn stdout(&self) -> Vec<u8> {
+        self.stdout
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.deadline))
+            .unwrap_or_default()
+    }
+
+    /// The first [`CHECK_STDERR_LIMIT`] bytes of stderr that arrived before
+    /// the run's deadline.
+    pub(crate) fn stderr(&self) -> Vec<u8> {
+        self.stderr
+            .as_ref()
+            .map(|chunks| collect_output(chunks, self.deadline))
+            .unwrap_or_default()
+    }
+}
+
+/// `command` run with stdin closed and stderr drained on its own thread, and
+/// stdout too when `stdout_limit` is given (else discarded), each keeping its
+/// first bytes up to its limit, bounded by `bound`: a child that outruns it is
+/// killed and reaped, it being clauth's own child. `binary` names the program
+/// in errors.
+pub(crate) fn run_bounded(
+    command: &mut Command,
+    binary: &Path,
+    bound: Duration,
+    stdout_limit: Option<usize>,
+) -> Result<Bounded> {
+    command
+        .stdin(Stdio::null())
+        .stdout(if stdout_limit.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Bounded::Missing),
         Err(e) => return Err(e).with_context(|| format!("cannot run {}", binary.display())),
     };
-    let stderr = child.stderr.take().map(drain_stderr);
-    let bound = check_timeout();
+    let stdout = child
+        .stdout
+        .take()
+        .zip(stdout_limit)
+        .map(|(pipe, limit)| drain_output(pipe, limit));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| drain_output(pipe, CHECK_STDERR_LIMIT));
     let deadline = Instant::now() + bound;
     let status = loop {
         match child.try_wait() {
@@ -1823,44 +1922,32 @@ fn run_check(
                     Err(e) => {
                         Err(e).with_context(|| format!("failed to wait on {}", binary.display()))
                     }
-                    Ok(_) => Err(ConfigEditRefusal::CheckTimedOut {
-                        binary: binary.to_path_buf(),
-                        config: config.to_path_buf(),
-                        after: bound,
-                    }
-                    .into()),
+                    Ok(_) => Ok(Bounded::TimedOut),
                 };
             }
         }
     };
-    if status.success() {
-        return Ok(());
-    }
-    let stderr = stderr
-        .map(|chunks| collect_stderr(&chunks, deadline))
-        .unwrap_or_default();
-    Err(ConfigEditRefusal::CheckFailed {
-        binary: binary.to_path_buf(),
-        config: config.to_path_buf(),
-        code: status.code(),
-        stderr: CheckStderr(String::from_utf8_lossy(&stderr).trim().to_string()),
-    }
-    .into())
+    Ok(Bounded::Exited(Exited {
+        status,
+        stdout,
+        stderr,
+        deadline,
+    }))
 }
 
-/// How much of a failed check's stderr the refusal keeps. shunt 0.47.0's
-/// failing `check` wrote 175 to 595 bytes (measured 2026-09-27, three broken
+/// How much of a bounded child's stderr is kept. shunt 0.47.0's failing
+/// `check` wrote 175 to 595 bytes (measured 2026-09-27, three broken
 /// configs), so a real report stays whole and a runaway one stays bounded.
 const CHECK_STDERR_LIMIT: usize = 64 * 1024;
 
-/// Read the check's stderr on its own thread, so a chatty check never stalls
-/// on a full pipe: its first [`CHECK_STDERR_LIMIT`] bytes come back in
-/// chunks as they arrive, and the rest is read and dropped.
-fn drain_stderr(mut pipe: ChildStderr) -> Receiver<Vec<u8>> {
+/// Read a child's pipe on its own thread, so a chatty child never stalls on
+/// a full pipe: its first `limit` bytes come back in chunks as they arrive,
+/// and the rest is read and dropped.
+fn drain_output(mut pipe: impl std::io::Read + Send + 'static, limit: usize) -> Receiver<Vec<u8>> {
     let (sender, chunks) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
-        let mut room = CHECK_STDERR_LIMIT;
+        let mut room = limit;
         loop {
             let read = match pipe.read(&mut buf) {
                 Ok(0) => break,
@@ -1879,9 +1966,9 @@ fn drain_stderr(mut pipe: ChildStderr) -> Receiver<Vec<u8>> {
     chunks
 }
 
-/// The stderr that arrives before `deadline`, the check's own bound: a
-/// process the check started can hold the pipe open past the check's exit.
-fn collect_stderr(chunks: &Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+/// The output that arrives before `deadline`, the child's own bound: a
+/// process the child started can hold the pipe open past the child's exit.
+fn collect_output(chunks: &Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
     let mut bytes = Vec::new();
     while let Ok(chunk) = chunks.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         bytes.extend(chunk);

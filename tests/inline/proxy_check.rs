@@ -27,6 +27,8 @@ enum Plant {
     UsedAsString,
     UsageWithoutToken,
     ContractTwo,
+    ContractPlusOne,
+    OtherService,
     MissingSettingValue,
     EchoSecrets,
     EscapeInSettingKey,
@@ -58,6 +60,8 @@ struct StubState {
     config: serde_json::Map<String, Value>,
     mutations: Vec<String>,
     inferences: u32,
+    /// Every request's method and path, in arrival order.
+    requests: Vec<String>,
 }
 
 impl StubState {
@@ -93,6 +97,7 @@ impl StubState {
             config,
             mutations: Vec::new(),
             inferences: 0,
+            requests: Vec::new(),
         }
     }
 }
@@ -214,18 +219,23 @@ fn handle(
 ) -> Reply {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if method == "GET" && path == "/health" {
-        let contract = if s.plant == Plant::ContractTwo {
-            "2.0"
-        } else {
-            "1.0"
+        let contract = match s.plant {
+            Plant::ContractTwo => "2.0",
+            Plant::ContractPlusOne => "+1.0",
+            _ => "1.0",
         };
         let status = if s.plant == Plant::EchoSecrets {
             ADMIN
         } else {
             "ok"
         };
+        let service = if s.plant == Plant::OtherService {
+            "other-proxy"
+        } else {
+            "stub"
+        };
         let mut health =
-            json!({"status": status, "service": "stub", "version": "0.0.1", "contract": contract});
+            json!({"status": status, "service": service, "version": "0.0.1", "contract": contract});
         if s.plant == Plant::BigHealth {
             // Padded to exactly the 4096-byte cap, which the draft puts out of bounds.
             health["pad"] = json!("");
@@ -558,13 +568,12 @@ fn serve_one(mut sock: TcpStream, state: &Mutex<StubState>) {
         }
     }
     let body = String::from_utf8_lossy(&req[head_end + 4..]).into_owned();
-    let reply = handle(
-        &mut state.lock().expect("stub state"),
-        &method,
-        &target,
-        &headers,
-        &body,
-    );
+    let mut state = state.lock().expect("stub state");
+    let path = target
+        .split_once('?')
+        .map_or(target.as_str(), |(path, _)| path);
+    state.requests.push(format!("{method} {path}"));
+    let reply = handle(&mut state, &method, &target, &headers, &body);
     if let Some(raw) = reply.raw {
         let _ = sock.write_all(raw.as_bytes());
         let _ = sock.shutdown(std::net::Shutdown::Both);
@@ -805,6 +814,23 @@ fn a_foreign_contract_major_stops_the_check_at_health() {
     assert_eq!(stub.state().inferences, 0);
 }
 
+/// A major spelled with a sign is no `MAJOR.MINOR`: the check reads it
+/// through the parser `clauth proxy enable` refuses it with, and stops there.
+#[test]
+fn a_signed_contract_major_stops_the_check_at_health() {
+    let stub = Stub::start(Plant::ContractPlusOne);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation("GET /health", "contract: major 1", "\"+1.0\"")]
+    );
+    assert_eq!(stub.state().mutations, Vec::<String>::new());
+    assert_eq!(stub.state().inferences, 0);
+}
+
 #[test]
 fn nothing_listening_is_an_error_naming_the_url() {
     let base = {
@@ -946,6 +972,279 @@ fn a_missing_secret_file_is_refused_naming_it() {
     assert_eq!(
         err.to_string(),
         format!("cannot read key file {path:?} (entity not found)")
+    );
+}
+
+// ── the target ──────────────────────────────────────────────────────────────
+
+/// Registry rows written as a hand-edited `proxies.toml` would hold them.
+fn register(rows: &[(&str, u16)]) {
+    let text: String = rows
+        .iter()
+        .map(|(service, port)| format!("[{service}]\nport = {port}\nenabled = true\n"))
+        .collect();
+    let path = crate::proxy::registry_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn profile(name: &str, base_url: Option<&str>, key: Option<&str>) -> crate::profile::Profile {
+    crate::profile::Profile::new(
+        name.to_string(),
+        base_url.map(str::to_string),
+        key.map(str::to_string),
+    )
+}
+
+/// No profile read: the URL form and a flag-given key never need one.
+fn no_profiles() -> Result<Vec<crate::profile::Profile>> {
+    panic!("the profiles were read")
+}
+
+/// A registered `zcode` on 9101 with its minted admin token, answered back.
+fn registered_zcode() -> String {
+    register(&[("zcode", 9101)]);
+    let zcode = crate::proxy::Service::parse("zcode").unwrap();
+    crate::proxy::ensure_proxy_token(&zcode)
+        .unwrap()
+        .expose()
+        .to_string()
+}
+
+fn resolved(target: Result<Target>) -> Result<(String, String, String), String> {
+    target
+        .map(|t| {
+            (
+                t.base,
+                t.admin.expose().to_string(),
+                t.key.expose().to_string(),
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_url_target_takes_both_files_and_refuses_naming_a_missing_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (admin, key) = secret_files(dir.path());
+
+    assert_eq!(
+        resolved(resolve_target(
+            "http://127.0.0.1:9101/",
+            Some(&admin),
+            Some(&key),
+            no_profiles
+        )),
+        Ok((
+            "http://127.0.0.1:9101".to_string(),
+            ADMIN.to_string(),
+            KEY.to_string()
+        ))
+    );
+    assert_eq!(
+        resolved(resolve_target(
+            "http://127.0.0.1:9101",
+            None,
+            Some(&key),
+            no_profiles
+        )),
+        Err(
+            "checking a proxy by URL needs --admin-token-file, the file holding its admin token"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        resolved(resolve_target("https://proxy.example", Some(&admin), None, no_profiles)),
+        Err("checking a proxy by URL needs --key-file, the file holding an inference key of one of its accounts".to_string())
+    );
+}
+
+/// A value that is neither a URL nor a service is refused naming both
+/// shapes, before any registry or file is read.
+#[test]
+fn a_target_that_is_neither_shape_is_refused_naming_both() {
+    for target in [
+        "127.0.0.1:9101",
+        "ftp://x",
+        "HTTP://127.0.0.1:9101",
+        "Zcode",
+    ] {
+        let err = resolve_target(target, None, None, no_profiles)
+            .err()
+            .expect("refused");
+        assert!(
+            err.downcast_ref::<crate::UsageError>().is_some(),
+            "{target}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "expected a proxy's base URL, like http://127.0.0.1:9101, or the service of a proxy registered with `clauth proxy enable`, like zcode; got {target:?}"
+            )
+        );
+    }
+}
+
+/// The service form carries the registered service into the check, which
+/// holds `/health` to it; the URL form carries none.
+#[test]
+fn only_the_service_form_carries_the_service_to_expect() {
+    let _home = crate::testutil::HomeSandbox::new();
+    registered_zcode();
+    let dir = tempfile::tempdir().unwrap();
+    let (admin, key) = secret_files(dir.path());
+    let service_of = |target: Result<Target>| {
+        target
+            .map(|t| t.service.map(|s| s.as_str().to_string()))
+            .map_err(|e| e.to_string())
+    };
+
+    assert_eq!(
+        service_of(resolve_target(
+            "zcode",
+            Some(&admin),
+            Some(&key),
+            no_profiles
+        )),
+        Ok(Some("zcode".to_string()))
+    );
+    assert_eq!(
+        service_of(resolve_target(
+            "http://127.0.0.1:9101",
+            Some(&admin),
+            Some(&key),
+            no_profiles
+        )),
+        Ok(None)
+    );
+}
+
+/// A registered proxy whose token file is missing (a hand-written row, a
+/// deleted file) is refused naming the command that mints it.
+#[test]
+fn a_registered_proxy_without_its_token_file_is_refused_naming_enable() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("zcode", 9101)]);
+    let path =
+        crate::proxy::admin_token_path(&crate::proxy::Service::parse("zcode").unwrap()).unwrap();
+
+    let err = resolve_target("zcode", None, None, no_profiles)
+        .err()
+        .expect("refused");
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "proxy \"zcode\" has no admin token file {path:?}; run `clauth proxy enable zcode` to mint it"
+        )
+    );
+}
+
+#[test]
+fn an_unregistered_service_is_refused_naming_enable() {
+    let _home = crate::testutil::HomeSandbox::new();
+    register(&[("qwen", 9102)]);
+    assert_eq!(
+        resolved(resolve_target("zcode", None, None, no_profiles)),
+        Err(
+            "no proxy \"zcode\" is registered; register it with `clauth proxy enable zcode`"
+                .to_string()
+        )
+    );
+}
+
+/// The service form: the bind from the row, the token from its file, and
+/// the key of the one profile whose base_url is the bind, whatever loopback
+/// spelling or trailing slash it carries; another port, `https` or a path
+/// is no match.
+#[test]
+fn a_service_target_takes_its_row_token_and_the_one_profile_on_its_bind() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let token = registered_zcode();
+
+    for url in [
+        "http://127.0.0.1:9101",
+        "http://127.0.0.1:9101/",
+        "http://localhost:9101",
+        "http://[::1]:9101",
+        "HTTP://LOCALHOST:9101/",
+    ] {
+        let profiles = vec![
+            profile("on-bind", Some(url), Some("clp_on-bind")),
+            profile("other-port", Some("http://127.0.0.1:9102"), Some("clp_x")),
+            profile("tls", Some("https://127.0.0.1:9101"), Some("clp_x")),
+            profile("path", Some("http://127.0.0.1:9101/v1"), Some("clp_x")),
+            profile("remote", Some("http://10.0.0.1:9101"), Some("clp_x")),
+            profile("signed-port", Some("http://127.0.0.1:+9101"), Some("clp_x")),
+            profile("oauth", None, None),
+        ];
+        assert_eq!(
+            resolved(resolve_target("zcode", None, None, || Ok(profiles))),
+            Ok((
+                "http://127.0.0.1:9101".to_string(),
+                token.clone(),
+                "clp_on-bind".to_string()
+            )),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn several_profiles_on_the_bind_are_refused_naming_each() {
+    let _home = crate::testutil::HomeSandbox::new();
+    registered_zcode();
+    let profiles = vec![
+        profile("a", Some("http://127.0.0.1:9101"), Some("clp_a")),
+        profile("b", Some("http://localhost:9101/"), Some("clp_b")),
+    ];
+    assert_eq!(
+        resolved(resolve_target("zcode", None, None, || Ok(profiles))),
+        Err("profiles \"a\", \"b\" all point at proxy \"zcode\" (http://127.0.0.1:9101); pass --key-file with the key to check with".to_string())
+    );
+}
+
+#[test]
+fn no_profile_on_the_bind_is_refused_naming_key_file() {
+    let _home = crate::testutil::HomeSandbox::new();
+    registered_zcode();
+    let profiles = vec![profile("x", Some("http://127.0.0.1:9102"), Some("clp_x"))];
+    assert_eq!(
+        resolved(resolve_target("zcode", None, None, || Ok(profiles))),
+        Err("no profile's base_url is proxy \"zcode\"'s bind http://127.0.0.1:9101; pass --key-file with an inference key of one of its accounts".to_string())
+    );
+    let keyless = vec![profile("bare", Some("http://127.0.0.1:9101"), None)];
+    assert_eq!(
+        resolved(resolve_target("zcode", None, None, || Ok(keyless))),
+        Err(
+            "profile \"bare\" points at proxy \"zcode\" and holds no api key; pass --key-file"
+                .to_string()
+        )
+    );
+}
+
+/// `--key-file` and `--admin-token-file` override the registry's picks: the
+/// profiles are never read, so several on the bind refuse nothing.
+#[test]
+fn the_flags_override_a_service_targets_picks() {
+    let _home = crate::testutil::HomeSandbox::new();
+    registered_zcode();
+    let dir = tempfile::tempdir().unwrap();
+    let (admin, key) = secret_files(dir.path());
+
+    assert_eq!(
+        resolved(resolve_target(
+            "zcode",
+            Some(&admin),
+            Some(&key),
+            no_profiles
+        )),
+        Ok((
+            "http://127.0.0.1:9101".to_string(),
+            ADMIN.to_string(),
+            KEY.to_string()
+        ))
     );
 }
 
@@ -1108,7 +1407,144 @@ fn run_succeeds_on_a_conformant_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let (admin, key) = secret_files(dir.path());
 
-    run(&format!("{}/", stub.base), &admin, &key, None).expect("a conformant proxy exits 0");
+    run(&format!("{}/", stub.base), Some(&admin), Some(&key), None)
+        .expect("a conformant proxy exits 0");
+}
+
+/// `clauth proxy check <service>` runs the same check on a registered proxy,
+/// with the admin token from its token file and the key of the one profile
+/// on its bind.
+/// A stub proxy registered as `stub`, with its admin token in the registry's
+/// token file and one profile `st` on its bind holding the stub's key.
+fn registered_stub(plant: Plant) -> Stub {
+    let stub = Stub::start(plant);
+    let port = stub
+        .base
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .expect("the stub's port");
+    register(&[("stub", port)]);
+    let registered = crate::proxy::Service::parse("stub").unwrap();
+    let token = crate::proxy::admin_token_path(&registered).unwrap();
+    std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+    secret_file(token.parent().unwrap(), "clauth-admin-token", ADMIN, 0o600);
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "st".to_string(),
+        Some(format!("{}/", stub.base)),
+        Some(KEY.to_string()),
+    ))
+    .unwrap();
+    crate::testutil::register_names(&["st"]);
+    stub
+}
+
+#[test]
+fn run_checks_a_registered_proxy_by_its_service() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _stub = registered_stub(Plant::None);
+
+    run("stub", None, None, None).expect("a conformant registered proxy exits 0");
+}
+
+/// `run`'s service form holds `/health` to the registered service: a proxy
+/// answering as another is stopped there, before its admin token or a key
+/// reaches it, and the run exits 1 on that one departure.
+#[test]
+fn run_stops_a_registered_proxy_answering_as_another_service_at_health() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stub = registered_stub(Plant::OtherService);
+
+    let (base, report) = check_target("stub", None, None, None).expect("check runs");
+
+    assert_eq!(
+        (base, report.violations),
+        (
+            stub.base.clone(),
+            vec![violation(
+                "GET /health",
+                "service: \"stub\", the registered proxy",
+                "\"other-proxy\""
+            )]
+        )
+    );
+    assert_eq!(stub.state().requests, vec!["GET /health".to_string()]);
+
+    let again = registered_stub(Plant::OtherService);
+    let err = run("stub", None, None, None).expect_err("a departing proxy exits 1");
+    assert_eq!(
+        err.to_string(),
+        format!("{} departs from contract v1 in 1 place", again.base)
+    );
+    assert_eq!(again.state().requests, vec!["GET /health".to_string()]);
+}
+
+/// A registered proxy's `/health` naming another service stops the check
+/// there, naming both: no admin token, key or inference request reaches
+/// whatever answers on the recorded port.
+#[test]
+fn a_registered_proxy_answering_as_another_service_stops_at_health() {
+    let stub = Stub::start(Plant::OtherService);
+    let (admin, key) = secrets();
+    let stub_service = crate::proxy::Service::parse("stub").unwrap();
+
+    let report =
+        check_registered(&stub.base, &admin, &key, &Mode::Safe, &stub_service).expect("check runs");
+
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /health",
+            "service: \"stub\", the registered proxy",
+            "\"other-proxy\""
+        )]
+    );
+    assert_eq!(stub.state().requests, vec!["GET /health".to_string()]);
+    assert_eq!(stub.state().inferences, 0);
+}
+
+/// A URL holds no expectation: the same answer is checked on.
+#[test]
+fn a_proxy_checked_by_url_may_name_any_service() {
+    let stub = Stub::start(Plant::OtherService);
+    let (admin, key) = secrets();
+
+    let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
+
+    assert!(
+        report.violations.iter().all(|v| v.route != "GET /health"),
+        "{:?}",
+        report.violations
+    );
+    assert_eq!(stub.state().inferences, 1, "the run went on to inference");
+}
+
+/// `--destructive` on a registered proxy without `--key-file` is refused
+/// before anything is sent: the profile's key need not be the named
+/// account's, and the proxy is the user's live one.
+#[test]
+fn destructive_on_a_registered_proxy_needs_key_file() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let port = {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        listener.local_addr().expect("addr").port()
+    };
+    register(&[("zcode", port)]);
+    crate::proxy::ensure_proxy_token(&crate::proxy::Service::parse("zcode").unwrap()).unwrap();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "zc".to_string(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some(KEY.to_string()),
+    ))
+    .unwrap();
+    crate::testutil::register_names(&["zc"]);
+
+    let err = run("zcode", None, None, Some(ACCOUNT.to_string())).expect_err("refused");
+
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
+    assert_eq!(
+        err.to_string(),
+        "--destructive needs --key-file holding the named account's key: a registered proxy's key is picked from a profile, which need not be that account's, and the proxy is your live one"
+    );
 }
 
 #[test]
@@ -1117,7 +1553,8 @@ fn run_fails_naming_how_many_departures_a_proxy_makes() {
     let dir = tempfile::tempdir().unwrap();
     let (admin, key) = secret_files(dir.path());
 
-    let err = run(&stub.base, &admin, &key, None).expect_err("a departing proxy exits 1");
+    let err =
+        run(&stub.base, Some(&admin), Some(&key), None).expect_err("a departing proxy exits 1");
 
     assert!(
         err.downcast_ref::<crate::UsageError>().is_none(),
@@ -1377,6 +1814,7 @@ fn a_secret_is_redacted_raw_and_json_escaped() {
     );
     let checker = Checker {
         base: "http://127.0.0.1:1",
+        expected_service: None,
         admin: &admin,
         key: &key,
         secrets: vec![admin.expose().to_string(), key.expose().to_string()],
