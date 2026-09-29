@@ -87,6 +87,7 @@ clauth list           # account table with cached usage, no network
 | `clauth herdr install` | `--key <spec>`, `--no-config`, `--yes` | install the [herdr](https://herdr.dev) plugin and bind a key to it |
 | `clauth herdr uninstall` | `--no-config`, `--yes` | remove that plugin and the config lines it added |
 | `clauth herdr config get <key>` | | print one herdr knob: `popup_width`, `pane_tag`, `tag_watch_secs`, `border_label`, `delegate_dot`, `delegate_row_text` |
+| `clauth proxy check <url>` | `--admin-token-file <path>`, `--key-file <path>`, `--destructive <account>` | check a running clauth-compatible proxy against the clauth proxy contract: one line per departure, exit 1 when there is any. Safe on a live proxy (mutating routes only hit an account id no proxy holds, the one login flow it starts is cancelled, one real inference request is sent); `--destructive` also changes and restores each setting it can, runs each action, re-binds a login, re-mints the key and deletes the named account, whose key the key file must hold, for a proxy's CI. Both files hold the secret alone and must be readable by you only |
 
 `--theme <full\|compatible>` is global and forces a color depth for the TUI.
 
