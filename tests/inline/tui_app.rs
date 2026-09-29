@@ -615,7 +615,7 @@ fn shunt_check_reads_the_slot_fields_in_order() {
         reason: Some("TOML parse error at line 1\n  |\n1 | foo =".to_string()),
         since: Some("2026-09-29T00:00:00Z".to_string()),
     };
-    let check = super::shunt_check(&every, true);
+    let check = super::shunt_check(&every, true, None);
     assert_eq!(check.health, super::Health::Ok, "healthy is green");
     assert_eq!(
         check.detail,
@@ -649,12 +649,294 @@ fn shunt_check_reads_the_slot_fields_in_order() {
         reason: None,
         since: None,
     };
-    let check = super::shunt_check(&absent, false);
+    let check = super::shunt_check(&absent, false, None);
     assert_eq!(check.health, super::Health::Idle, "absent is dim");
     assert_eq!(
         check.detail,
-        vec!["state: absent".to_string()],
-        "a record-only absent slot renders state alone, no unobserved figures"
+        vec!["state: not adopted".to_string()],
+        "an unprobed absent slot renders state alone, no unobserved figures"
+    );
+}
+
+/// With no gateway adopted, the row names the config shunt would load and the
+/// standalone shunt answering, each only when there is one; an adopted
+/// gateway's row never shows a standalone readout.
+#[test]
+fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    use std::net::SocketAddr;
+    let slot = |state| GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let addr: SocketAddr = "127.0.0.1:3067".parse().unwrap();
+    let found = std::path::PathBuf::from("/home/u/.config/shunt/shunt.toml");
+    let detail = |state, readout: &super::StandaloneShunt| {
+        super::shunt_check(&slot(state), false, Some(readout)).detail
+    };
+
+    assert_eq!(
+        detail(GatewayState::Absent, &super::StandaloneShunt::default()),
+        vec!["state: not adopted".to_string()],
+        "nothing found and nothing answering adds nothing",
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: Some(found.clone()),
+                unread_bind: None,
+                answer: None,
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.toml".to_string(),
+        ],
+        "a config with nothing answering names the config alone",
+    );
+    let both = super::StandaloneShunt {
+        found: Some(found),
+        unread_bind: None,
+        answer: Some(("0.49.1".to_string(), addr)),
+    };
+    assert_eq!(
+        detail(GatewayState::Absent, &both),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.toml".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: None,
+                unread_bind: None,
+                answer: Some(("0.49.1\u{1b}[2J".to_string(), addr)),
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "standalone shunt 0.49.1\\u{1b}[2J answers on 127.0.0.1:3067".to_string(),
+        ],
+        "an answerer with no config found, its version escaped like every slot string",
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: Some(std::path::PathBuf::from("/w/\u{202e}x/shunt.toml")),
+                unread_bind: None,
+                answer: None,
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /w/\\u{202e}x/shunt.toml".to_string(),
+        ],
+        "a found path is escaped too: a directory name can carry a bidi override",
+    );
+    let unread = |reason: super::UnreadBind| super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml")),
+        unread_bind: Some(reason),
+        answer: Some(("0.49.1".to_string(), addr)),
+    };
+    assert_eq!(
+        detail(GatewayState::Absent, &unread(super::UnreadBind::Yaml)),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.yaml".to_string(),
+            "bind: not read (yaml)".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+        "the unread bind sits between the config and the answer",
+    );
+    for (reason, shown) in [
+        (
+            super::UnreadBind::Unreadable,
+            "bind: not read (config unreadable)",
+        ),
+        (
+            super::UnreadBind::Unparsed,
+            "bind: not read (config does not parse)",
+        ),
+        (
+            super::UnreadBind::Value("${SHUNT_\u{1b}BIND}".to_string()),
+            "bind: not read (${SHUNT_\\u{1b}BIND})",
+        ),
+    ] {
+        assert_eq!(
+            detail(GatewayState::Absent, &unread(reason))[2],
+            shown,
+            "each reason's words, a raw value escaped"
+        );
+    }
+    assert_eq!(
+        detail(GatewayState::Disabled, &both),
+        vec!["state: disabled".to_string()],
+        "an adopted gateway keeps its own readout",
+    );
+}
+
+/// The standalone readout off a discovery result and one `/health` probe of
+/// the bind that config sets, against a real stub answering `/health`.
+#[test]
+fn the_standalone_readout_probes_the_found_configs_bind() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, seen) = crate::testutil::serve_endpoints(1, |_, _| {
+        (200, r#"{"status":"ok","version":"0.49.1"}"#.to_string())
+    });
+    let stub: std::net::SocketAddr = base.trim_start_matches("http://").parse().unwrap();
+    let config = home.home().join("shunt.toml");
+    // A wildcard bind, as a served shunt often has: the row names the loopback
+    // address the probe reached, never `0.0.0.0`.
+    std::fs::write(
+        &config,
+        format!("[server]\nbind = \"0.0.0.0:{}\"\n", stub.port()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::standalone_readout_from(
+            Ok(Some(config.clone())),
+            None,
+            crate::gateway::probe_health
+        ),
+        super::StandaloneShunt {
+            found: Some(config.clone()),
+            unread_bind: None,
+            answer: Some(("0.49.1".to_string(), stub)),
+        },
+        "the stub on the config's bind answers as a standalone shunt",
+    );
+    assert_eq!(seen.join().expect("listener"), ["/health"]);
+
+    // A closed port on the config's bind: found, nothing answering.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    std::fs::write(&config, format!("[server]\nbind = \"{closed}\"\n")).unwrap();
+    assert_eq!(
+        super::standalone_readout_from(
+            Ok(Some(config.clone())),
+            None,
+            crate::gateway::probe_health
+        ),
+        super::StandaloneShunt {
+            found: Some(config),
+            unread_bind: None,
+            answer: None,
+        },
+    );
+}
+
+/// Where clauth cannot read a bind, the one probe goes to shunt's default
+/// and the readout names why; the env override moves the probe whatever the
+/// config's format, as it moves shunt's own. No config and no override is not
+/// an unread bind: shunt's default IS its bind.
+#[test]
+fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
+    use super::UnreadBind;
+    use std::cell::RefCell;
+    let home = crate::testutil::HomeSandbox::new();
+    let probed = RefCell::new(Vec::new());
+    let silent = |addr| {
+        probed.borrow_mut().push(addr);
+        Ok(crate::gateway::Health::NotShunt { status: 404 })
+    };
+    let readout =
+        |found: Option<std::path::PathBuf>, unread: Option<UnreadBind>| super::StandaloneShunt {
+            found,
+            unread_bind: unread,
+            answer: None,
+        };
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), None, silent),
+        readout(None, None),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), Some("127.0.0.1:4100"), silent),
+        readout(None, None),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), Some("nope"), silent),
+        readout(
+            None,
+            Some(UnreadBind::Value("SHUNT_SERVER__BIND=nope".to_string()))
+        ),
+        "a refused env override is named with its variable",
+    );
+
+    let yaml = std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml");
+    let yaml_err = || Err(crate::gateway::YamlConfig { path: yaml.clone() }.into());
+    assert_eq!(
+        super::standalone_readout_from(yaml_err(), None, silent),
+        readout(Some(yaml.clone()), Some(UnreadBind::Yaml)),
+    );
+    assert_eq!(
+        super::standalone_readout_from(yaml_err(), Some("127.0.0.1:4200"), silent),
+        readout(Some(yaml.clone()), None),
+        "the env override is read, so a YAML config's own bind does not matter",
+    );
+
+    let config = home.home().join("shunt.toml");
+    let toml_case = |text: &str| {
+        std::fs::write(&config, text).unwrap();
+        super::standalone_readout_from(Ok(Some(config.clone())), None, silent).unread_bind
+    };
+    assert_eq!(
+        toml_case("[server]\nbind = \"${SHUNT_BIND}\"\n"),
+        Some(UnreadBind::Value("${SHUNT_BIND}".to_string())),
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = \"127.0.0.1:0\"\n"),
+        Some(UnreadBind::Value("127.0.0.1:0".to_string())),
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = 3001\n"),
+        Some(UnreadBind::Value("3001".to_string())),
+        "a non-string bind is named in its TOML spelling",
+    );
+    assert_eq!(toml_case("[server\n"), Some(UnreadBind::Unparsed));
+    let dir = home.home().join("a-dir-not-a-file");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        super::standalone_readout_from(Ok(Some(dir.clone())), None, silent),
+        readout(Some(dir), Some(UnreadBind::Unreadable)),
+    );
+
+    let want: Vec<std::net::SocketAddr> = [
+        "127.0.0.1:3001",
+        "127.0.0.1:4100",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:4200",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+    ]
+    .iter()
+    .map(|a| a.parse().unwrap())
+    .collect();
+    assert_eq!(
+        *probed.borrow(),
+        want,
+        "one probe per readout, at the bind clauth reads, else shunt's default"
     );
 }
 
@@ -696,7 +978,7 @@ fn shunt_check_maps_each_state_to_its_dot_class() {
     ];
     for (state, want) in cases {
         assert_eq!(
-            super::shunt_check(&slot(*state), false).health,
+            super::shunt_check(&slot(*state), false, None).health,
             *want,
             "{state:?} dot class"
         );
@@ -751,7 +1033,7 @@ fn shunt_check_escapes_the_untrusted_slot_strings() {
         reason: Some("bad \u{202e} entry".to_string()),
         since: None,
     };
-    let check = super::shunt_check(&slot, true);
+    let check = super::shunt_check(&slot, true, None);
     let find = |prefix: &str| {
         check
             .detail
@@ -807,19 +1089,19 @@ fn shunt_check_renders_the_foreign_answerer() {
             "port: 3001".to_string(),
         ]
     };
-    let check = super::shunt_check(&foreign(Some(Answerer::Shunt)), false);
+    let check = super::shunt_check(&foreign(Some(Answerer::Shunt)), false, None);
     assert_eq!(
         check.detail,
         expect("shunt"),
         "a shunt-shaped foreign answerer names itself"
     );
-    let check = super::shunt_check(&foreign(Some(Answerer::NotShunt)), false);
+    let check = super::shunt_check(&foreign(Some(Answerer::NotShunt)), false, None);
     assert_eq!(
         check.detail,
         expect("not shunt"),
         "a non-shunt HTTP answerer names itself"
     );
-    let check = super::shunt_check(&foreign(Some(Answerer::NoAnswer)), false);
+    let check = super::shunt_check(&foreign(Some(Answerer::NoAnswer)), false, None);
     assert_eq!(
         check.detail,
         expect("no answer"),
@@ -907,7 +1189,7 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
         .expect("shunt row");
     assert_eq!(
         shunt.detail,
-        vec!["state: absent".to_string()],
+        vec!["state: not adopted".to_string()],
         "an absent record shows no daemon note"
     );
 
@@ -12343,18 +12625,97 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
     );
 }
 
-/// Drain the herdr probe worker's result the way the tick does, waiting up to
-/// 10 s for it to land.
-fn await_herdr_probe(app: &mut App) {
+/// Drain the Services probe workers' results the way the tick does, waiting up
+/// to 10 s for every running one to land.
+fn await_service_probes(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.herdr_probing {
+    while app.services.herdr_probe.running || app.services.standalone_probe.running {
         assert!(
             std::time::Instant::now() < deadline,
-            "the herdr probe did not land within 10 s"
+            "a Services probe did not land within 10 s"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
-        super::drain_herdr_probe(app);
+        super::drain_service_probes(app);
     }
+}
+
+/// With no gateway adopted, entering the tab probes what runs standalone on a
+/// worker, and the readout lands on the `shunt` row with no key; `r` probes
+/// again. The adopted-gateway path never starts it.
+#[test]
+fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn stub() -> super::StandaloneShunt {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt {
+            found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+            unread_bind: None,
+            answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
+        }
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    RUNS.store(0, Ordering::SeqCst);
+
+    let mut app = bare_app();
+    app.services.standalone_probe.prober = Some(stub);
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.standalone_probe.running,
+        "entering the tab starts the probe, no `r`"
+    );
+    await_service_probes(&mut app);
+    let shunt = |app: &App| {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "shunt")
+            .expect("shunt row")
+            .detail
+            .clone()
+    };
+    assert_eq!(
+        shunt(&app),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /cfg/shunt.toml".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+    );
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.standalone_probe.running,
+        "the per-tick refresh reuses the cached readout"
+    );
+    super::recompute_services_checks(&mut app, true);
+    assert!(app.services.standalone_probe.running, "`r` probes again");
+    await_service_probes(&mut app);
+    assert_eq!(RUNS.load(Ordering::SeqCst), 2, "one run per trigger");
+
+    // An adopted gateway: no standalone probe, no readout on the row.
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config = dir.join("shunt.toml");
+    std::fs::write(&config, "port = 3001\n").expect("config");
+    std::fs::write(
+        dir.join("gateway.toml"),
+        format!("config = {:?}\n", config.to_string_lossy()),
+    )
+    .expect("record");
+    let mut app = bare_app();
+    app.services.standalone_probe.prober = Some(stub);
+    super::recompute_services_checks(&mut app, true);
+    assert!(
+        !app.services.standalone_probe.running,
+        "an adopted gateway never probes for a standalone one"
+    );
+    assert!(
+        !shunt(&app)
+            .iter()
+            .any(|l| l.starts_with("found") || l.starts_with("standalone")),
+        "{:?}",
+        shunt(&app)
+    );
 }
 
 /// Entering the Services tab with an installed herdr shows its row with no
@@ -12369,13 +12730,13 @@ fn entering_the_services_tab_shows_the_herdr_row_with_no_key() {
     let _env = crate::testutil::heal_env(&home, &shim, &listing, &listing, "", &[]);
 
     let mut app = bare_app();
-    app.services.herdr_prober = Some(crate::herdr::probe);
+    app.services.herdr_probe.prober = Some(crate::herdr::probe);
     super::switch_tab(&mut app, super::Tab::Services);
     assert!(
-        app.services.herdr_probing,
+        app.services.herdr_probe.running,
         "entering the tab starts the probe, no `r`"
     );
-    await_herdr_probe(&mut app);
+    await_service_probes(&mut app);
 
     let herdr = app
         .services
@@ -12434,7 +12795,7 @@ fn gated_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
 fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.services.herdr_prober = Some(gated_herdr_probe);
+    app.services.herdr_probe.prober = Some(gated_herdr_probe);
 
     let started = std::time::Instant::now();
     super::switch_tab(&mut app, super::Tab::Services);
@@ -12443,14 +12804,14 @@ fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
     term.draw(|f| crate::tui::render::draw(f, &app))
         .expect("first paint");
     let elapsed = started.elapsed();
-    super::drain_herdr_probe(&mut app);
+    super::drain_service_probes(&mut app);
 
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "the tab entry and first paint waited on the held probe: {elapsed:?}"
     );
     assert!(
-        app.services.herdr_probing,
+        app.services.herdr_probe.running,
         "the probe is still held after the first paint"
     );
     assert!(
@@ -12463,14 +12824,14 @@ fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
         &mut app,
         crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
     );
-    assert!(app.services.herdr_probing, "still the one held probe");
+    assert!(app.services.herdr_probe.running, "still the one held probe");
 
     {
         let (lock, cvar) = &HERDR_GATE;
         *lock.lock().expect("gate lock") = true;
         cvar.notify_all();
     }
-    await_herdr_probe(&mut app);
+    await_service_probes(&mut app);
     assert!(
         app.services.checks.iter().any(|c| c.label == "herdr"),
         "the row appears once the probe lands"
@@ -12503,11 +12864,11 @@ fn r_re_probes_herdr_on_the_services_tab() {
     use std::sync::atomic::Ordering;
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.services.herdr_prober = Some(counting_herdr_probe);
+    app.services.herdr_probe.prober = Some(counting_herdr_probe);
     let before = COUNTED_PROBES.load(Ordering::SeqCst);
 
     super::switch_tab(&mut app, super::Tab::Services);
-    await_herdr_probe(&mut app);
+    await_service_probes(&mut app);
     assert_eq!(
         COUNTED_PROBES.load(Ordering::SeqCst),
         before + 1,
@@ -12516,7 +12877,7 @@ fn r_re_probes_herdr_on_the_services_tab() {
 
     super::recompute_services_checks(&mut app, false);
     assert!(
-        !app.services.herdr_probing,
+        !app.services.herdr_probe.running,
         "a recompute with a probe cached starts none"
     );
 
@@ -12524,8 +12885,8 @@ fn r_re_probes_herdr_on_the_services_tab() {
         &mut app,
         crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
     );
-    assert!(app.services.herdr_probing, "`r` starts a re-probe");
-    await_herdr_probe(&mut app);
+    assert!(app.services.herdr_probe.running, "`r` starts a re-probe");
+    await_service_probes(&mut app);
     assert_eq!(
         COUNTED_PROBES.load(Ordering::SeqCst),
         before + 2,
@@ -12537,20 +12898,23 @@ fn panicking_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
     panic!("the herdr probe blew up")
 }
 
-/// A probe that panics lands as "herdr does not resolve", so `herdr_probing`
+/// A probe that panics lands as "herdr does not resolve", so `herdr_probe.running`
 /// never sticks and `r` stays live.
 #[test]
 fn a_panicking_herdr_probe_lands_as_no_herdr() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.services.herdr_prober = Some(panicking_herdr_probe);
+    app.services.herdr_probe.prober = Some(panicking_herdr_probe);
     super::switch_tab(&mut app, super::Tab::Services);
-    await_herdr_probe(&mut app);
+    await_service_probes(&mut app);
     assert!(
         matches!(app.services.herdr, Some(None)),
         "a panicking probe reads as no herdr"
     );
-    assert!(!app.services.herdr_probing, "the in-flight flag cleared");
+    assert!(
+        !app.services.herdr_probe.running,
+        "the in-flight flag cleared"
+    );
 }
 
 /// The first herdr landing never moves the view behind an open modal: a probe
@@ -12576,12 +12940,13 @@ fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
         !app.modals.is_empty(),
         "fixture control: the help modal is open"
     );
-    app.services.herdr_probing = true;
+    app.services.herdr_probe.running = true;
     app.services
-        .herdr_probe_tx
+        .herdr_probe
+        .tx
         .send(Some(probe()))
         .expect("send");
-    super::drain_herdr_probe(&mut app);
+    super::drain_service_probes(&mut app);
     assert!(
         app.services.checks.iter().any(|c| c.label == "herdr"),
         "the probe landed"
@@ -13297,7 +13662,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         "the landed options cursor starts on the first row"
     );
     assert!(
-        app.services.herdr.is_none() && !app.services.herdr_probing,
+        app.services.herdr.is_none() && !app.services.herdr_probe.running,
         "no prober under test: herdr stays unprobed, standing in for a probe \
          that has not landed"
     );

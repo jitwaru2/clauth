@@ -1460,10 +1460,61 @@ pub(crate) fn fix_line(fix: &ServiceFix) -> String {
     format!("f  {}", fix_verb(fix))
 }
 
+/// One Services probe that must never hold a frame: at most one run in
+/// flight, its result landing through [`Self::drain`] on the tick.
+#[derive(Debug)]
+pub(crate) struct ProbeWorker<T> {
+    /// What the worker runs, or `None` under test, so no test spawns the real
+    /// probe unless it opts in with a stub (the `App::clipboard` seam's shape).
+    pub(crate) prober: Option<fn() -> T>,
+    /// A run is in flight; a second never starts beside it.
+    pub(crate) running: bool,
+    pub(crate) tx: std::sync::mpsc::Sender<T>,
+    rx: std::sync::mpsc::Receiver<T>,
+}
+
+impl<T: Default + Send + 'static> ProbeWorker<T> {
+    fn new(prober: fn() -> T) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            prober: (!cfg!(test)).then_some(prober),
+            running: false,
+            tx,
+            rx,
+        }
+    }
+
+    /// Start a run unless one is in flight. A prober that panics lands as
+    /// `T::default()`, so `running` never sticks.
+    fn start(&mut self) {
+        let Some(prober) = self.prober else {
+            return;
+        };
+        if self.running {
+            return;
+        }
+        self.running = true;
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send(catch_unwind(prober).unwrap_or_default());
+        });
+    }
+
+    /// The newest result that landed since the last drain, if any.
+    fn drain(&mut self) -> Option<T> {
+        let mut landed = None;
+        while let Ok(result) = self.rx.try_recv() {
+            landed = Some(result);
+            self.running = false;
+        }
+        landed
+    }
+}
+
 /// UI-thread-only state for the Services tab. Recomputed synchronously on tab
 /// focus and on `r` (the reads are local FS/`PATH`; `claude --version` is one
-/// cached subprocess gated by [`ServicesState::cc_version`]); the herdr probe
-/// alone runs on a worker ([`ServicesState::herdr`]).
+/// cached subprocess gated by [`ServicesState::cc_version`]); the herdr and
+/// standalone-shunt probes run on workers ([`ProbeWorker`]).
 #[derive(Debug)]
 pub(crate) struct ServicesState {
     pub(crate) focus: ServicesFocus,
@@ -1491,17 +1542,18 @@ pub(crate) struct ServicesState {
     /// resolve (no row), `Some(Some(p))` = the probe. The first recompute
     /// (entering the tab, or construction on the first herdr landing) and
     /// every `r` start it on a worker, since it spawns three subprocesses;
-    /// the result lands through `drain_herdr_probe`, and until then the cached
+    /// the result lands through `drain_service_probes`, and until then the cached
     /// value renders. A tab switch and the per-tick refresh reuse it.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
-    /// A herdr probe is running on its worker; a second never starts beside it.
-    pub(crate) herdr_probing: bool,
-    /// What the probe worker runs: [`crate::herdr::probe`], or `None` under
-    /// test, so no test spawns the real herdr unless it opts in with a stub
-    /// (the `App::clipboard` seam's shape).
-    pub(crate) herdr_prober: Option<fn() -> Option<crate::herdr::HerdrProbe>>,
-    pub(crate) herdr_probe_tx: std::sync::mpsc::Sender<Option<crate::herdr::HerdrProbe>>,
-    pub(crate) herdr_probe_rx: std::sync::mpsc::Receiver<Option<crate::herdr::HerdrProbe>>,
+    /// The worker running [`crate::herdr::probe`].
+    pub(crate) herdr_probe: ProbeWorker<Option<crate::herdr::HerdrProbe>>,
+    /// Cached standalone-shunt readout, for the `shunt` row while no gateway
+    /// is adopted: `None` = unprobed. Probed on a worker (config discovery plus
+    /// one `/health` round trip) the first time the row reads `absent` and on
+    /// every `r`; a tab switch and the per-tick refresh reuse it.
+    pub(crate) standalone: Option<StandaloneShunt>,
+    /// The worker running [`standalone_probe`].
+    pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
@@ -1547,7 +1599,6 @@ pub(crate) struct ServicesState {
 
 impl Default for ServicesState {
     fn default() -> Self {
-        let (herdr_probe_tx, herdr_probe_rx) = std::sync::mpsc::channel();
         Self {
             focus: ServicesFocus::List,
             cursor: 0,
@@ -1559,14 +1610,9 @@ impl Default for ServicesState {
             cc_version: None,
             mcp_boot: None,
             herdr: None,
-            herdr_probing: false,
-            herdr_prober: if cfg!(test) {
-                None
-            } else {
-                Some(crate::herdr::probe)
-            },
-            herdr_probe_tx,
-            herdr_probe_rx,
+            herdr_probe: ProbeWorker::new(crate::herdr::probe),
+            standalone: None,
+            standalone_probe: ProbeWorker::new(standalone_probe),
             delegates: Vec::new(),
             problem_cursor: 0,
             herdr_options_cursor: 0,
@@ -4477,7 +4523,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // recompute with nothing cached starts it (the row appears with no key),
     // `r` re-probes.
     if refresh_version || app.services.herdr.is_none() {
-        start_herdr_probe(app);
+        app.services.herdr_probe.start();
     }
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
@@ -4486,9 +4532,19 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // fresh, else the record-only verdict. The "the daemon runs the gateway"
     // note names the daemon only for a record the gateway WOULD run on with no
     // daemon to run it (the `unobserved` verdict) — never for absent/disabled/
-    // no_config, where no gateway would run at all.
+    // no_config, where no gateway would run at all. With no gateway adopted,
+    // the standalone probe says what shunt would load and what answers.
     let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
-    let mut shunt = shunt_check(&gateway_slot, gateway_supervised);
+    if gateway_slot.state == GatewayState::Absent
+        && (refresh_version || app.services.standalone.is_none())
+    {
+        app.services.standalone_probe.start();
+    }
+    let mut shunt = shunt_check(
+        &gateway_slot,
+        gateway_supervised,
+        app.services.standalone.as_ref(),
+    );
     if !gateway_supervised && gateway_slot.state == GatewayState::Unobserved {
         shunt.detail.push("the daemon runs the gateway".to_string());
     }
@@ -4582,36 +4638,21 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     }
 }
 
-/// Start the herdr probe on a worker unless one already runs. Its three
-/// subprocesses (each bounded by `herdr::PROBE_TIMEOUT`) never hold a frame;
-/// `drain_herdr_probe` adopts the result. A probe that panics lands as "herdr
-/// does not resolve", so `herdr_probing` never sticks.
-fn start_herdr_probe(app: &mut App) {
-    let Some(prober) = app.services.herdr_prober else {
-        return;
-    };
-    if app.services.herdr_probing {
+/// Adopt every finished Services probe and recompute once, so a row appears
+/// (or changes) with no key, and a pending first-herdr landing lands.
+fn drain_service_probes(app: &mut App) {
+    let herdr = app.services.herdr_probe.drain();
+    let standalone = app.services.standalone_probe.drain();
+    if herdr.is_none() && standalone.is_none() {
         return;
     }
-    app.services.herdr_probing = true;
-    let tx = app.services.herdr_probe_tx.clone();
-    spawn_worker(move || {
-        let _ = tx.send(catch_unwind(prober).unwrap_or(None));
-    });
-}
-
-/// Adopt a finished herdr probe and recompute, so the row appears (or goes)
-/// with no key, and a pending first-herdr landing lands.
-fn drain_herdr_probe(app: &mut App) {
-    let mut landed = false;
-    while let Ok(probe) = app.services.herdr_probe_rx.try_recv() {
+    if let Some(probe) = herdr {
         app.services.herdr = Some(probe);
-        app.services.herdr_probing = false;
-        landed = true;
     }
-    if landed {
-        recompute_services_checks(app, false);
+    if let Some(readout) = standalone {
+        app.services.standalone = Some(readout);
     }
+    recompute_services_checks(app, false);
 }
 
 /// The `delegates` row: a selector whose detail is the job list. Green while a
@@ -4643,12 +4684,136 @@ pub(crate) fn delegates_check(
     }
 }
 
+/// What runs without clauth while no gateway is adopted: the config shunt's
+/// own discovery would load, and the shunt answering `/health` on its bind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StandaloneShunt {
+    /// The first config shunt would load from the TUI's cwd and env, TOML or
+    /// YAML; `None` when discovery finds none.
+    pub(crate) found: Option<std::path::PathBuf>,
+    /// Why clauth could not read the bind shunt would listen on; `None` when
+    /// it read one, or when no config and no env override set one.
+    pub(crate) unread_bind: Option<UnreadBind>,
+    /// The version a shunt-shaped `/health` answer reported, and the address
+    /// that answered; `None` when nothing shunt-shaped answered.
+    pub(crate) answer: Option<(String, std::net::SocketAddr)>,
+}
+
+/// Why clauth could not read a standalone shunt's bind. The row names it, so
+/// a shunt on that bind going unnamed has a stated reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreadBind {
+    /// The config is YAML, which clauth does not parse.
+    Yaml,
+    /// The config file could not be read.
+    Unreadable,
+    /// The config is not valid TOML.
+    Unparsed,
+    /// The value clauth refused, as written: a `${…}` reference, port 0, or
+    /// something that is not an address; an env value leads with its name.
+    Value(String),
+}
+
+impl UnreadBind {
+    fn label(&self) -> String {
+        match self {
+            UnreadBind::Yaml => "yaml".to_string(),
+            UnreadBind::Unreadable => "config unreadable".to_string(),
+            UnreadBind::Unparsed => "config does not parse".to_string(),
+            UnreadBind::Value(value) => value.clone(),
+        }
+    }
+}
+
+/// The standalone readout from a discovery result, the `SHUNT_SERVER__BIND`
+/// value and one `/health` probe: of the bind clauth reads off the found TOML
+/// config and the env, else of shunt's default. A bind clauth cannot read
+/// falls back to the default and is named in `unread_bind`, so the answer
+/// line only ever states what answered where.
+pub(crate) fn standalone_readout_from(
+    discovered: anyhow::Result<Option<std::path::PathBuf>>,
+    env_bind: Option<&str>,
+    probe: impl Fn(std::net::SocketAddr) -> anyhow::Result<crate::gateway::Health>,
+) -> StandaloneShunt {
+    let (found, config_text, unread_config) = match discovered {
+        Ok(Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => (Some(path), text, None),
+            Err(_) => (Some(path), String::new(), Some(UnreadBind::Unreadable)),
+        },
+        Ok(None) => (None, String::new(), None),
+        Err(e) => match e.downcast_ref::<crate::gateway::YamlConfig>() {
+            Some(yaml) => (
+                Some(yaml.path.clone()),
+                String::new(),
+                Some(UnreadBind::Yaml),
+            ),
+            None => (None, String::new(), None),
+        },
+    };
+    let (addr, unread_bind) = match crate::gateway::resolve_bind(&config_text, env_bind) {
+        // An env override is the bind shunt uses whatever the config says.
+        Ok(bind) => (bind.probe, unread_config.filter(|_| env_bind.is_none())),
+        Err(e) => {
+            let reason = match env_bind {
+                Some(value) => UnreadBind::Value(format!("{}={value}", crate::gateway::BIND_ENV)),
+                None if e.downcast_ref::<crate::gateway::BindRefusal>().is_some() => {
+                    UnreadBind::Value(raw_config_bind(&config_text))
+                }
+                None => UnreadBind::Unparsed,
+            };
+            (crate::gateway::SHUNT_DEFAULT_BIND, Some(reason))
+        }
+    };
+    let answer = match probe(addr) {
+        Ok(crate::gateway::Health::Shunt { version }) => Some((version, addr)),
+        Ok(crate::gateway::Health::Silent(_) | crate::gateway::Health::NotShunt { .. })
+        | Err(_) => None,
+    };
+    StandaloneShunt {
+        found,
+        unread_bind,
+        answer,
+    }
+}
+
+/// `[server].bind` as the config writes it, for a bind clauth refused: the
+/// string itself, or a non-string value's TOML spelling.
+fn raw_config_bind(config_text: &str) -> String {
+    config_text
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| {
+            let bind = doc.get("server")?.get("bind")?;
+            Some(match bind.as_str() {
+                Some(value) => value.to_string(),
+                None => bind.to_string().trim().to_string(),
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// [`standalone_readout_from`] over this process's cwd and env: the Services
+/// worker's prober.
+fn standalone_probe() -> StandaloneShunt {
+    standalone_readout_from(
+        crate::gateway::discover_config(),
+        std::env::var(crate::gateway::BIND_ENV).ok().as_deref(),
+        crate::gateway::probe_health,
+    )
+}
+
 /// The `shunt` row: the managed gateway's status dot + readout, from the slot
 /// `gateway_slot` resolves (the daemon's feed, or the record-only verdict).
 /// Read-only — no actions — so no fix and no problems. Pure over the slot plus
 /// the `supervised` flag (whether the slot came from a fresh daemon's feed) so
-/// the verdict logic unit-tests without touching `status.json`.
-pub(crate) fn shunt_check(slot: &crate::daemon::gateway::GatewaySlot, supervised: bool) -> Check {
+/// the verdict logic unit-tests without touching `status.json`. With no
+/// gateway adopted (`absent`) the state reads `not adopted` and the
+/// `standalone` readout, once probed, names what runs without clauth.
+pub(crate) fn shunt_check(
+    slot: &crate::daemon::gateway::GatewaySlot,
+    supervised: bool,
+    standalone: Option<&StandaloneShunt>,
+) -> Check {
     let mut detail = Vec::new();
     if let Some(binary) = &slot.binary {
         detail.push(format!("binary: {}", escape_control(binary)));
@@ -4659,7 +4824,30 @@ pub(crate) fn shunt_check(slot: &crate::daemon::gateway::GatewaySlot, supervised
     if let Some(version) = &slot.version {
         detail.push(format!("version: {}", escape_control(version)));
     }
-    detail.push(format!("state: {}", gateway_state_word(slot.state)));
+    if slot.state == GatewayState::Absent {
+        // The feed keeps `absent`; the row says what it means for the user.
+        detail.push("state: not adopted".to_string());
+        if let Some(path) = standalone.and_then(|s| s.found.as_ref()) {
+            detail.push(format!(
+                "found: {}",
+                escape_control(&path.to_string_lossy())
+            ));
+        }
+        if let Some(unread) = standalone.and_then(|s| s.unread_bind.as_ref()) {
+            detail.push(format!(
+                "bind: not read ({})",
+                escape_control(&unread.label())
+            ));
+        }
+        if let Some((version, addr)) = standalone.and_then(|s| s.answer.as_ref()) {
+            detail.push(format!(
+                "standalone shunt {} answers on {addr}",
+                escape_control(version)
+            ));
+        }
+    } else {
+        detail.push(format!("state: {}", gateway_state_word(slot.state)));
+    }
     if let Some(reason) = &slot.reason {
         // A multi-line reason (a TOML parse error with its snippet) splits onto
         // one indented sub-line per further line instead of one garbled row; the
@@ -11026,7 +11214,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_live_sessions(app);
     sync_broken_verdicts(app);
     poll_codex_rows(app);
-    drain_herdr_probe(app);
+    drain_service_probes(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);

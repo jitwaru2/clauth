@@ -216,20 +216,28 @@ fn assert_dot(check: &Check, expected: Health) {
 
 // ── selector rows ──────────────────────────────────────────────────────────────
 
-/// The title spinner shows while the herdr probe runs on its worker, and not
-/// otherwise.
+/// The title spinner shows while either Services probe runs on its worker,
+/// and not otherwise.
 #[test]
-fn the_title_spinner_shows_while_the_herdr_probe_runs() {
+fn the_title_spinner_shows_while_a_services_probe_runs() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = app_with(plugin_check_with_problems());
     let spun = format!(" SERVICES {} ", super::spinner_frame(app.tick_count));
     let (rows, _) = render(&app);
     assert!(!rows[0].contains(&spun), "no spinner at rest:\n{}", rows[0]);
-    app.services.herdr_probing = true;
+    app.services.herdr_probe.running = true;
     let (rows, _) = render(&app);
     assert!(
         rows[0].contains(&spun),
-        "the spinner while probing:\n{}",
+        "the spinner while herdr probes:\n{}",
+        rows[0]
+    );
+    app.services.herdr_probe.running = false;
+    app.services.standalone_probe.running = true;
+    let (rows, _) = render(&app);
+    assert!(
+        rows[0].contains(&spun),
+        "the spinner while the standalone shunt probe runs:\n{}",
         rows[0]
     );
 }
@@ -243,6 +251,7 @@ fn the_selector_lists_each_service_row_dot_and_label_only() {
         crate::tui::app::shunt_check(
             &shunt_slot(crate::daemon::gateway::GatewayState::Absent),
             false,
+            None,
         ),
         delegates_check(&[], &[]),
         plugin_check_with_problems(),
@@ -284,7 +293,7 @@ fn the_shunt_dot_maps_each_state_to_its_class() {
         (S::Unobserved, Health::Idle),
     ] {
         assert_dot(
-            &crate::tui::app::shunt_check(&shunt_slot(state), false),
+            &crate::tui::app::shunt_check(&shunt_slot(state), false, None),
             want,
         );
     }
@@ -296,7 +305,7 @@ fn the_shunt_dot_maps_each_state_to_its_class() {
 #[test]
 fn the_shunt_detail_renders_every_set_field() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = app_with(crate::tui::app::shunt_check(&shunt_slot_full(), true));
+    let app = app_with(crate::tui::app::shunt_check(&shunt_slot_full(), true, None));
     let (rows, _) = render(&app);
     assert_eq!(
         detail_rows(&rows),
@@ -322,7 +331,7 @@ fn the_shunt_detail_escapes_a_planted_screen_clear() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut slot = shunt_slot_full();
     slot.version = Some("0.49.1\u{1b}[2J".to_string());
-    let app = app_with(crate::tui::app::shunt_check(&slot, true));
+    let app = app_with(crate::tui::app::shunt_check(&slot, true, None));
     let (rows, _) = render(&app);
     let detail = detail_rows(&rows);
     assert_eq!(
@@ -699,6 +708,68 @@ fn the_plugin_detail_tones_the_mcp_and_install_values() {
             "a healthy `{key}` reads success"
         );
     }
+}
+
+/// An unadopted gateway's state reads dim, and a found config renders as a
+/// path value beside it.
+#[test]
+fn an_unadopted_shunt_state_reads_dim() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let readout = crate::tui::app::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: None,
+        answer: None,
+    };
+    let app = app_with(crate::tui::app::shunt_check(
+        &shunt_slot(crate::daemon::gateway::GatewayState::Absent),
+        false,
+        Some(&readout),
+    ));
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("not adopted"))
+        .unwrap_or_else(|| panic!("no state row:\n{screen}"));
+    let row = &rows[row_idx];
+    let col = row[..row.find("not adopted").unwrap()].chars().count();
+    assert_eq!(
+        buf.content[row_idx * W as usize + col].fg,
+        super::theme::text_dim_color(),
+        "`not adopted` is dim:\n{screen}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("found") && r.contains("/cfg/shunt.toml")),
+        "the found config renders:\n{screen}"
+    );
+
+    // A path wider than the pane keeps both ends: the tree and the file.
+    let long = crate::tui::app::StandaloneShunt {
+        found: Some(std::path::PathBuf::from(format!(
+            "/home/u/{}/shunt.toml",
+            "deep/".repeat(40)
+        ))),
+        unread_bind: None,
+        answer: None,
+    };
+    let app = app_with(crate::tui::app::shunt_check(
+        &shunt_slot(crate::daemon::gateway::GatewayState::Absent),
+        false,
+        Some(&long),
+    ));
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    let found = rows
+        .iter()
+        .find(|r| r.contains("found"))
+        .unwrap_or_else(|| panic!("no found row:\n{screen}"));
+    assert!(
+        found.contains("found  /home/u/deep/")
+            && found.contains("…")
+            && found.contains("/shunt.toml"),
+        "a long found path is middle-truncated:\n{screen}"
+    );
 }
 
 /// From the list, `f` on the plugin row fixes the FIRST fixable problem shown

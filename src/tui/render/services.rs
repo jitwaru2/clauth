@@ -167,7 +167,10 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         Span::styled("─", Style::default().fg(border_color)),
         Span::styled(" SERVICES ", title_style),
     ];
-    if app.services.fetching || app.services.herdr_probing {
+    if app.services.fetching
+        || app.services.herdr_probe.running
+        || app.services.standalone_probe.running
+    {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
             theme::accent(),
@@ -566,7 +569,7 @@ fn detail_line(text: &str, key_w: usize, width: usize) -> Line<'static> {
 fn is_path_key(key: &str) -> bool {
     matches!(
         key,
-        "data" | "path" | "project" | "root" | "config" | "binary"
+        "data" | "path" | "project" | "root" | "config" | "binary" | "found"
     )
 }
 
@@ -609,6 +612,7 @@ fn value_tone(key: &str, value: &str) -> Style {
         ("key", "not") => theme::warning(),
         ("sidebar", "templated") => theme::success(),
         ("sidebar", "not") => theme::warning(),
+        ("state", "not") => theme::dim(),
         _ => theme::body(),
     }
 }
