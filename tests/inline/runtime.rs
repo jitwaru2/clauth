@@ -407,7 +407,7 @@ fn pose_dir_link(link: &Path, target: &Path) {
     #[cfg(windows)]
     {
         let out = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
+            .args(["/D", "/C", "mklink", "/J"])
             .arg(link)
             .arg(target)
             .output()
@@ -10225,6 +10225,24 @@ fn an_alive_delete_child_keeps_refusing_past_the_age_bound() {
     );
 }
 
+/// A child alive until its stdin closes, from a program every OS ships: a
+/// stock Windows PATH has no `true` or `sleep` (those come with Git Bash), and
+/// the dropped stdin ends it even when the test panics before its kill.
+/// `/D` keeps a registry AutoRun command out of the child.
+fn spawn_stdin_parked_child() -> std::process::Child {
+    #[cfg(not(windows))]
+    let (program, args): (&str, &[&str]) = ("cat", &[]);
+    #[cfg(windows)]
+    let (program, args): (&str, &[&str]) = ("cmd", &["/D"]);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn `{program}`: {e}"))
+}
+
 /// A pid-dead row falls back to the age bound: the child is gone, so the
 /// guarded delete cannot still be running past its worst-case duration, and
 /// the bound sweeps the row. The dead pid is a just-reaped child's (pid
@@ -10241,8 +10259,9 @@ fn a_pid_dead_row_falls_back_to_the_age_bound() {
         &runtime.canonicalize().expect("canonical runtime"),
     );
 
-    let mut child = std::process::Command::new("true").spawn().expect("spawn");
+    let mut child = spawn_stdin_parked_child();
     let dead_pid = child.id();
+    drop(child.stdin.take());
     child.wait().expect("reap");
 
     let now = SystemTime::now()
@@ -10348,10 +10367,7 @@ fn an_unstampable_child_is_killed_not_run_unguarded() {
 fn one_collectors_clear_cannot_erase_anothers_live_tracking() {
     let _home = HomeSandbox::new();
     let service = "Claude Code-credentials-c56fc9bd";
-    let mut child = std::process::Command::new("sleep")
-        .arg("5")
-        .spawn()
-        .expect("spawn the second collector's child");
+    let mut child = spawn_stdin_parked_child();
     let live_pid = child.id();
 
     let now = SystemTime::now()
