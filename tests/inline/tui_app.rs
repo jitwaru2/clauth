@@ -12639,6 +12639,89 @@ fn await_service_probes(app: &mut App) {
     }
 }
 
+/// `r` during a probe already in flight queues one follow-up run, started
+/// when the held run lands, so the toast's "re-running service checks" holds
+/// for a change made just before the key. A second `r` queues no second run.
+/// Both Services workers share it.
+#[test]
+fn r_during_a_running_probe_queues_one_follow_up_run() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HERDR_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static STANDALONE_RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn herdr_stub() -> Option<crate::herdr::HerdrProbe> {
+        HERDR_RUNS.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+    fn standalone_stub() -> super::StandaloneShunt {
+        STANDALONE_RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt::default()
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    HERDR_RUNS.store(0, Ordering::SeqCst);
+    STANDALONE_RUNS.store(0, Ordering::SeqCst);
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.herdr_probe.prober = Some(herdr_stub);
+    app.services.standalone_probe.prober = Some(standalone_stub);
+    // Both runs held in flight: set by hand, so neither stub runs for them.
+    app.services.herdr_probe.running = true;
+    app.services.standalone_probe.running = true;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert_eq!(
+        (
+            HERDR_RUNS.load(Ordering::SeqCst),
+            STANDALONE_RUNS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "no run starts beside the one in flight"
+    );
+
+    app.services
+        .herdr_probe
+        .tx
+        .send(Some(healthy_herdr_probe()))
+        .expect("send");
+    app.services
+        .standalone_probe
+        .tx
+        .send(super::StandaloneShunt::default())
+        .expect("send");
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.herdr_probe.running && app.services.standalone_probe.running,
+        "each held run's landing starts its follow-up"
+    );
+    await_service_probes(&mut app);
+    assert_eq!(
+        (
+            HERDR_RUNS.load(Ordering::SeqCst),
+            STANDALONE_RUNS.load(Ordering::SeqCst)
+        ),
+        (1, 1),
+        "one follow-up each, however many `r`s"
+    );
+    assert!(
+        matches!(app.services.herdr, Some(None)),
+        "the follow-up's result is the one adopted"
+    );
+
+    // The per-tick refresh over a run in flight queues nothing: only `r` does.
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.herdr_probe.prober = Some(herdr_stub);
+    app.services.standalone_probe.prober = Some(standalone_stub);
+    app.services.herdr_probe.running = true;
+    app.services.standalone_probe.running = true;
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.herdr_probe.rerun && !app.services.standalone_probe.rerun,
+        "the refresh queues no follow-up"
+    );
+}
+
 /// With no gateway adopted, entering the tab probes what runs standalone on a
 /// worker, and the readout lands on the `shunt` row with no key; `r` probes
 /// again. The adopted-gateway path never starts it.
@@ -12790,7 +12873,8 @@ fn gated_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
 /// A probe that hangs never holds the first paint: entering the tab and
 /// drawing a frame return while the probe is still held, with no herdr row
 /// yet, and the row appears once the probe lands. While it is held, neither a
-/// refresh tick's recompute nor `r` starts a second one.
+/// refresh tick's recompute nor `r` starts a second one beside it; `r` queues
+/// one follow-up, which runs once the held probe lands.
 #[test]
 fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -12825,6 +12909,10 @@ fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
         crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
     );
     assert!(app.services.herdr_probe.running, "still the one held probe");
+    assert!(
+        app.services.herdr_probe.rerun,
+        "`r` queued its probe behind the held one instead of beside it"
+    );
 
     {
         let (lock, cvar) = &HERDR_GATE;
@@ -12839,8 +12927,8 @@ fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
     super::join_test_workers();
     assert_eq!(
         GATED_PROBES.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the tick recompute and `r` started no second probe beside the held one"
+        2,
+        "the `r` held behind the first probe ran once after it landed"
     );
 }
 
@@ -12917,12 +13005,15 @@ fn a_panicking_herdr_probe_lands_as_no_herdr() {
     );
 }
 
-/// The first herdr landing never moves the view behind an open modal: a probe
-/// landing under the help modal leaves the cursor where it was and the intent
-/// pending; the first modal-free recompute lands it. `f` on the list, like
-/// ↑↓/↵, is the user acting, so it drops the intent.
+/// The first herdr landing happens on the tick that drains its probe, or
+/// never (cloudy, 2026-09-29). A modal opening before that drops the intent:
+/// the probe landing under it leaves the cursor, and so does every refresh
+/// after it closes. That holds for a modal already closed when the probe lands
+/// (`a`, then esc: the action-menu path), which the old wait-for-a-modal-free
+/// recompute landed. `f` on the list, like ↑↓/↵, is the user acting, so it
+/// drops the intent too.
 #[test]
-fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
+fn a_modal_drops_the_herdr_landing_and_f_drops_it() {
     use ratatui::crossterm::event::KeyCode;
     let _home = crate::testutil::HomeSandbox::new();
     let probe = || crate::herdr::HerdrProbe {
@@ -12931,7 +13022,21 @@ fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
         config_path: None,
         error: None,
     };
+    let land = |app: &mut App| {
+        app.services.herdr_probe.running = true;
+        app.services
+            .herdr_probe
+            .tx
+            .send(Some(probe()))
+            .expect("send");
+        super::drain_service_probes(app);
+        assert!(
+            app.services.checks.iter().any(|c| c.label == "herdr"),
+            "fixture control: the probe landed"
+        );
+    };
 
+    // A modal still open when the probe lands.
     let mut app = bare_app().with_herdr_mode(true);
     assert!(app.services.land_on_herdr, "the landing is pending");
     let parked = app.services.cursor;
@@ -12940,35 +13045,40 @@ fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
         !app.modals.is_empty(),
         "fixture control: the help modal is open"
     );
-    app.services.herdr_probe.running = true;
-    app.services
-        .herdr_probe
-        .tx
-        .send(Some(probe()))
-        .expect("send");
-    super::drain_service_probes(&mut app);
     assert!(
-        app.services.checks.iter().any(|c| c.label == "herdr"),
-        "the probe landed"
+        !app.services.land_on_herdr,
+        "opening a modal drops the intent"
     );
+    land(&mut app);
     assert_eq!(
         app.services.cursor, parked,
         "the cursor stays under the modal"
     );
     assert_eq!(app.services.focus, super::ServicesFocus::List);
-    assert!(app.services.land_on_herdr, "the intent is still pending");
-
     app.modals.clear();
     super::recompute_services_checks(&mut app, false);
-    let herdr = app
-        .services
-        .checks
-        .iter()
-        .position(|c| c.label == "herdr")
-        .expect("herdr row");
-    assert_eq!(app.services.cursor, herdr, "the modal-free recompute lands");
-    assert_eq!(app.services.focus, super::ServicesFocus::Detail);
-    assert!(!app.services.land_on_herdr);
+    assert_eq!(
+        app.services.cursor, parked,
+        "the refresh after the modal closes does not land"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
+
+    // A modal opened and closed before the probe lands.
+    let mut app = bare_app().with_herdr_mode(true);
+    let parked = app.services.cursor;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::ActionMenu(_))),
+        "fixture control: the action menu is open"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "fixture control: the menu closed");
+    land(&mut app);
+    assert_eq!(
+        app.services.cursor, parked,
+        "a landing after the user's own modal leaves the cursor"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
 
     let mut app = bare_app().with_herdr_mode(true);
     assert!(app.services.land_on_herdr, "the landing is pending");
@@ -12977,6 +13087,50 @@ fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
         !app.services.land_on_herdr,
         "`f` on the list is the user acting: the intent drops"
     );
+}
+
+/// With no modal, the landing is the first tick's after the probe result is
+/// sent: `on_tick` drains the probe before its 1 s Services refresh, and the
+/// refresh is held off here so only the drain can land it. A probe that
+/// resolves with no herdr drops the intent, so a later resolve never lands.
+#[test]
+fn the_herdr_landing_is_the_draining_tick_or_never() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    app.services.herdr_probe.running = true;
+    app.services
+        .herdr_probe
+        .tx
+        .send(Some(healthy_herdr_probe()))
+        .expect("send");
+    app.last_services_refresh = std::time::Instant::now();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "the draining tick lands on the herdr row"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::Detail);
+    assert!(!app.services.land_on_herdr);
+
+    let mut app = bare_app().with_herdr_mode(true);
+    let parked = app.services.cursor;
+    app.services.herdr_probe.running = true;
+    app.services.herdr_probe.tx.send(None).expect("send");
+    super::drain_service_probes(&mut app);
+    assert!(
+        !app.services.land_on_herdr,
+        "a probe resolving with no herdr drops the intent"
+    );
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "herdr"),
+        "fixture control: the herdr row renders"
+    );
+    assert_eq!(app.services.cursor, parked, "a later resolve never lands");
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
 }
 
 /// The row reads `source_kind` to decide whether a plugin is a local link, and herdr's own output is the only authority on that spelling. Driving the real captured bytes through the parse and into the check is what stops the row drifting onto a spelling herdr never emits: a hand-built fixture agrees with whatever the reader guessed.
@@ -13634,8 +13788,8 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
 /// Construction's recompute starts the herdr probe on its worker; under test no
 /// prober is set (it would read the real registry), which stands in for a
 /// probe that has not landed: the landing stays PENDING (parked on the last
-/// row, list focus) and re-lands on the herdr row by label the moment a later
-/// recompute resolves it. The `claude --version` probe stays `r`-gated:
+/// row, list focus) and lands on the herdr row by label in the recompute that
+/// adopts the probe. The `claude --version` probe stays `r`-gated:
 /// construction must not block the first paint on a spawn.
 #[test]
 fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
@@ -13703,8 +13857,8 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         plugin.detail
     );
 
-    // The probe resolves (a real construction runs it, `r` re-runs it): the
-    // herdr row inserts and the pending landing selects it by label.
+    // The probe resolves (its drain adopts it and recomputes): the herdr row
+    // inserts and the pending landing selects it by label.
     app.services.herdr = Some(Some(healthy_herdr_probe()));
     super::recompute_services_checks(&mut app, false);
     assert!(app.services.checks.iter().any(|c| c.label == "herdr"));
@@ -13723,8 +13877,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         "landing clears the pending intent"
     );
 
-    // The landing slot itself: with herdr present at construction (the real
-    // production path, where `HERDR_ENV=1` proves herdr resolves), the pending
+    // The landing slot itself: with a probe already cached, the pending
     // intent lands on the herdr row in the same recompute.
     let mut landed = bare_app();
     landed.services.land_on_herdr = true;

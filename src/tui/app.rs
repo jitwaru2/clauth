@@ -1678,6 +1678,10 @@ pub(crate) struct ProbeWorker<T> {
     pub(crate) prober: Option<fn() -> T>,
     /// A run is in flight; a second never starts beside it.
     pub(crate) running: bool,
+    /// A re-probe asked for while a run was in flight: one follow-up run
+    /// starts when that run's result drains, since the in-flight run may
+    /// predate the change the re-probe was asked to see.
+    rerun: bool,
     pub(crate) tx: std::sync::mpsc::Sender<T>,
     rx: std::sync::mpsc::Receiver<T>,
 }
@@ -1688,8 +1692,19 @@ impl<T: Default + Send + 'static> ProbeWorker<T> {
         Self {
             prober: (!cfg!(test)).then_some(prober),
             running: false,
+            rerun: false,
             tx,
             rx,
+        }
+    }
+
+    /// Start a run, or queue one follow-up behind the run in flight: the
+    /// explicit re-probe (`r`), whose result must postdate the call.
+    fn restart(&mut self) {
+        if self.running && self.prober.is_some() {
+            self.rerun = true;
+        } else {
+            self.start();
         }
     }
 
@@ -1709,12 +1724,16 @@ impl<T: Default + Send + 'static> ProbeWorker<T> {
         });
     }
 
-    /// The newest result that landed since the last drain, if any.
+    /// The newest result that landed since the last drain, if any. A landing
+    /// starts the follow-up run a [`Self::restart`] queued.
     fn drain(&mut self) -> Option<T> {
         let mut landed = None;
         while let Ok(result) = self.rx.try_recv() {
             landed = Some(result);
             self.running = false;
+        }
+        if landed.is_some() && std::mem::take(&mut self.rerun) {
+            self.start();
         }
         landed
     }
@@ -1749,8 +1768,9 @@ pub(crate) struct ServicesState {
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
     /// resolve (no row), `Some(Some(p))` = the probe. The first recompute
-    /// (entering the tab, or construction on the first herdr landing) and
-    /// every `r` start it on a worker, since it spawns three subprocesses;
+    /// (entering the tab, or construction on the first herdr landing) starts
+    /// it on a worker, since it spawns three subprocesses, and every `r`
+    /// starts it or queues one follow-up behind the run in flight;
     /// the result lands through `drain_service_probes`, and until then the cached
     /// value renders. A tab switch and the per-tick refresh reuse it.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
@@ -1758,8 +1778,9 @@ pub(crate) struct ServicesState {
     pub(crate) herdr_probe: ProbeWorker<Option<crate::herdr::HerdrProbe>>,
     /// Cached standalone-shunt readout, for the `shunt` row while no gateway
     /// is adopted: `None` = unprobed. Probed on a worker (config discovery plus
-    /// one `/health` round trip) the first time the row reads `absent` and on
-    /// every `r`; a tab switch and the per-tick refresh reuse it.
+    /// one `/health` round trip) the first time the row reads `absent`; every
+    /// `r` starts it or queues one follow-up behind the run in flight; a tab
+    /// switch and the per-tick refresh reuse it.
     pub(crate) standalone: Option<StandaloneShunt>,
     /// The worker running [`standalone_probe`].
     pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
@@ -1801,8 +1822,9 @@ pub(crate) struct ServicesState {
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
     /// A pending first-herdr-launch landing: the cursor lands on the `herdr` row
-    /// in the first modal-free recompute after its probe resolves. Cleared on
-    /// landing, or when the user moves the cursor, descends or fixes first.
+    /// in the recompute that adopts its probe, or never. Cleared there, or
+    /// earlier when a modal opens, the tab changes, or the user moves the
+    /// cursor, descends or fixes.
     pub(crate) land_on_herdr: bool,
 }
 
@@ -2871,18 +2893,17 @@ impl App {
     /// `home_tab` (default overview); the herdr header tag is unaffected. The
     /// first landing's recompute starts the herdr probe on its worker, so the
     /// first paint never waits on its three subprocesses; the pending intent
-    /// lands on the herdr row by label in the first recompute with no modal
-    /// open after the probe lands. The `claude --version` probe stays
-    /// `r`-gated: construction must not block the first paint on a spawn. An
-    /// ↑↓ cursor move, ↵, `f` on the list, or a tab switch clears the pending
+    /// lands on the herdr row by label in the recompute that adopts the probe,
+    /// or never. The `claude --version` probe stays `r`-gated: construction
+    /// must not block the first paint on a spawn. A modal opening, an ↑↓
+    /// cursor move, ↵, `f` on the list, or a tab switch clears the pending
     /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
         let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
         if first_landing {
             self.tab = Tab::Services;
-            // Land on the herdr row by label once its probe resolves: the
-            // intent stays pending until a modal-free recompute after that.
+            // Land on the herdr row by label once its probe resolves.
             self.services.land_on_herdr = true;
             recompute_services_checks(&mut self, false);
             {
@@ -3475,6 +3496,15 @@ impl App {
         }
     }
 
+    /// Every modal opens here. Opening one drops a still-pending first herdr
+    /// landing: the landing happens on the tick its probe drains or never, so
+    /// it can neither move the view behind a modal nor after the user's own
+    /// action closed one.
+    pub(crate) fn open_modal(&mut self, modal: Modal) {
+        self.services.land_on_herdr = false;
+        self.modals.push(modal);
+    }
+
     pub(crate) fn toast(&mut self, kind: ToastKind, body: impl Into<String>) {
         if self.toasts.len() >= TOAST_CAPACITY {
             self.toasts.pop_front();
@@ -3770,7 +3800,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') => {
             app.disarm_quit();
             app.help_scroll = 0;
-            app.modals.push(Modal::Help);
+            app.open_modal(Modal::Help);
             return;
         }
         KeyCode::Char('d') => {
@@ -3794,7 +3824,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             app.disarm_quit();
             let state = build_action_menu(app);
             if !state.items.is_empty() {
-                app.modals.push(Modal::ActionMenu(state));
+                app.open_modal(Modal::ActionMenu(state));
             }
             return;
         }
@@ -3830,7 +3860,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 set_token_period(app, app.token_period.next());
                 return;
             }
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
                 choice: false,
@@ -4379,7 +4409,7 @@ fn apply_service_fix(app: &mut App) {
     match fix {
         ServiceFix::WireMcpServers => {
             app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "wire clauth into claude code's mcpServers?".to_string(),
                 detail: Some(
                     "writes the clauth entry into ~/.claude.json; other fields are preserved."
@@ -4391,7 +4421,7 @@ fn apply_service_fix(app: &mut App) {
         }
         ServiceFix::HealHerdrConfig(path) => {
             app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "add the keybinding and sidebar row to herdr's config?".to_string(),
                 detail: Some(
                     "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
@@ -4402,7 +4432,7 @@ fn apply_service_fix(app: &mut App) {
         }
         ServiceFix::InstallPlugin => {
             app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "install the clauth plugin into claude code?".to_string(),
                 detail: Some(
                     "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
@@ -4646,7 +4676,7 @@ fn open_herdr_row_text_confirm(app: &mut App) {
     };
     let turning_on = !app.config().state.herdr.delegate_row_text;
     app.disarm_quit();
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: if turning_on {
             "add the delegate token to herdr's sidebar row?".to_string()
         } else {
@@ -4860,7 +4890,9 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // herdr probe — three subprocesses, so it runs on a worker: the first
     // recompute with nothing cached starts it (the row appears with no key),
     // `r` re-probes.
-    if refresh_version || app.services.herdr.is_none() {
+    if refresh_version {
+        app.services.herdr_probe.restart();
+    } else if app.services.herdr.is_none() {
         app.services.herdr_probe.start();
     }
 
@@ -4873,10 +4905,12 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // no_config, where no gateway would run at all. With no gateway adopted,
     // the standalone probe says what shunt would load and what answers.
     let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
-    if gateway_slot.state == GatewayState::Absent
-        && (refresh_version || app.services.standalone.is_none())
-    {
-        app.services.standalone_probe.start();
+    if gateway_slot.state == GatewayState::Absent {
+        if refresh_version {
+            app.services.standalone_probe.restart();
+        } else if app.services.standalone.is_none() {
+            app.services.standalone_probe.start();
+        }
     }
     let mut shunt = shunt_check(
         &gateway_slot,
@@ -4962,10 +4996,10 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // A pending herdr landing (the first herdr launch; its probe lands on a
     // worker) selects the herdr row the moment it appears — by label, not by a
     // stale index — and descends into its detail. The intent clears on
-    // landing; when herdr still does not resolve, the cursor parks on the last
-    // row and the intent survives for the next recompute. An open modal holds
-    // it: the probe can land under one, and the view must not move behind it.
-    if app.services.land_on_herdr && app.modals.is_empty() {
+    // landing; until the probe resolves, the cursor parks on the last row, and
+    // the drained probe settles it (`drain_service_probes`). Opening a modal
+    // drops it (`App::open_modal`), so no modal is ever open here with it set.
+    if app.services.land_on_herdr {
         if let Some(idx) = app.services.checks.iter().position(|c| c.label == "herdr") {
             app.services.cursor = idx;
             app.services.focus = ServicesFocus::Detail;
@@ -4977,13 +5011,16 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 }
 
 /// Adopt every finished Services probe and recompute once, so a row appears
-/// (or changes) with no key, and a pending first-herdr landing lands.
+/// (or changes) with no key. A pending first-herdr landing lands in that
+/// recompute or never: a herdr probe that resolved without landing it (herdr
+/// absent) drops the intent, so no later refresh can move the view.
 fn drain_service_probes(app: &mut App) {
     let herdr = app.services.herdr_probe.drain();
     let standalone = app.services.standalone_probe.drain();
     if herdr.is_none() && standalone.is_none() {
         return;
     }
+    let herdr_landed = herdr.is_some();
     if let Some(probe) = herdr {
         app.services.herdr = Some(probe);
     }
@@ -4991,6 +5028,9 @@ fn drain_service_probes(app: &mut App) {
         app.services.standalone = Some(readout);
     }
     recompute_services_checks(app, false);
+    if herdr_landed {
+        app.services.land_on_herdr = false;
+    }
 }
 
 /// The `delegates` row: a selector whose detail is the job list. Green while a
@@ -5541,7 +5581,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         return;
     }
     drop(cfg);
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
@@ -5656,7 +5696,7 @@ fn open_divergence_modal(app: &mut App, active: &str) {
         let cfg = app.config();
         crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
     };
-    app.modals.push(Modal::Divergence(DivergenceForm {
+    app.open_modal(Modal::Divergence(DivergenceForm {
         active: active.to_string(),
         sibling,
         cursor: 0,
@@ -5755,7 +5795,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
     };
     if let Some(existing) = existing_match {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
@@ -5763,7 +5803,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         }));
         return;
     }
-    app.modals.push(Modal::CaptureName(CaptureNameForm {
+    app.open_modal(Modal::CaptureName(CaptureNameForm {
         snapshot: Box::new(snapshot),
         input: InputState::new(""),
         from_divergence,
@@ -6764,7 +6804,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 chain_would_mix(&cfg, &name)
             };
             if would_mix {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: "mixing api-key and oauth accounts can leave sessions stuck on the \
                               api account."
                         .into(),
@@ -7980,7 +8020,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
             // say why up front instead of arming a confirm that no-ops.
             Some((name, true, _)) if crate::runtime::rotation_blocked_for(&name) => {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
@@ -7988,7 +8028,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 }));
             }
             Some((name, true, _)) => {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
@@ -8567,7 +8607,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             if mint_stashed {
                 // The browser round-trip a mint cost can't be redone for free;
                 // gate replacing it, mirroring the re-login gate above.
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: "replace the logged-in mint?".to_string(),
                     detail: Some(
                         "the browser login you already captured will be dropped".to_string(),
@@ -8597,7 +8637,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 } else {
                     "blanks the login; keeps the account, model, env, and chain slot. re-login any time."
                 };
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
@@ -9001,7 +9041,7 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
         .as_ref()
         .is_some_and(|d| d.captured_login.is_some());
     if has_stash {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
@@ -9095,7 +9135,7 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
 /// Show the login progress modal (no-op when already open).
 fn open_login_modal(app: &mut App) {
     if !app.modals.iter().any(|m| matches!(m, Modal::Login)) {
-        app.modals.push(Modal::Login);
+        app.open_modal(Modal::Login);
     }
 }
 
@@ -9584,7 +9624,7 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app.modals.push(Modal::EnvCollision(env_collision_form(
+        Some(c) => app.open_modal(Modal::EnvCollision(env_collision_form(
             name.to_string(),
             key,
             c,
@@ -9959,7 +9999,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
     // forward. Confirm the deauth risk instead of attempting (and failing)
     // the unforced delete first.
     if crate::runtime::has_live_session(name) {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("delete '{name}' anyway?"),
             detail: Some(
                 "this account has a live clauth start session; deleting it may log that \
@@ -10023,7 +10063,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         toggle_profile_disabled(app, &name);
         return;
     }
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
@@ -10039,7 +10079,7 @@ fn prompt_duplicate_profile(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
         return;
     };
-    app.modals.push(Modal::NamePrompt(NamePromptForm {
+    app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::DuplicateProfile(name.to_string()),
     }));
@@ -10050,7 +10090,7 @@ fn prompt_save_preset(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
         return;
     };
-    app.modals.push(Modal::NamePrompt(NamePromptForm {
+    app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::SavePreset(name.to_string()),
     }));
@@ -10074,7 +10114,7 @@ fn open_preset_picker(app: &mut App) {
     } else {
         return;
     };
-    app.modals.push(Modal::PresetPicker(PresetPickerForm {
+    app.open_modal(Modal::PresetPicker(PresetPickerForm {
         target,
         presets: crate::presets::list_presets(),
         cursor: 0,
@@ -10128,7 +10168,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     }
                     app.modals.pop();
                     if crate::presets::preset_exists(&name) {
-                        app.modals.push(Modal::Confirm(ConfirmState {
+                        app.open_modal(Modal::Confirm(ConfirmState {
                             message: format!("preset '{name}' already exists."),
                             detail: Some(
                                 "overwrite it with this account's base url and model settings?"
@@ -10185,7 +10225,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             app.modals.pop();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
@@ -10211,7 +10251,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 apply_preset_to(app, &target, &preset.name);
                 return;
             }
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("apply '{}' over '{target}'?", preset.name),
                 detail: Some(format!("replaces {}.", clobbered.join(", "))),
                 choice: false,
@@ -10539,7 +10579,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
-            app.modals.push(Modal::CaptureName(CaptureNameForm {
+            app.open_modal(Modal::CaptureName(CaptureNameForm {
                 snapshot,
                 input: InputState::new(""),
                 from_divergence,
@@ -10828,7 +10868,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     let Some(snapshot) = capture_live_or_toast(app) else {
                         return;
                     };
-                    app.modals.push(Modal::Confirm(ConfirmState {
+                    app.open_modal(Modal::Confirm(ConfirmState {
                         message: format!("switch to '{owner}'? the live login is its account."),
                         detail: Some(format!(
                             "the login is saved into '{owner}' and '{owner}' becomes the active \
@@ -10876,7 +10916,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
         }
         DivergenceChoice::NewProfile => open_divergence_target_picker(app),
         DivergenceChoice::Discard => {
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("discard the new login and restore '{active}'?"),
                 detail: Some(
                     "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
@@ -10980,7 +11020,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             // it; an OAuth-active one fills neither and the preserve arm keeps
             // the target's. The outcome turns on an account this prompt is not
             // about, so it promises nothing about either field.
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
                     "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
@@ -11033,7 +11073,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 // Issue #7: typing an existing profile's name used to dead-end
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("account '{existing}' already exists."),
                     detail: Some(
                         "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
@@ -11362,7 +11402,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             .config()
             .find(&ProfileName::from(session.name.clone()))
             .is_some_and(crate::claude::has_own_inference_endpoint);
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
                 if keeps_endpoint {
