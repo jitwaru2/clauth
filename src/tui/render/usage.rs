@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::App;
+use super::super::app::{App, NoteBuffer};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
@@ -18,8 +18,8 @@ use super::format::{
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim, wrap_words,
+    draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state, key_cell, master_detail,
+    pill, rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
@@ -246,6 +246,34 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Read off the guard already held here: `config` is a plain (non-reentrant)
     // mutex, so a second `app.config()` deeper in the render would self-deadlock.
     let reset_fmt = ResetFmt::from_state(&cfg.state);
+    // The note editor docks at the pane's bottom (the contract's multi-line
+    // input slot): content above, the auto-grow draft below.
+    let slot = app
+        .note_editor
+        .as_ref()
+        .filter(|e| e.profile.as_str() == profile.name.as_str());
+    let (content_area, slot_area) = match slot {
+        Some(editor) => {
+            let slot_h =
+                (editor.buf.row_count().min(NOTE_SLOT_MAX_ROWS) as u16 + 2).min(inner.height);
+            let content_h = inner.height.saturating_sub(slot_h);
+            (
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: content_h,
+                },
+                Some(Rect {
+                    x: inner.x,
+                    y: inner.y + content_h,
+                    width: inner.width,
+                    height: slot_h,
+                }),
+            )
+        }
+        None => (inner, None),
+    };
     let lines = build_usage_lines(
         profile,
         inner.width,
@@ -255,7 +283,10 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         show_pace,
         reset_fmt,
     );
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), content_area);
+    if let Some(editor) = slot {
+        draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf);
+    }
 }
 
 fn build_usage_lines(
@@ -270,6 +301,15 @@ fn build_usage_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w));
     lines.push(Line::from(""));
+
+    // Notes close the pane (cloudy's placement): below the usage bars and the
+    // extra-usage/balance rows, so the account's figures read first. Every
+    // branch exit appends it.
+    let with_notes = |mut lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
+        lines.push(Line::from(""));
+        lines.extend(notes_lines(app.note_text.as_deref(), inner_w));
+        lines
+    };
 
     // Accounts whose usage figures live in the third-party cache — a recognised
     // provider or a generic api-key endpoint — render via the third-party
@@ -289,18 +329,18 @@ fn build_usage_lines(
             reset_fmt,
             wallet_rate.as_ref(),
         ));
-        return lines;
+        return with_notes(lines);
     }
 
     if profile.usage.is_none() {
         lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
-        return lines;
+        return with_notes(lines);
     }
 
     let mut stats = collect_stats(profile, reset_fmt);
     if stats.is_empty() {
         lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
-        return lines;
+        return with_notes(lines);
     }
 
     let history = app
@@ -350,7 +390,7 @@ fn build_usage_lines(
     }
 
     lines.extend(render_stat_block(&stats, inner_w));
-    lines
+    with_notes(lines)
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
@@ -1685,6 +1725,83 @@ fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'stati
 
 fn key_span(key: &str) -> Span<'static> {
     Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::label())
+}
+
+/// The value column the `notes:` row opens at. `notes:` (6) is shorter than
+/// `KEY_W` (8), so the key cell always pads to `KEY_W + KEY_GUTTER`.
+const NOTES_VALUE_LEAD: usize = KEY_W + KEY_GUTTER;
+
+/// The `notes:` row: the faint add-hint while the account has none, the full
+/// note wrapped to the value column once it does. Copy is cloudy's (lowercase
+/// `notes:`, full-note display); styling is contract-clean — accent key, faint
+/// hint, no italic (the contract reserves italic for titles).
+fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
+    let value_w = (inner_w as usize).saturating_sub(NOTES_VALUE_LEAD).max(8);
+    let pad = " ".repeat(NOTES_VALUE_LEAD);
+    match note.filter(|t| !t.is_empty()) {
+        None => vec![Line::from(vec![
+            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
+            Span::styled("press n to add notes", theme::faint()),
+        ])],
+        Some(text) => {
+            let mut lines = Vec::new();
+            for (i, note_line) in text.split('\n').enumerate() {
+                for (j, seg) in wrap_words(note_line, value_w).into_iter().enumerate() {
+                    let value = Span::styled(seg, theme::body());
+                    if i == 0 && j == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
+                            value,
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![Span::raw(pad.clone()), value]));
+                    }
+                }
+            }
+            lines
+        }
+    }
+}
+
+/// The note editor docks at the detail pane's bottom with this many draft rows
+/// (the contract's auto-grow 1→8) before the draft scrolls inside.
+const NOTE_SLOT_MAX_ROWS: usize = 8;
+
+/// The note editor's docked slot: a `╭─ ✎ ───╮` sub-block, LINE_STRONG border,
+/// the draft inside, the native cursor at the caret, and the draft scrolling
+/// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. Wide chars are counted
+/// at their display width so the caret lands on the cell they occupy.
+fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
+    let block = edit_slot_block();
+    let slot_inner = block.inner(area);
+    frame.render_widget(block, area);
+    let empty = buf.row_count() == 1 && buf.line(0).is_empty();
+    let lines: Vec<Line<'static>> = if empty {
+        vec![Line::from(Span::styled("add a note…", theme::faint()))]
+    } else {
+        (0..buf.row_count())
+            .map(|i| Line::from(Span::styled(buf.line(i).to_string(), theme::body())))
+            .collect()
+    };
+    let (crow, ccol) = buf.cursor_pos();
+    let viewport = slot_inner.height as usize;
+    let total = lines.len();
+    let offset = scroll_offset(total, viewport, (crow, crow + 1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset as u16, 0)),
+        slot_inner,
+    );
+    draw_scrollbar(frame, slot_inner, total, offset, viewport);
+    let x = slot_inner.x + (ccol as u16).min(slot_inner.width.saturating_sub(1));
+    let vis_row = crow.checked_sub(offset).unwrap_or(usize::MAX);
+    if vis_row < slot_inner.height as usize {
+        frame.set_cursor_position(ratatui::layout::Position {
+            x,
+            y: slot_inner.y + vis_row as u16,
+        });
+    }
 }
 
 #[cfg(test)]

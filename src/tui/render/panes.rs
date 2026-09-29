@@ -695,6 +695,23 @@ pub(super) fn section_box_loading(
     section_box_impl(title, focused, first, true, suffix, None)
 }
 
+/// The note editor's docked slot: an empty-title section box whose title break
+/// carries the `✎` edit mark in accent — `╭─ ✎ ───╮`, the contract's multi-line
+/// input slot. The chrome dash carries the border token, never the mark color.
+pub(super) fn edit_slot_block() -> Block<'static> {
+    section_box_impl(
+        "",
+        true,
+        false,
+        false,
+        vec![
+            Span::styled("─ ", Style::default().fg(theme::line_strong_color())),
+            Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
+        ],
+        None,
+    )
+}
+
 fn section_box_impl(
     title: &str,
     focused: bool,

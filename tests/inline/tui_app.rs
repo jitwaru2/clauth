@@ -15776,3 +15776,229 @@ fn a_failed_day_list_save_keeps_memory_on_the_disk_value_and_names_the_error() {
         "preferred days update failed\nfailed to write config.toml"
     );
 }
+
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+fn notes_app(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    App::new(AppConfig {
+        state: AppState::default(),
+        profiles,
+    })
+}
+
+/// `n` on the usage tab opens the account's note editor; an empty roster keeps
+/// the empty state's `n to create one` promise; every other tab keeps the
+/// global new-account flow.
+#[test]
+fn n_on_usage_opens_the_note_editor() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // With an account, n opens the note editor for the selected account.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(
+        app.note_editor.is_some(),
+        "usage tab: n opens the note editor"
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().profile.as_str(), "alice");
+    assert!(app.config_draft.is_none(), "new-account never started");
+
+    // An empty roster keeps the empty state's `n to create one` promise.
+    let mut app = notes_app(vec![]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none(), "no account, no editor");
+    assert!(
+        app.config_draft.is_some(),
+        "the empty state keeps n = new account"
+    );
+
+    // Every other tab keeps the global new-account flow.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Overview;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none());
+    assert!(app.config_draft.is_some());
+}
+
+/// ⏎ saves the draft into the profile dir and toasts; esc discards the draft.
+#[test]
+fn enter_saves_the_note_and_esc_discards_it() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_some(), "editor open");
+    for ch in "hello".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    for ch in "world".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let name = crate::profile::ProfileName::from("alice");
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "the draft landed on disk verbatim"
+    );
+    assert_eq!(app.note_text.as_deref(), Some("hello\nworld"));
+    assert!(app.note_editor.is_none(), "a save closes the editor");
+    assert_eq!(app.toasts[0].body, "note saved");
+
+    // Reopen: seeded from the saved text.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().buf.text(), "hello\nworld");
+
+    // esc discards: the typed extra stays out of the stored note.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.note_editor.is_none());
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "esc never wrote"
+    );
+}
+
+/// ⌃j splits the draft, backspace at a line start joins it, ⌃w deletes the
+/// previous word.
+#[test]
+fn the_note_editor_keymap_edits_the_draft() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    let press = |app: &mut App, code| {
+        super::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    for ch in "foo bar baz".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar ", "⌃w removes the last word");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar \n", "⌃j splits at the caret");
+    for ch in "ab".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(draft(&app), "foo bar ", "backspace joins at a line start");
+}
+
+/// A save for an account the roster dropped fails and keeps the editor open —
+/// the draft is the only copy.
+#[test]
+fn a_failed_save_keeps_the_editor_open() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    for ch in "boo".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.note_editor.is_some(),
+        "the draft survives a failed save"
+    );
+    assert!(
+        app.toasts[0].body.starts_with("couldn't save the note"),
+        "the failure names itself, got {:?}",
+        app.toasts[0].body
+    );
+}
+
+fn draft(app: &App) -> String {
+    app.note_editor.as_ref().unwrap().buf.text()
+}
+
+/// ↓ on the usage tab re-reads the note: the `notes:` row must never show the
+/// previous account's note under the newly selected header.
+#[test]
+fn stepping_the_cursor_reloads_the_note() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let alice = mini_profile("alice", None);
+    let bob = mini_profile("bob", None);
+    crate::profile::save_profile(&alice).unwrap();
+    crate::profile::save_profile(&bob).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into(), "bob".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let alice_name = crate::profile::ProfileName::from("alice");
+    let bob_name = crate::profile::ProfileName::from("bob");
+    crate::profile_notes::save_note(&alice_name, "A note").unwrap();
+    crate::profile_notes::save_note(&bob_name, "B note").unwrap();
+
+    let mut app = notes_app(vec![alice, bob]);
+    app.tab = Tab::Usage;
+    assert_eq!(app.note_text.as_deref(), Some("A note"));
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        app.note_text.as_deref(),
+        Some("B note"),
+        "a cursor step re-reads the note for the new selection"
+    );
+}

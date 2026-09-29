@@ -636,7 +636,10 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
 /// `every_sub_focus_tab_documents_esc_in_help`.
-fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+fn tab_specific_rows(
+    tab: Tab,
+    has_accounts: bool,
+) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
     match tab {
         Tab::Overview => vec![(
             "accounts",
@@ -646,11 +649,23 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("shift \u{2191} \u{2193}", "reorder account up / down"),
             ][..],
         )],
-        Tab::Usage => vec![(
+        // `n` is the note editor only while an account exists to hold one; on
+        // an empty roster the global `n new account` row must survive the
+        // shadow filter below, matching the empty state's `n to create one`.
+        Tab::Usage if has_accounts => vec![(
             "usage",
             &[
                 ("\u{2191} \u{2193}", "pick account to inspect"),
                 ("r", "refresh account"),
+                ("n", "edit the account's note"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ][..],
+        )],
+        Tab::Usage => vec![(
+            "usage",
+            &[
+                ("\u{2191} \u{2193}", "pick account to inspect"),
                 ("e", "toggle estimates"),
                 ("p", "toggle pace marker"),
             ][..],
@@ -753,7 +768,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = "KEYS";
 
-    let tab_specific = tab_specific_rows(app.tab);
+    let tab_specific = tab_specific_rows(app.tab, app.profile_count() > 0);
 
     let nav: &[(&str, &str)] = &[(
         "\u{2190} \u{2192} \u{00b7} tab",

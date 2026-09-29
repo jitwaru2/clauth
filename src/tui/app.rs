@@ -170,6 +170,215 @@ impl InputState {
     }
 }
 
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+/// The note editor's multi-line draft. The stored text is `lines` joined by
+/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
+/// at render (a wide char takes two cells).
+#[derive(Debug, Clone)]
+pub(crate) struct NoteBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+impl NoteBuffer {
+    pub(crate) fn new(text: &str) -> Self {
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(str::to_string).collect()
+        };
+        let row = lines.len() - 1;
+        let col = lines[row].chars().count();
+        Self { lines, row, col }
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(crate) fn line(&self, index: usize) -> &str {
+        &self.lines[index]
+    }
+
+    /// Caret row and DISPLAY column (wide chars count two cells), for the
+    /// native cursor position.
+    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
+        (self.row, display_col(&self.lines[self.row], self.col))
+    }
+
+    fn line_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    fn clamp_col(&mut self) {
+        self.col = self.col.min(self.line_len());
+    }
+
+    fn cursor_byte(&self) -> usize {
+        let line = &self.lines[self.row];
+        line.char_indices()
+            .nth(self.col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
+    }
+
+    pub(crate) fn insert_char(&mut self, ch: char) {
+        let at = self.cursor_byte();
+        self.lines[self.row].insert(at, ch);
+        self.col += 1;
+    }
+
+    pub(crate) fn insert_newline(&mut self) {
+        let at = self.cursor_byte();
+        let rest = self.lines[self.row].split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.col > 0 {
+            let prev = self.lines[self.row]
+                .char_indices()
+                .nth(self.col - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let at = self.cursor_byte();
+            self.lines[self.row].replace_range(prev..at, "");
+            self.col -= 1;
+        } else if self.row > 0 {
+            let line = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.line_len();
+            self.lines[self.row].push_str(&line);
+        }
+    }
+
+    pub(crate) fn delete(&mut self) {
+        if self.col < self.line_len() {
+            let at = self.cursor_byte();
+            let line = &self.lines[self.row];
+            let next = line[at..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| at + i)
+                .unwrap_or(line.len());
+            self.lines[self.row].replace_range(at..next, "");
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+        }
+    }
+
+    pub(crate) fn left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.line_len();
+        }
+    }
+
+    pub(crate) fn right(&mut self) {
+        if self.col < self.line_len() {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    pub(crate) fn up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.col = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.col = self.line_len();
+    }
+
+    /// Delete the word (run of non-spaces, plus any preceding spaces) left of
+    /// the caret within the line; at a line start, joins the line up.
+    pub(crate) fn delete_word(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let mut start = self.col;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
+        let at = self.cursor_byte();
+        self.lines[self.row].replace_range(from_byte..at, "");
+        self.col = start;
+    }
+}
+
+/// Display width of the first `cols` chars of a line: wide (CJK/fullwidth/
+/// emoji-range) chars take two cells, everything else one. The usage pane's
+/// rows are ASCII-bound; the editor's caret is what must land right on the
+/// lines that are not.
+fn display_col(line: &str, cols: usize) -> usize {
+    line.chars().take(cols).map(char_display_width).sum()
+}
+
+fn char_display_width(c: char) -> usize {
+    let u = c as u32;
+    if matches!(u,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD,
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The usage tab's note editor state. The account is captured at open, so a
+/// config reload mid-edit can never retarget the draft.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteEditor {
+    pub(crate) profile: crate::profile::ProfileName,
+    pub(crate) buf: NoteBuffer,
+}
+
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
@@ -2031,6 +2240,12 @@ pub(crate) struct App {
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<InputState>,
+    /// The selected account's note (the usage tab's `notes:` row). Loaded on
+    /// cursor moves, tab switches with a clamped cursor, and saves — never per
+    /// frame.
+    pub(crate) note_text: Option<String>,
+    /// The open note editor, while `n` has one open on the usage tab.
+    pub(crate) note_editor: Option<NoteEditor>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -2488,6 +2703,10 @@ impl App {
                 .map(|p| p.name.to_string())
                 .collect::<Vec<_>>(),
         );
+        let initial_note = config
+            .profiles
+            .first()
+            .and_then(|p| crate::profile_notes::load_note(&p.name));
 
         let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -2533,6 +2752,8 @@ impl App {
             refresh_interval_draft: None,
             context_nudge_draft: None,
             weekly_threshold_draft: None,
+            note_text: initial_note,
+            note_editor: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -3336,6 +3557,16 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
+        // Every reload path lands here (a roster change can move or remove the
+        // selected account), so the note tracks the selection for free.
+        self.reload_selected_note();
+    }
+
+    /// Re-read the selected account's note from disk.
+    pub(crate) fn reload_selected_note(&mut self) {
+        self.note_text = self
+            .profile_name_at(self.profile_cursor)
+            .and_then(|name| crate::profile_notes::load_note(&name));
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
@@ -3428,6 +3659,9 @@ pub(crate) enum KeyOwner {
     WeeklyThreshold,
     /// The Services tab's herdr tag-refresh field.
     HerdrTag,
+    /// The usage tab's note editor (the `n`-opened draft on the selected
+    /// account).
+    NoteEditor,
 }
 
 impl KeyOwner {
@@ -3470,6 +3704,7 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
         Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
         Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
         Tab::Services if app.services.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Usage if app.note_editor.is_some() => Some(KeyOwner::NoteEditor),
         Tab::Overview
         | Tab::Usage
         | Tab::Tokens
@@ -3504,6 +3739,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             KeyOwner::ContextNudge => handle_context_nudge_edit_key(app, key),
             KeyOwner::WeeklyThreshold => handle_weekly_threshold_edit_key(app, key),
             KeyOwner::HerdrTag => handle_herdr_tag_edit_key(app, key),
+            KeyOwner::NoteEditor => handle_note_editor_key(app, key),
         }
         return;
     }
@@ -3604,7 +3840,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('n') => {
             app.disarm_quit();
-            start_new_account(app);
+            // The usage tab claims `n` for the account's note editor (footer +
+            // help modal advertise it there); the empty roster keeps the empty
+            // state's `n to create one` promise. Everywhere else: new account.
+            if app.tab == Tab::Usage && app.profile_count() > 0 {
+                open_note_editor(app);
+            } else {
+                start_new_account(app);
+            }
             return;
         }
         // Esc backs out of sub-focus; no-op at the top level.
@@ -3845,6 +4088,9 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
         return;
     }
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
+    // The note belongs to the selection: the row must never show the previous
+    // account's note under the newly selected header.
+    app.reload_selected_note();
 }
 
 /// True, with a toast saying so, while the Overview's `Codex` filter hides the
@@ -3881,6 +4127,98 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') => toggle_show_estimates(app),
         KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
+    }
+}
+
+/// Open the note editor on the selected account, seeded from disk.
+fn open_note_editor(app: &mut App) {
+    let Some(name) = app.profile_name_at(app.profile_cursor) else {
+        return;
+    };
+    let text = crate::profile_notes::load_note(&name).unwrap_or_default();
+    app.note_editor = Some(NoteEditor {
+        profile: name,
+        buf: NoteBuffer::new(&text),
+    });
+}
+
+/// `⏎` in the note editor: persist the draft (an empty draft clears the note).
+/// A failed save keeps the editor open — the draft is the only copy.
+fn commit_note(app: &mut App) {
+    let Some(editor) = app.note_editor.take() else {
+        return;
+    };
+    let text = editor.buf.text();
+    match crate::profile_notes::save_note(&editor.profile, &text) {
+        Ok(()) => {
+            app.note_text = crate::profile_notes::load_note(&editor.profile);
+            app.toast(ToastKind::Success, "note saved");
+        }
+        Err(e) => {
+            app.note_editor = Some(editor);
+            app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+        }
+    }
+}
+
+/// The note editor's keymap: text edits, ⌃j newline, ⏎ save, esc cancel. Every
+/// printable is data (a note may contain `q`, `?`, `x`), so the owner claims
+/// all keys bar ctrl+c.
+fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
+    enum NoteKey {
+        Commit,
+        Cancel,
+        Char(char),
+        Newline,
+        Word,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+    }
+    let action = match key.code {
+        KeyCode::Enter => NoteKey::Commit,
+        KeyCode::Esc => NoteKey::Cancel,
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Newline,
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Word,
+        KeyCode::Char(ch) => NoteKey::Char(ch),
+        KeyCode::Backspace => NoteKey::Backspace,
+        KeyCode::Delete => NoteKey::Delete,
+        KeyCode::Left => NoteKey::Left,
+        KeyCode::Right => NoteKey::Right,
+        KeyCode::Up => NoteKey::Up,
+        KeyCode::Down => NoteKey::Down,
+        KeyCode::Home => NoteKey::Home,
+        KeyCode::End => NoteKey::End,
+        _ => return,
+    };
+    match action {
+        NoteKey::Commit => commit_note(app),
+        NoteKey::Cancel => app.note_editor = None,
+        _ => {
+            let Some(editor) = app.note_editor.as_mut() else {
+                return;
+            };
+            let buf = &mut editor.buf;
+            match action {
+                NoteKey::Char(ch) => buf.insert_char(ch),
+                NoteKey::Newline => buf.insert_newline(),
+                NoteKey::Word => buf.delete_word(),
+                NoteKey::Backspace => buf.backspace(),
+                NoteKey::Delete => buf.delete(),
+                NoteKey::Left => buf.left(),
+                NoteKey::Right => buf.right(),
+                NoteKey::Up => buf.up(),
+                NoteKey::Down => buf.down(),
+                NoteKey::Home => buf.home(),
+                NoteKey::End => buf.end(),
+                _ => {}
+            }
+        }
     }
 }
 

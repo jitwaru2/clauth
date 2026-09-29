@@ -39,7 +39,7 @@ fn every_sub_focus_tab_documents_esc_in_help() {
             continue;
         }
 
-        let rows = tab_specific_rows(tab);
+        let rows = tab_specific_rows(tab, true);
         let has_esc_row = rows
             .iter()
             .flat_map(|(_, entries)| entries.iter())
@@ -57,7 +57,7 @@ fn every_sub_focus_tab_documents_esc_in_help() {
 /// drops section titles: every current tab documents exactly one, so nothing
 /// is lost. Add another tab's row list to this loop by extending the call.
 fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
-    let rows: Vec<(&str, &str)> = tab_specific_rows(tab)
+    let rows: Vec<(&str, &str)> = tab_specific_rows(tab, true)
         .iter()
         .flat_map(|(_, entries)| entries.iter().copied())
         .collect();
@@ -635,5 +635,36 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
     assert!(
         !screen.contains(" confirm "),
         "the generic `confirm` label must not appear for AddChainCandidate:\n{screen}"
+    );
+}
+
+/// The Usage help section documents the note key while an account exists; on
+/// an empty roster the row is gone, so the shadow filter leaves the global
+/// `n new account` row standing, matching the empty state's promise.
+#[test]
+fn the_usage_help_section_documents_the_note_key() {
+    let rows = tab_specific_rows(Tab::Usage, true);
+    let usage: Vec<&(&str, &str)> = rows
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .collect();
+    assert!(
+        usage.iter().any(|(k, _)| *k == "n"),
+        "usage section must document the n key, got {usage:?}"
+    );
+    assert!(
+        usage
+            .iter()
+            .any(|(k, d)| *k == "n" && *d == "edit the account's note"),
+        "n's usage copy is pinned, got {usage:?}"
+    );
+
+    let empty: Vec<(&str, &str)> = tab_specific_rows(Tab::Usage, false)
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().copied())
+        .collect();
+    assert!(
+        empty.iter().all(|(k, _)| *k != "n"),
+        "an empty roster keeps n = new account, got {empty:?}"
     );
 }

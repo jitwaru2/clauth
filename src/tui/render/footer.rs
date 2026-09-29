@@ -27,6 +27,15 @@ const TYPED_FIELD: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("e
 /// typed value; nothing saves until the form's own `create account` row.
 const NEW_ACCOUNT_FIELD: &[(&str, &str)] = &[("↵", "done"), ("←→", "caret"), ("esc", "done")];
 
+/// The note editor's grammar: ⏎ saves the draft, ⌃j inserts a newline, esc
+/// cancels. ←→ move the caret inside the draft (never switch tabs).
+const NOTE_EDITOR_FIELD: &[(&str, &str)] = &[
+    ("↵", "save"),
+    ("⌃j", "newline"),
+    ("←→", "caret"),
+    ("esc", "cancel"),
+];
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // 1-col breathing room on each side; the alert row (which replaces this in
     // place) shares the same inset so the left margin never jumps.
@@ -126,6 +135,7 @@ fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)
         | KeyOwner::WeeklyThreshold
         | KeyOwner::HerdrTag => Some(TYPED_FIELD),
         KeyOwner::NewAccountField => Some(NEW_ACCOUNT_FIELD),
+        KeyOwner::NoteEditor => Some(NOTE_EDITOR_FIELD),
         // `←→` walk the chips and each space saves, so nothing reads as a
         // commit; `q` leaves the picker. ⏎ leaves it too, so it takes no group
         // of its own beside `q back`: three screen-specific groups at most.
@@ -160,12 +170,17 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("c", "harness"),
             ("?", "help"),
         ],
-        Tab::Usage => &[
+        // The hint derives from the key's behavior on this frame: with no
+        // accounts, `n` still starts a new account (the empty state's promise)
+        // and the note editor does not exist yet.
+        Tab::Usage if app.profile_count() > 0 => &[
             ("↑↓", "account"),
             ("r", "refresh account"),
+            ("n", "note"),
             ("a", "actions"),
             ("?", "help"),
         ],
+        Tab::Usage => &[("↑↓", "account"), ("a", "actions"), ("?", "help")],
         Tab::Tokens => match app.token_view {
             TokenView::Dashboard => &[
                 ("↵", "models"),
@@ -564,3 +579,7 @@ fn draw_login(
         area,
     );
 }
+
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_footer.rs"]
+mod tests;
