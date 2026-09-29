@@ -12341,6 +12341,277 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
     );
 }
 
+/// Drain the herdr probe worker's result the way the tick does, waiting up to
+/// 10 s for it to land.
+fn await_herdr_probe(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.herdr_probing {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the herdr probe did not land within 10 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_herdr_probe(app);
+    }
+}
+
+/// Entering the Services tab with an installed herdr shows its row with no
+/// key: the tab entry starts the probe (the real `herdr::probe`, over a stub
+/// herdr pinned through `HERDR_BIN_PATH`) and the drain adopts it.
+#[cfg(unix)]
+#[test]
+fn entering_the_services_tab_shows_the_herdr_row_with_no_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = crate::testutil::stateful_heal_shim(home.home());
+    let listing = crate::herdr::plugin_list_json(crate::herdr::GITHUB);
+    let _env = crate::testutil::heal_env(&home, &shim, &listing, &listing, "", &[]);
+
+    let mut app = bare_app();
+    app.services.herdr_prober = Some(crate::herdr::probe);
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.herdr_probing,
+        "entering the tab starts the probe, no `r`"
+    );
+    await_herdr_probe(&mut app);
+
+    let herdr = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "herdr")
+        .unwrap_or_else(|| {
+            panic!(
+                "the herdr row shows once its probe lands, got {:?}",
+                app.services
+                    .checks
+                    .iter()
+                    .map(|c| c.label)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        herdr
+            .detail
+            .iter()
+            .any(|l| l == "plugin: installed (github)"),
+        "the row reads the stub's listing: {:?}",
+        herdr.detail
+    );
+}
+
+/// Released by `a_slow_herdr_probe_leaves_the_first_paint_unblocked` once its
+/// first paint is done; the gated prober waits on it (10 s at most).
+static HERDR_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// How many times `gated_herdr_probe` started: the one-probe-at-a-time guard's
+/// witness.
+static GATED_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn gated_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    GATED_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (lock, cvar) = &HERDR_GATE;
+    let open = lock.lock().expect("gate lock");
+    let _open = cvar
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .expect("gate wait");
+    Some(crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    })
+}
+
+/// A probe that hangs never holds the first paint: entering the tab and
+/// drawing a frame return while the probe is still held, with no herdr row
+/// yet, and the row appears once the probe lands. While it is held, neither a
+/// refresh tick's recompute nor `r` starts a second one.
+#[test]
+fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_prober = Some(gated_herdr_probe);
+
+    let started = std::time::Instant::now();
+    super::switch_tab(&mut app, super::Tab::Services);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("first paint");
+    let elapsed = started.elapsed();
+    super::drain_herdr_probe(&mut app);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the tab entry and first paint waited on the held probe: {elapsed:?}"
+    );
+    assert!(
+        app.services.herdr_probing,
+        "the probe is still held after the first paint"
+    );
+    assert!(
+        !app.services.checks.iter().any(|c| c.label == "herdr"),
+        "no herdr row before the probe lands"
+    );
+
+    super::recompute_services_checks(&mut app, false);
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
+    );
+    assert!(app.services.herdr_probing, "still the one held probe");
+
+    {
+        let (lock, cvar) = &HERDR_GATE;
+        *lock.lock().expect("gate lock") = true;
+        cvar.notify_all();
+    }
+    await_herdr_probe(&mut app);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "herdr"),
+        "the row appears once the probe lands"
+    );
+    super::join_test_workers();
+    assert_eq!(
+        GATED_PROBES.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the tick recompute and `r` started no second probe beside the held one"
+    );
+}
+
+/// How many times `counting_herdr_probe` ran.
+static COUNTED_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    COUNTED_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    })
+}
+
+/// With a probe cached, a plain recompute starts none; `r` on the Services tab
+/// probes herdr again.
+#[test]
+fn r_re_probes_herdr_on_the_services_tab() {
+    use std::sync::atomic::Ordering;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_prober = Some(counting_herdr_probe);
+    let before = COUNTED_PROBES.load(Ordering::SeqCst);
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    await_herdr_probe(&mut app);
+    assert_eq!(
+        COUNTED_PROBES.load(Ordering::SeqCst),
+        before + 1,
+        "tab entry probed once"
+    );
+
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.herdr_probing,
+        "a recompute with a probe cached starts none"
+    );
+
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
+    );
+    assert!(app.services.herdr_probing, "`r` starts a re-probe");
+    await_herdr_probe(&mut app);
+    assert_eq!(
+        COUNTED_PROBES.load(Ordering::SeqCst),
+        before + 2,
+        "`r` probed again"
+    );
+}
+
+fn panicking_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    panic!("the herdr probe blew up")
+}
+
+/// A probe that panics lands as "herdr does not resolve", so `herdr_probing`
+/// never sticks and `r` stays live.
+#[test]
+fn a_panicking_herdr_probe_lands_as_no_herdr() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_prober = Some(panicking_herdr_probe);
+    super::switch_tab(&mut app, super::Tab::Services);
+    await_herdr_probe(&mut app);
+    assert!(
+        matches!(app.services.herdr, Some(None)),
+        "a panicking probe reads as no herdr"
+    );
+    assert!(!app.services.herdr_probing, "the in-flight flag cleared");
+}
+
+/// The first herdr landing never moves the view behind an open modal: a probe
+/// landing under the help modal leaves the cursor where it was and the intent
+/// pending; the first modal-free recompute lands it. `f` on the list, like
+/// ↑↓/↵, is the user acting, so it drops the intent.
+#[test]
+fn a_herdr_landing_waits_for_an_open_modal_and_f_drops_it() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let probe = || crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    };
+
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    let parked = app.services.cursor;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('?')));
+    assert!(
+        !app.modals.is_empty(),
+        "fixture control: the help modal is open"
+    );
+    app.services.herdr_probing = true;
+    app.services
+        .herdr_probe_tx
+        .send(Some(probe()))
+        .expect("send");
+    super::drain_herdr_probe(&mut app);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "herdr"),
+        "the probe landed"
+    );
+    assert_eq!(
+        app.services.cursor, parked,
+        "the cursor stays under the modal"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
+    assert!(app.services.land_on_herdr, "the intent is still pending");
+
+    app.modals.clear();
+    super::recompute_services_checks(&mut app, false);
+    let herdr = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "herdr")
+        .expect("herdr row");
+    assert_eq!(app.services.cursor, herdr, "the modal-free recompute lands");
+    assert_eq!(app.services.focus, super::ServicesFocus::Detail);
+    assert!(!app.services.land_on_herdr);
+
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        !app.services.land_on_herdr,
+        "`f` on the list is the user acting: the intent drops"
+    );
+}
+
 /// The row reads `source_kind` to decide whether a plugin is a local link, and herdr's own output is the only authority on that spelling. Driving the real captured bytes through the parse and into the check is what stops the row drifting onto a spelling herdr never emits: a hand-built fixture agrees with whatever the reader guessed.
 #[test]
 fn a_real_linked_payload_reads_as_a_local_link() {
@@ -12993,10 +13264,9 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
 /// with the herdr selector row under the cursor and its detail pane descended
 /// (the `↵` shape), checks already recomputed so the first paint is not empty,
 /// and marks the landing done in `[herdr] first_landing_done` — once, forever.
-/// Construction probes herdr right away — `HERDR_ENV=1` proves herdr is
-/// present — so on a real run the row is there at first paint; the probe is
-/// skipped under test (it would read the real registry), which stands in for a
-/// probe that does not resolve: the landing stays PENDING (parked on the last
+/// Construction's recompute starts the herdr probe on its worker; under test no
+/// prober is set (it would read the real registry), which stands in for a
+/// probe that has not landed: the landing stays PENDING (parked on the last
 /// row, list focus) and re-lands on the herdr row by label the moment a later
 /// recompute resolves it. The `claude --version` probe stays `r`-gated:
 /// construction must not block the first paint on a spawn.
@@ -13025,8 +13295,9 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         "the landed options cursor starts on the first row"
     );
     assert!(
-        matches!(app.services.herdr, Some(None)),
-        "construction ran the probe (skipped under test, standing in as no herdr)"
+        app.services.herdr.is_none() && !app.services.herdr_probing,
+        "no prober under test: herdr stays unprobed, standing in for a probe \
+         that has not landed"
     );
     assert!(
         app.services.cc_version.is_none(),

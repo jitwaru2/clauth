@@ -1461,9 +1461,9 @@ pub(crate) fn fix_line(fix: &ServiceFix) -> String {
 }
 
 /// UI-thread-only state for the Services tab. Recomputed synchronously on tab
-/// focus and on `r`; there is no background thread (all reads are local
-/// FS/`PATH`; `claude --version` is one cached subprocess gated by
-/// [`ServicesState::cc_version`]).
+/// focus and on `r` (the reads are local FS/`PATH`; `claude --version` is one
+/// cached subprocess gated by [`ServicesState::cc_version`]); the herdr probe
+/// alone runs on a worker ([`ServicesState::herdr`]).
 #[derive(Debug)]
 pub(crate) struct ServicesState {
     pub(crate) focus: ServicesFocus,
@@ -1488,11 +1488,20 @@ pub(crate) struct ServicesState {
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
-    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction on
-    /// the first herdr landing only (`HERDR_ENV=1` proves herdr is present), else
-    /// only on `r`; it spawns three subprocesses, so a tab switch and the
-    /// per-tick refresh reuse the cached value.
+    /// resolve (no row), `Some(Some(p))` = the probe. The first recompute
+    /// (entering the tab, or construction on the first herdr landing) and
+    /// every `r` start it on a worker, since it spawns three subprocesses;
+    /// the result lands through `drain_herdr_probe`, and until then the cached
+    /// value renders. A tab switch and the per-tick refresh reuse it.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
+    /// A herdr probe is running on its worker; a second never starts beside it.
+    pub(crate) herdr_probing: bool,
+    /// What the probe worker runs: [`crate::herdr::probe`], or `None` under
+    /// test, so no test spawns the real herdr unless it opts in with a stub
+    /// (the `App::clipboard` seam's shape).
+    pub(crate) herdr_prober: Option<fn() -> Option<crate::herdr::HerdrProbe>>,
+    pub(crate) herdr_probe_tx: std::sync::mpsc::Sender<Option<crate::herdr::HerdrProbe>>,
+    pub(crate) herdr_probe_rx: std::sync::mpsc::Receiver<Option<crate::herdr::HerdrProbe>>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
@@ -1530,14 +1539,15 @@ pub(crate) struct ServicesState {
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
-    /// A pending first-herdr-launch landing: the cursor must land on the `herdr`
-    /// row the moment its probe resolves, even when the construction probe did
-    /// not. Cleared on landing, or when the user moves the cursor first.
+    /// A pending first-herdr-launch landing: the cursor lands on the `herdr` row
+    /// in the first modal-free recompute after its probe resolves. Cleared on
+    /// landing, or when the user moves the cursor, descends or fixes first.
     pub(crate) land_on_herdr: bool,
 }
 
 impl Default for ServicesState {
     fn default() -> Self {
+        let (herdr_probe_tx, herdr_probe_rx) = std::sync::mpsc::channel();
         Self {
             focus: ServicesFocus::List,
             cursor: 0,
@@ -1549,6 +1559,14 @@ impl Default for ServicesState {
             cc_version: None,
             mcp_boot: None,
             herdr: None,
+            herdr_probing: false,
+            herdr_prober: if cfg!(test) {
+                None
+            } else {
+                Some(crate::herdr::probe)
+            },
+            herdr_probe_tx,
+            herdr_probe_rx,
             delegates: Vec::new(),
             problem_cursor: 0,
             herdr_options_cursor: 0,
@@ -2578,40 +2596,27 @@ impl App {
             .collect()
     }
 
-    /// Landing, applied at construction (before the first paint). The FIRST
-    /// herdr launch opens the Services tab with the herdr selector row under the
-    /// cursor and its detail pane descended, then marks the landing done in
-    /// `[herdr] first_landing_done` — once, forever. Every other launch — a
-    /// plain TUI, and herdr after the first — opens the top-level `home_tab`
-    /// (default overview); the herdr header tag is unaffected. The first
-    /// landing's probe runs here — `HERDR_ENV=1` proves herdr is present, and
-    /// each of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT`
-    /// (2 s, worst case 6 s total) — so the landing row is real at first paint
-    /// instead of waiting for `r`; later launches skip it like plain ones (the
-    /// probe stays `r`-gated), and a pending landing intent inside the
-    /// recompute re-lands on the herdr row by label when the construction
-    /// probe did not resolve it. The `claude --version` probe stays `r`-gated:
-    /// construction must not block the first paint on a spawn. The pending
-    /// intent can still move the cursor only on the recomputes before it lands;
-    /// an ↑↓ cursor move, ↵, or a tab switch clears it, so focus is never
-    /// stolen once the user has acted.
+    /// Landing, armed at construction. The FIRST herdr launch opens the
+    /// Services tab and, once the herdr probe lands, puts the herdr selector row
+    /// under the cursor with its detail pane descended; construction marks the
+    /// landing done in `[herdr] first_landing_done` — once, forever. Every other
+    /// launch — a plain TUI, and herdr after the first — opens the top-level
+    /// `home_tab` (default overview); the herdr header tag is unaffected. The
+    /// first landing's recompute starts the herdr probe on its worker, so the
+    /// first paint never waits on its three subprocesses; the pending intent
+    /// lands on the herdr row by label in the first recompute with no modal
+    /// open after the probe lands. The `claude --version` probe stays
+    /// `r`-gated: construction must not block the first paint on a spawn. An
+    /// ↑↓ cursor move, ↵, `f` on the list, or a tab switch clears the pending
+    /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
         let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
         if first_landing {
             self.tab = Tab::Services;
-            // Land on the herdr row by label once its probe resolves. The
-            // recompute below selects it when the construction probe already
-            // did; when it did not (or the probe is skipped under test), the
-            // intent stays pending until a later `r` resolves herdr.
+            // Land on the herdr row by label once its probe resolves: the
+            // intent stays pending until a modal-free recompute after that.
             self.services.land_on_herdr = true;
-            // Skipped under test (a spawned probe would read the real
-            // registry); the landing test injects the probe instead.
-            self.services.herdr = Some(if cfg!(test) {
-                None
-            } else {
-                crate::herdr::probe()
-            });
             recompute_services_checks(&mut self, false);
             {
                 let mut cfg = self.config();
@@ -3920,7 +3925,10 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         app.services.detail_scroll = 0;
                     }
                 }
-                KeyCode::Char('f') => apply_service_fix(app),
+                KeyCode::Char('f') => {
+                    app.services.land_on_herdr = false;
+                    apply_service_fix(app);
+                }
                 _ => {}
             }
         }
@@ -4425,8 +4433,9 @@ pub(crate) fn herdr_check(
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
 /// `delegates` (its detail is the job list), `plugin` (the four integration
 /// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
-/// `claude --version` runs only when `refresh_version` is set or the cached
-/// result is absent. Synchronous — no background thread.
+/// `claude --version` and the `clauth mcp` boot probe run only when
+/// `refresh_version` is set. Synchronous, except the herdr probe, which it
+/// starts on a worker when none is cached or on `r`.
 fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     use crate::plugin_probe as probe;
 
@@ -4464,11 +4473,11 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
         app.services.fetching = false;
     }
 
-    // herdr probe — three subprocesses, so it is `r`-gated like `mcp_boot`.
-    // Skipped under test rather than set to a fixed value, so a test that
-    // injected a probe keeps it.
-    if refresh_version && !cfg!(test) {
-        app.services.herdr = Some(crate::herdr::probe());
+    // herdr probe — three subprocesses, so it runs on a worker: the first
+    // recompute with nothing cached starts it (the row appears with no key),
+    // `r` re-probes.
+    if refresh_version || app.services.herdr.is_none() {
+        start_herdr_probe(app);
     }
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
@@ -4516,9 +4525,10 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     ));
 
     // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
-    // The probe is cached (`r`-gated, three subprocesses); the config read is a
+    // The probe is cached (its worker lands it, above); the config read is a
     // cheap `fs::read_to_string` that rides the tick, using the path the probe
-    // already resolved. No row when herdr does not resolve or was never probed.
+    // already resolved. No row when herdr does not resolve or its probe has not
+    // landed yet.
     if let Some(Some(probe)) = &app.services.herdr {
         let config = probe
             .config_path
@@ -4555,12 +4565,13 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
         app.services.problem_cursor = problems;
     }
 
-    // A pending herdr landing (first herdr launch whose construction probe did
-    // not resolve) selects the herdr row the moment it appears — by label, not
-    // by a stale index — and descends into its detail. The intent clears on
+    // A pending herdr landing (the first herdr launch; its probe lands on a
+    // worker) selects the herdr row the moment it appears — by label, not by a
+    // stale index — and descends into its detail. The intent clears on
     // landing; when herdr still does not resolve, the cursor parks on the last
-    // row and the intent survives for the next recompute.
-    if app.services.land_on_herdr {
+    // row and the intent survives for the next recompute. An open modal holds
+    // it: the probe can land under one, and the view must not move behind it.
+    if app.services.land_on_herdr && app.modals.is_empty() {
         if let Some(idx) = app.services.checks.iter().position(|c| c.label == "herdr") {
             app.services.cursor = idx;
             app.services.focus = ServicesFocus::Detail;
@@ -4568,6 +4579,38 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
         } else {
             app.services.cursor = app.services.row_count().saturating_sub(1);
         }
+    }
+}
+
+/// Start the herdr probe on a worker unless one already runs. Its three
+/// subprocesses (each bounded by `herdr::PROBE_TIMEOUT`) never hold a frame;
+/// `drain_herdr_probe` adopts the result. A probe that panics lands as "herdr
+/// does not resolve", so `herdr_probing` never sticks.
+fn start_herdr_probe(app: &mut App) {
+    let Some(prober) = app.services.herdr_prober else {
+        return;
+    };
+    if app.services.herdr_probing {
+        return;
+    }
+    app.services.herdr_probing = true;
+    let tx = app.services.herdr_probe_tx.clone();
+    spawn_worker(move || {
+        let _ = tx.send(catch_unwind(prober).unwrap_or(None));
+    });
+}
+
+/// Adopt a finished herdr probe and recompute, so the row appears (or goes)
+/// with no key, and a pending first-herdr landing lands.
+fn drain_herdr_probe(app: &mut App) {
+    let mut landed = false;
+    while let Ok(probe) = app.services.herdr_probe_rx.try_recv() {
+        app.services.herdr = Some(probe);
+        app.services.herdr_probing = false;
+        landed = true;
+    }
+    if landed {
+        recompute_services_checks(app, false);
     }
 }
 
@@ -10983,6 +11026,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_live_sessions(app);
     sync_broken_verdicts(app);
     poll_codex_rows(app);
+    drain_herdr_probe(app);
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);

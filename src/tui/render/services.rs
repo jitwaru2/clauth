@@ -7,8 +7,8 @@
 //! is a status dot + label, the verdict in the detail pane. Enter descends into
 //! the detail pane; `f` applies the focused row's (or, on the plugin detail,
 //! focused problem's) fix. All data is recomputed synchronously on tab focus
-//! and `r` — there is no background thread, so the title spinner only flickers
-//! while the cached `claude --version` is probed.
+//! and `r`, the herdr probe excepted: it runs on a worker, its row appears when
+//! it lands, and the title spinner shows while it runs.
 //!
 //! The delegates detail is read-only and takes no keys at all: stopping a
 //! delegate is `monitor({job_ids, cancel: true})`'s job, and a second stop path
@@ -167,7 +167,7 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         Span::styled("─", Style::default().fg(border_color)),
         Span::styled(" SERVICES ", title_style),
     ];
-    if app.services.fetching {
+    if app.services.fetching || app.services.herdr_probing {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
             theme::accent(),

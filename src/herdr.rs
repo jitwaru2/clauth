@@ -428,8 +428,8 @@ pub(crate) fn resolved_bin() -> Option<PathBuf> {
     crate::plugin_probe::on_path(&raw)
 }
 
-/// Bounds one herdr subprocess on the probe path (construction in herdr mode,
-/// `r` refreshes), on the validated-write path (`check_config`), and on the
+/// Bounds one herdr subprocess on the probe path (the Services tab's probe
+/// worker), on the validated-write path (`check_config`), and on the
 /// TUI's knob push (`crate::tui::app::push_herdr_knob_change`): a hung herdr must
 /// delay the caller, never hang the first paint or a heal behind an open
 /// modal. Same kill-on-deadline shape as the pane reporter's `report`

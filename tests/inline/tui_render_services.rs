@@ -216,6 +216,24 @@ fn assert_dot(check: &Check, expected: Health) {
 
 // ── selector rows ──────────────────────────────────────────────────────────────
 
+/// The title spinner shows while the herdr probe runs on its worker, and not
+/// otherwise.
+#[test]
+fn the_title_spinner_shows_while_the_herdr_probe_runs() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(plugin_check_with_problems());
+    let spun = format!(" SERVICES {} ", super::spinner_frame(app.tick_count));
+    let (rows, _) = render(&app);
+    assert!(!rows[0].contains(&spun), "no spinner at rest:\n{}", rows[0]);
+    app.services.herdr_probing = true;
+    let (rows, _) = render(&app);
+    assert!(
+        rows[0].contains(&spun),
+        "the spinner while probing:\n{}",
+        rows[0]
+    );
+}
+
 /// The four service rows render as dot + label, in order, with no fix cue on
 /// any row.
 #[test]
