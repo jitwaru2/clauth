@@ -4750,7 +4750,7 @@ fn gateway_health(state: GatewayState) -> Health {
 /// or a bidi formatting character is spelled as its visible `\u{…}` form so an
 /// untrusted string off the feed or the record can neither inject into the
 /// terminal nor reorder a line; every other character passes through unchanged.
-fn escape_control(s: &str) -> String {
+pub(crate) fn escape_control(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_control() || crate::jobs_cli::reorders_display(c) {
