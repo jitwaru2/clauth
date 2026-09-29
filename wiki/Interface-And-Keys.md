@@ -7,7 +7,7 @@
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position, a read-only section of codex accounts | switch accounts, reorder them, pick which harness shows |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, peak-rate state | refresh one account, toggle estimates and the pace marker, edit the account's note |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
@@ -28,7 +28,7 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 | <kbd>←</kbd> <kbd>→</kbd> (or <kbd>tab</kbd> / <kbd>⇧tab</kbd>) | previous / next tab |
 | <kbd>↑</kbd> <kbd>↓</kbd> | move the selection, or scroll a detail pane |
 | <kbd>⏎</kbd> | act on the selected row (see below) |
-| <kbd>n</kbd> | new account |
+| <kbd>n</kbd> | new account · on the usage tab: edit the account's note |
 | <kbd>d</kbd> | open the divergence resolver, when one is pending |
 | <kbd>x</kbd> | dismiss the oldest toast, then the footer alert |
 | <kbd>a</kbd> | action menu for the current row |
@@ -72,6 +72,8 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
 | Status | none | `refresh status`, `open in browser` |
 | every tab | none | `start daemon` / `stop daemon`, last |
+
+The usage tab claims <kbd>n</kbd> for the selected account's note: a free-form text block shown in full on the tab under `notes:` (`press n to add notes` while the account has none). <kbd>⏎</kbd> saves, <kbd>esc</kbd> cancels, <kbd>⌃j</kbd> starts a new line. The note is stored as `profiles/<name>/note.txt` (see [Configuration](Configuration#storage-layout)), so it follows the account on rename and goes with it on delete; everywhere else <kbd>n</kbd> still starts a new account.
 
 `start daemon` shows while no daemon runs and starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
 

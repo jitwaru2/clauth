@@ -262,6 +262,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       config.toml          # everything in the table above
       credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
+      note.txt             # the account's free-form note, edited from the usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
