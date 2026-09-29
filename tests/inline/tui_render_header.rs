@@ -196,14 +196,15 @@ fn header_height_is_always_three() {
     assert_eq!(header_height(&compact), 3);
 }
 
-// ── Row 1: the gauge and the status indicator alone ──────────────────────
+// ── Row 1: the gauge and the status indicator, nothing live ──────────────
 //
 // Row 1's text column starts after the 10-cell glyph column, so a terminal `W`
 // columns wide offers it `W - 10`. The indicator `● status.claude.ai` is 18
 // cells (dot, space, 16-char feed) plus a 3-cell reserve, so the gauge is
 // fitted to `W - 31` and the indicator is gated on the gauge as rendered. No
 // account count and no harness filter name takes part: both live on the
-// accounts panel's title row.
+// accounts panel's title row. These fixtures run no session, so the live
+// count's prefix stays off the row.
 
 #[test]
 fn row1_is_the_gauge_and_the_status_indicator_alone_when_wide() {
@@ -343,6 +344,112 @@ fn row1_gauge_falls_to_the_percent_alone_and_then_away() {
         row_content(&app, 34, 1).trim_end(),
         "      ● status.claude.ai",
         "one column narrower the gauge is gone, the indicator staying"
+    );
+}
+
+// ── Row 1: the fleet's live-session count ahead of the gauge ────────────────
+//
+// `3 live · ` leads row 1: the count of every live session across the fleet,
+// not the active account's. It takes only the width the gauge and the
+// indicator leave, so it is the first thing row 1 sheds: it renders only
+// while gauge + count + indicator + the 3-cell reserve all fit.
+
+/// Three sessions, two on the active account and one on `kerry`, an account
+/// no longer in the config: the prefix counts all three, so a count taken over
+/// the configured accounts alone would read 2.
+fn app_with_three_live(tab: Tab) -> App {
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = tab;
+    app.live_sessions = crate::live_sessions::LiveTally::of([
+        crate::testutil::live_row("4242-0", "uwuclxdy"),
+        crate::live_sessions::LiveSession {
+            follows_chain: false,
+            ..crate::testutil::live_row("4242-1", "uwuclxdy")
+        },
+        crate::testutil::live_row("4343-0", "kerry"),
+    ]);
+    app
+}
+
+/// Compact mode hides the gauge, not the fleet's count: the count stands alone
+/// the way it does on the Overview.
+#[test]
+fn row1_keeps_the_live_count_in_compact_mode() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_three_live(Tab::Tokens);
+    app.compact = true;
+
+    assert_eq!(
+        row_content(&app, 90, 1),
+        format!("3 live{}● status.claude.ai", " ".repeat(56)),
+    );
+}
+
+#[test]
+fn row1_leads_with_the_fleet_live_count_before_the_gauge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_three_live(Tab::Tokens);
+
+    // 120 - 10 = 110 text cells: `3 live · ` is 9, the gauge 26, the
+    // indicator 18, and the 57 cells between them are the elastic gap.
+    assert_eq!(
+        row_content(&app, 120, 1),
+        format!(
+            "3 live · uwuclxdy  [████░░░░░░] 42%{}● status.claude.ai",
+            " ".repeat(57)
+        ),
+    );
+}
+
+#[test]
+fn row1_carries_the_live_count_alone_where_no_gauge_renders() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_three_live(Tab::Overview);
+
+    // No gauge on the Overview: the count stands alone, with no separator
+    // left dangling after it. (90 - 10) - 6 - 18 = 56 cells of gap.
+    assert_eq!(
+        row_content(&app, 90, 1),
+        format!("3 live{}● status.claude.ai", " ".repeat(56)),
+    );
+}
+
+#[test]
+fn row1_carries_no_live_count_while_nothing_is_live() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![oauth_profile("uwuclxdy", 42.0)], Some("uwuclxdy"));
+    app.tab = Tab::Tokens;
+
+    assert_eq!(
+        row_content(&app, 120, 1),
+        format!(
+            "uwuclxdy  [████░░░░░░] 42%{}● status.claude.ai",
+            " ".repeat(66)
+        ),
+        "zero is hidden: no `0 live` and no stray separator"
+    );
+}
+
+/// The shed seam: gauge 26 + count 9 + indicator 18 + reserve 3 = 56 text
+/// cells, so 66 is the narrowest width holding the count, and at 65 the count
+/// goes whole while the gauge keeps its full bar.
+#[test]
+fn row1_sheds_the_live_count_before_the_gauge_or_the_indicator() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = app_with_three_live(Tab::Tokens);
+
+    assert_eq!(
+        row_content(&app, 66, 1),
+        "3 live · uwuclxdy  [████░░░░░░] 42%   ● status.claude.ai",
+        "at its own fit width the count renders"
+    );
+    assert_eq!(
+        row_content(&app, 65, 1),
+        format!(
+            "uwuclxdy  [████░░░░░░] 42%{}● status.claude.ai",
+            " ".repeat(11)
+        ),
+        "one column narrower the count drops whole, the gauge untouched"
     );
 }
 
@@ -503,6 +610,12 @@ fn no_header_row_counts_accounts_at_any_width_tab_or_filter() {
         vec![oauth_profile("uwuclxdy", 42.0), provider_profile("z.ai")],
         Some("uwuclxdy"),
     );
+    // A live fleet puts the one sanctioned middot on row 1 (`2 live · `), so
+    // the guard below runs with it present and strips exactly that one.
+    app.live_sessions = crate::live_sessions::LiveTally::of([
+        crate::testutil::live_row("4242-0", "uwuclxdy"),
+        crate::testutil::live_row("4242-1", "z.ai"),
+    ]);
 
     for filter in [
         HarnessFilter::All,
@@ -532,7 +645,7 @@ fn no_header_row_counts_accounts_at_any_width_tab_or_filter() {
                          harness: {content:?}"
                     );
                     assert!(
-                        !content.contains('·'),
+                        !content.replacen("2 live · ", "", 1).contains('·'),
                         "{filter:?} on {tab:?} at {width}: header row {row} carries a \
                          count middot: {content:?}"
                     );

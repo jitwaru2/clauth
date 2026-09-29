@@ -4,10 +4,11 @@
 //!
 //! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
 //! and the `[ daemon ]` health chip on the right edge; it sheds the tag first,
-//! then the chip. Row 1 carries the active-profile usage gauge and the status
-//! indicator, nothing else: the account counts and the harness filter live on
-//! the accounts panel's title row, as meta slots beside the bare `ACCOUNTS`
-//! title. The collapse ladder drops the usage bar before the name.
+//! then the chip. Row 1 carries the fleet's live-session count, the
+//! active-profile usage gauge and the status indicator, nothing else: the
+//! account counts and the harness filter live on the accounts panel's title
+//! row, as meta slots beside the bare `ACCOUNTS` title. Row 1 sheds the live
+//! count first; the gauge's ladder drops the usage bar before the name.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -254,13 +255,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows[0],
     );
 
-    // ── Row 1: [gauge] ...... ● feed ─────────────────────────────────────
-    // The active profile's gauge, left-aligned, and the status indicator, the
-    // only thing right-aligned, across an elastic gap. The account counts and
-    // the harness filter left this row for the accounts panel's title row,
-    // whose meta slots carry them beside the bare `ACCOUNTS` title (the filter
-    // name left, the roster counts right): this row stays counts-free at every
-    // width. The indicator drops whole, head and feed together, since a dot
+    // ── Row 1: [N live · ][gauge] ...... ● feed ──────────────────────────
+    // The fleet's live count and the active profile's gauge, left-aligned, and
+    // the status indicator, the only thing right-aligned, across an elastic
+    // gap. The account counts and the harness filter left this row for the
+    // accounts panel's title row, whose meta slots carry them beside the bare
+    // `ACCOUNTS` title (the filter name left, the roster counts right). The
+    // indicator drops whole, head and feed together, since a dot
     // left to render clips the feed mid-word and a half-spelled source says
     // less than none. Its gate is charged the gauge as rendered, so the gauge's
     // own ladder gives way before the indicator does.
@@ -277,6 +278,22 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
+        }
+    }
+    // The fleet's live-session count leads the row, hidden at zero. It takes
+    // only what the gauge and the indicator leave, so it is the first thing
+    // the row sheds, whole, never costing the gauge a cell.
+    let live = app.live_sessions.total();
+    if live > 0 {
+        let mut prefix = vec![Span::styled(format!("{live} live"), theme::dim())];
+        if !left_spans.is_empty() {
+            prefix.push(Span::styled(" · ", theme::dim()));
+        }
+        let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
+        let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
+            prefix.append(&mut left_spans);
+            left_spans = prefix;
         }
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
