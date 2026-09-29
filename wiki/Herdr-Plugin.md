@@ -89,7 +89,7 @@ The agent-panel status dot does not follow it. The dot is herdr's own lifecycle 
 
 ## Herdr mode
 
-A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag. The first launch opens the Services tab with the `herdr` row selected and its detail pane open; every later launch opens the `home tab` like a standalone TUI. Everything else is the same TUI.
+A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag. The first launch opens the Services tab and, the moment herdr answers the TUI's check, selects the `herdr` row with its detail pane open; opening a modal, moving the cursor, pressing <kbd>⏎</kbd> or <kbd>f</kbd>, or switching tabs before then cancels that jump, and it never happens later. Every later launch opens the `home tab` like a standalone TUI. Everything else is the same TUI.
 
 ## Herdr options
 
@@ -105,7 +105,7 @@ Seven knobs tune the plugin. Six live in the dashboard's Services tab: select `h
 | `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote (a block you edited by hand is kept whole), behind a confirm that defaults to cancel |
 | `home tab` | `overview` | the tab every launch opens on (`overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services`); a saved `plugin` loads as `services`. the first herdr launch lands on the Services tab with the herdr row open instead. edited from the Config tab's appearance band, not the herdr detail |
 
-The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing: the first herdr launch opens the Services tab with the herdr row selected and its detail open; every later launch opens the `home tab`.
+The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing described above.
 
 ## Checking it from the TUI
 
