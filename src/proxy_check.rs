@@ -262,8 +262,10 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
-        // A proxy on loopback asked through an env-configured forward proxy
-        // would be asked of the wrong host.
+        // The check asks the proxy directly: through an env-configured
+        // forward proxy a loopback proxy resolves on the forward proxy's own
+        // host, and any other one's delays and errors would be the forward
+        // proxy's.
         .proxy(None)
         .build()
         .into()
@@ -1892,20 +1894,12 @@ impl Checker<'_> {
         }
     }
 
-    /// A cancelled flow is gone (404 `not_found`) or reads as ended
-    /// (`failed` or `expired`); still `pending` or `done` is a departure.
+    /// A cancelled flow is gone: it reads back 404 `not_found`, like an
+    /// unknown one.
     fn cancelled(&mut self, path: &str) {
         let gone = format!("GET {CONTROL}/accounts/login/{{flow}} (cancelled)");
-        let Some(answer) = self.admin_call(&gone, Method::Get, path, None) else {
-            return;
-        };
-        if answer.status == 404 {
-            self.control_error(&gone, Some(answer), 404, "not_found", None);
-            return;
-        }
-        if let Some(view) = self.expect_json(&gone, Some(answer), 200) {
-            self.req_one_of(&gone, &view, "", "state", &["failed", "expired"]);
-        }
+        let answer = self.admin_call(&gone, Method::Get, path, None);
+        self.control_error(&gone, answer, 404, "not_found", None);
     }
 
     fn poll_hints(&mut self, route: &str, body: &Value) {

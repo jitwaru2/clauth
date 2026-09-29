@@ -1243,8 +1243,9 @@ pub(crate) fn health_agent() -> ureq::Agent {
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
-        // A loopback probe routed through an env-configured proxy would ask
-        // the proxy's host, not this one.
+        // The probe asks its target directly: through an env-configured
+        // proxy a loopback target resolves on the proxy's own host, and any
+        // other target's delays and errors would be the proxy's.
         .proxy(None)
         .build()
         .into()

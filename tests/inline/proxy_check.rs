@@ -1079,13 +1079,20 @@ fn a_delete_that_leaves_the_key_working_fails_naming_it() {
 }
 
 #[test]
-fn a_cancelled_flow_may_read_back_as_failed() {
+fn a_cancelled_flow_that_still_reads_back_fails_naming_it() {
     let stub = Stub::start(Plant::CancelledFlowReadsFailed);
     let (admin, key) = secrets();
 
     let report = check(&stub.base, &admin, &key, &Mode::Safe).expect("check runs");
 
-    assert_eq!(report.violations, Vec::<Violation>::new());
+    assert_eq!(
+        report.violations,
+        vec![violation(
+            "GET /clauth/v1/accounts/login/{flow} (cancelled)",
+            "status 404",
+            "status 200"
+        )]
+    );
 }
 
 fn secret_files(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
