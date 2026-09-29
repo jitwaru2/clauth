@@ -38,7 +38,7 @@
 
 **On macOS a switch does not reach my running session.** Claude Code reads the Keychain first there, and it deletes the credentials file once it migrates. clauth mirrors each fresh login into the Keychain for exactly this reason, but an account holding a live `clauth start` session is skipped by force-rotate, since its Keychain item belongs to that session's own config dir. [Security](Security#per-platform-behavior).
 
-**Claude Code does not show clauth's tools.** Open the Plugin tab. It checks `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, and whether `clauth mcp` actually answers a handshake. <kbd>f</kbd> on a row applies that row's fix: install the plugin at user scope, write the `mcpServers` entry into `~/.claude.json`, repair or relink the active account's credentials, or add clauth's keybinding and sidebar row to herdr's config.
+**Claude Code does not show clauth's tools.** Open the Services tab, move to the `plugin` row. It checks `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, and (after <kbd>r</kbd>) whether `clauth mcp` answers a handshake. <kbd>f</kbd> applies the focused fix: `wire mcp server` writes the `mcpServers` entry into `~/.claude.json`, and `install plugin` installs at user scope; on the `herdr` row, `heal herdr config` adds clauth's keybinding and sidebar row to herdr's config.
 
 **A `delegate` run did nothing and the tree is unchanged.** A delegate spawns with the permission gate armed and nobody to answer it. Pass the permission flag through `args` for a delegate that writes files, and read the `permission_denials` array in the envelope. [Claude Code plugin](Claude-Code-Plugin#delegate).
 

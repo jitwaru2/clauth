@@ -6,7 +6,7 @@ Three files, all TOML, all safe to hand-edit while clauth runs (it reloads on ex
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
 - `~/.clauth/codex-profiles.toml` for the codex roster: its own active marker, chain and weekly line ([Codex](Codex)).
 
-Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Services tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
 
 ## Account types
 
@@ -150,12 +150,12 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
-| `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `plugin`; edited from the Config tab's `home tab` row. the first herdr launch lands on `plugin` with the herdr row open instead |
+| `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `services`; a saved `plugin` loads as `services`. edited from the Config tab's `home tab` row. the first herdr launch lands on `services` with the herdr row open instead |
 | `show_estimates` | bool | `true` | burn estimates on the Usage tab |
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
 | `auth_broken` | list | `[]` | accounts quarantined after a permanent OAuth rejection; clauth writes this |
-| `[herdr]` | table | `{}` | the herdr-plugin knobs the Plugin tab edits, plus the first-launch marker ([herdr plugin](Herdr-Plugin)) |
+| `[herdr]` | table | `{}` | the herdr-plugin knobs the Services tab edits, plus the first-launch marker ([herdr plugin](Herdr-Plugin)) |
 | `[herdr] popup_width` | string | `fit` | `fit` (focused-pane width, 540-column cap), `half` (herdr's default), `split-right`, or `split-top` (a real pane right of or above the focused one); a saved `full` loads as `fit` |
 | `[herdr] pane_tag` | bool | `true` | publish the `clauth=$profile` pane-metadata tag; off clears it on every pane |
 | `[herdr] tag_watch_secs` | int | `5` | seconds between the per-pane tag watcher's re-publishes |

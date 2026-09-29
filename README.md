@@ -124,11 +124,11 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 | **Fallback** | chain editor |
 | **Config** | appearance, scheduler, auto-switch defaults |
 | **Status** | Claude incident feed |
-| **Plugin** | Claude Code wiring + per-profile runtime, with one-key fixes |
+| **Services** | the shunt gateway, delegates, the Claude Code plugin and herdr |
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add uwuclxdy/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Services tab, `plugin` row, <kbd>⏎</kbd>, <kbd>↑</kbd>/<kbd>↓</kbd> to `f  install plugin`, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add uwuclxdy/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
 
 A registration that breaks repairs itself: `clauth mcp` heals one at startup, so does the daemon's tick, and `clauth start` heals one before `claude` launches. That last one covers what a hook cannot, since a marketplace too broken to load means the plugin never loads and its hooks never fire.
 

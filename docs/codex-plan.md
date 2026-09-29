@@ -161,18 +161,17 @@ A sweep on 2026-07-27 found a set of patterns that this series would otherwise d
 | settings sync / `.claude.json` sync | SKIP codex |
 | sessions index / `resume` / `info` / rescue | SKIP codex (codex owns its own `sessions/`) |
 | Tokens tab, `token_ledger`, the cost lens | SKIP codex this series (claude-shaped JSONL) |
-| MCP server, `delegate`, Plugin tab | claude-only, copy fixes only (below) |
+| MCP server, `delegate`, Services tab | claude-only, copy fixes only (below) |
 | kick / auto-start / `kick_block` | claude-only. Codex has no window-opening endpoint, and the kick's 401 arm (`oauth.rs:576`) falls through to a refresh against `platform.claude.com` |
 | spend ceiling, weekly soft line, `weekly_scoped` | no codex wire equivalent for the ceiling or the scoped windows. The weekly soft line has its own codex setting (`weekly_switch_threshold` in `codex-profiles.toml`, hand-edited, defaulting to the claude default). `check_scoped` defaults ON (`fallback.rs:913`) and is disarmed for codex members or an unmapped window becomes a rotation-blocking phantom |
 | macOS keychain mirror | N/A (forced file mode) |
 | `clauth proxy` | out of scope, separate feature |
 
-### MCP and the Plugin tab stay Claude-Code-only
+### MCP and the Services tab stay Claude-Code-only
 
-Both fail closed already: `load_config` builds `AppConfig.profiles` from `profiles.toml` only (`profile.rs:1528`), so codex profiles are invisible to every MCP tool, and the Plugin tab has no per-profile selector to hand one to. Nothing behavioral changes. What ships is copy:
+Both fail closed already: `load_config` builds `AppConfig.profiles` from `profiles.toml` only (`profile.rs:1528`), so codex profiles are invisible to every MCP tool, and the Services tab has no per-profile selector to hand one to. Nothing behavioral changes. What ships is copy:
 
 - the MCP init block asserting clauth manages "Claude Code accounts" (`mcp/render.rs:104`).
-- the Plugin tab's "every profile's live sessions" (`tui/render/plugin.rs:7`).
 - the Tokens tab's missing Claude-Code-only qualifier.
 - `delegate`'s, `switch_profile`'s and the `profiles` filter's "profile not found", which is what a user gets for a codex name that demonstrably exists. It says so: the refusal names the codex account.
 

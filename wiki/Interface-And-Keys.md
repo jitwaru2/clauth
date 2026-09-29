@@ -13,7 +13,7 @@
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
 | **Config** | program-wide settings | change any of the rows in the table below |
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
-| **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
+| **Services** | the shunt gateway, running delegates, the Claude Code plugin and herdr | apply one-key fixes |
 
 The active account is orange. A `▲` on an account's row means the provider behind it is on peak-rate hours right now — some providers charge more at set times of day (DeepSeek roughly doubles its API rate; Z.ai's GLM peak hours consume the coding plan's quota faster). The active account's `●` outranks `▲` on its own row, so an active account on peak hours keeps its dot and `▲` shows on the other accounts. The Usage tab's `pricing` row names the state, the countdown to the next switch, and nothing renders for flat-rate accounts. The marker follows the provider's own published rate schedule, never which models the profile pins; an account on an endpoint clauth doesn't recognize shows none. A codex account's banked usage-limit resets show as `↺ N` on its Overview row while one is available — `clauth limit-reset` spends one ([Codex](Codex#use-a-usage-limit-reset)). Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable. Once those figures age past the refresh cadence's stale threshold, the Usage tab's status block adds a `[ stale ]` pill; it reads the age of the reading — an OAuth account's own fetch stamp, one it cannot date reading stale at once, or a third-party account's cache write time — not the last fetch outcome, so a `[ cached ]` pill and it can appear together. On the fallback chain panel below the accounts, `↲ ~40m` beside a member names the account the chain switches to next, and roughly when.
 
@@ -41,16 +41,16 @@ Codex accounts ([Codex](Codex)) sit under the Claude Code rows in a section head
 
 | Key | Behavior |
 |-----|----------|
-| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Plugin: reload that tab's data. Everywhere else: refresh every Claude Code account |
+| <kbd>r</kbd> | Usage: refresh the selected account only. Tokens / Status / Services: reload that tab's data. Everywhere else: refresh every Claude Code account |
 | <kbd>t</kbd> | Tokens: cycle the period lens. Everywhere else: force-rotate every Claude Code account's token, after a confirm |
-| <kbd>⏎</kbd> | Overview: switch to the selected account. Tokens: open the model breakdown. Setup / Fallback: open a detail row, or commit an edit; on a Fallback card's `preferred days` row, open the day picker. Status / Plugin: open the detail |
+| <kbd>⏎</kbd> | Overview: switch to the selected account. Tokens: open the model breakdown. Setup / Fallback: open a detail row, or commit an edit; on a Fallback card's `preferred days` row, open the day picker. Status / Services: open the detail |
 | <kbd>⇧↑</kbd> <kbd>⇧↓</kbd> | Overview: reorder accounts. Fallback (chain focus): reorder chain members |
 | <kbd>space</kbd> | Config: cycle a value. Setup `model` row and Fallback toggle rows: flip. Fallback `preferred days`: step `never` → `weekdays` → `weekends` → `every day` and back to `never`, saving each step; a custom set is one more stop after `every day` until you leave the card |
 | <kbd>+</kbd> <kbd>-</kbd> | Fallback detail: step `rotate at` or `weekly at` by 5 |
 | <kbd>e</kbd> | Usage: toggle burn estimates |
 | <kbd>p</kbd> | Usage: toggle the ideal-pace marker |
 | <kbd>c</kbd> | Overview: cycle the harness filter (both → claude → codex → both; the accounts panel title names the active one). Tokens: count cache reads and writes in the token totals |
-| <kbd>f</kbd> | Plugin: apply the selected row's fix |
+| <kbd>f</kbd> | Services: apply the fix the footer names (the selected row's first, or the focused problem in the plugin detail) |
 
 The day picker on a Fallback card's `preferred days` row shows each weekday as `[x]` or `[ ]`: <kbd>←</kbd> <kbd>→</kbd> walk the days (and do not switch tabs while it is open), <kbd>space</kbd> toggles the day and saves at once, <kbd>⏎</kbd>, <kbd>esc</kbd> or <kbd>q</kbd> leave it, and <kbd>↑</kbd> <kbd>↓</kbd> leave it and move to the row above or below. <kbd>?</kbd> and <kbd>x</kbd> keep working while it is open; every other key does nothing until you leave.
 
@@ -60,7 +60,7 @@ The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help 
 
 ## Action menus
 
-<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so on Config, Fallback and Plugin, where every action already has a key, it holds only the daemon entry every tab ends on. The footer only advertises <kbd>a</kbd> where something would open.
+<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so on Config, Fallback and Services, where every action already has a key, it holds only the daemon entry every tab ends on. The footer only advertises <kbd>a</kbd> where something would open.
 
 Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab, and the last one on the daemon.
 
@@ -120,7 +120,7 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 | `theme` | `full`, `compatible` | auto-detected |
 | `reset display` | `relative`, `clock`, `both` | `relative` |
 | `clock` | `24h`, `12h` | `24h` |
-| `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `plugin` | `overview` |
+| `home tab` | `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services` | `overview` |
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
@@ -139,18 +139,21 @@ The account list ends in an action row: `+ new`, which turns this pane into the 
 
 `clock` is inert unless `reset display` shows one. `burn floor` and `burn horizon` are inert unless `switch mode` is `burn-aware`. `extra usage spent` is inert unless `allow extra usage` is on. `auto-start queue` is inert until some account has `auto_start` on. What each of the auto-switch rows does: [Auto-switch](Auto-Switch).
 
-## Plugin tab
+## Services tab
 
-Each row is a check on your Claude Code wiring: `clauth` on `PATH` and `claude --version`, the `mcpServers` entry and whether `clauth mcp` boots, the plugin install record, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
+Four rows: `shunt`, `delegates`, `plugin`, and `herdr` (shown only when herdr resolves; press <kbd>r</kbd> once to probe it, since only the first herdr launch probes on its own). A row's dot carries its health; the full readout lives in the detail pane. <kbd>⏎</kbd> descends into the selected row's detail (`delegates` excepted: its detail takes no keys). A fixable problem shows a dim `f  <verb>` line under the problem it fixes, and the footer shows `f <verb>`. On the list <kbd>f</kbd> fixes the first fixable problem on the selected row; in the `plugin` detail <kbd>↑</kbd>/<kbd>↓</kbd> walk the problems, the focused one highlighted, and <kbd>f</kbd> fixes it.
 
-| Fix | When it appears |
-|-----|-----------------|
-| `wire mcpServers into ~/.claude.json` | the entry is missing, project-local only, or points somewhere stale |
-| `repair credentials` | the active profile's stored login disagrees with the live one |
-| `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
-| `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
-| `install the clauth plugin` / `install globally (user scope)` | the first spelling when the plugin row reads not installed, the second when it is installed for this project only. Either confirms into the real `claude plugin` installer at user scope |
+`shunt` reports the managed gateway's status, read-only: the daemon's live verdict when it runs the gateway, else the gateway record's own. It names the state plus the config, binary, port, pid and version it resolved. No action lives on this row yet.
 
-The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.
+`delegates` lists the `clauth mcp` job store in its detail. The row's dot reads green while a job runs and dim when none; a recent delegate rate-limit warning names the accounts in its detail. The detail binds no key: a delegate is stopped through the plugin's `monitor` tool ([Claude Code plugin](Claude-Code-Plugin)).
 
-The `delegates` pane underneath lists the plugin's running `delegate` jobs. It binds no key: a delegate is stopped through the plugin's `monitor` tool ([Claude Code plugin](Claude-Code-Plugin)).
+`plugin` folds the Claude Code wiring checks into one detail: the clauth data dir and whether `clauth` is on `PATH`, the `mcpServers` wiring (`mcp wired` / `mcp source` / `mcp server`), the plugin install record, and the `claude` version. Its health is the worst of the four, and two fixes can apply:
+
+| Verb | When it appears |
+|------|-----------------|
+| `wire mcp server` | the `mcpServers` entry is missing, project-local only, or drifted off the current launch line; writes the clauth entry into `~/.claude.json` |
+| `install plugin` | the plugin reads not installed, or installed for this project only; installs at user scope |
+
+To install the plugin: select the `plugin` row, press <kbd>⏎</kbd>, move to `f  install plugin` with <kbd>↑</kbd>/<kbd>↓</kbd>, press <kbd>f</kbd>, confirm.
+
+The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel. <kbd>f</kbd> applies `heal herdr config` when the herdr plugin is installed and its key is unbound or its sidebar row is untemplated.

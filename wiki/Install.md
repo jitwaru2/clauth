@@ -61,4 +61,4 @@ clauth completions bash             # print the script to stdout instead
 
 ## Claude Code plugin
 
-The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.
+The plugin is a separate step, installed from the TUI's Services tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.

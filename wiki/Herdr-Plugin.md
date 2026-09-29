@@ -12,7 +12,7 @@ clauth herdr install
 
 One command for the whole setup. It runs herdr's own installer, passing herdr's preview of every command the plugin would run as you straight through, then adds the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. Both land in your herdr `config.toml`, appended after a diff and a `[y/N]`, and herdr validates the result before anything is written.
 
-Run it a second time and it adds nothing. `--key` picks the keybinding, and a re-run with a new key re-binds an existing clauth binding to it; the Plugin tab's heal keeps the installed key instead. If the plugin is already linked from a local checkout (a development setup), install refuses rather than replace your live tree, and names the checkout plus the two ways out: `herdr plugin link` relinks it, `clauth herdr uninstall` first switches you to the GitHub install.
+Run it a second time and it adds nothing. `--key` picks the keybinding, and a re-run with a new key re-binds an existing clauth binding to it; the Services tab's heal keeps the installed key instead. If the plugin is already linked from a local checkout (a development setup), install refuses rather than replace your live tree, and names the checkout plus the two ways out: `herdr plugin link` relinks it, `clauth herdr uninstall` first switches you to the GitHub install.
 
 | Flag | Effect |
 |------|--------|
@@ -89,11 +89,11 @@ The agent-panel status dot does not follow it. The dot is herdr's own lifecycle 
 
 ## Herdr mode
 
-A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag. The first launch opens the Plugin tab with the `herdr` row selected and its detail pane open; every later launch opens the `home tab` like a standalone TUI. Everything else is the same TUI.
+A clauth TUI opened inside a herdr pane (`HERDR_ENV=1`) adds one thing: the header carries a dim `[ herdr ]` tag. The first launch opens the Services tab with the `herdr` row selected and its detail pane open; every later launch opens the `home tab` like a standalone TUI. Everything else is the same TUI.
 
 ## Herdr options
 
-Seven knobs tune the plugin. Six live in the dashboard's Plugin tab: select `herdr`, press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. The seventh, `home tab`, sits in the Config tab's appearance band and picks the tab every launch opens on; the first herdr launch lands on the Plugin tab with the herdr row open instead. The six form knobs persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`; `home tab` persists as the top-level `home_tab` key. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
+Seven knobs tune the plugin. Six live in the dashboard's Services tab: select `herdr` (press <kbd>r</kbd> once to probe it; only the first herdr launch probes on its own), press <kbd>⏎</kbd>, and an `options` section at the bottom of the detail lists them as form rows. The seventh, `home tab`, sits in the Config tab's appearance band and picks the tab every launch opens on; the first herdr launch lands on the Services tab with the herdr row open instead. The six form knobs persist in `~/.clauth/profiles.toml` under `[herdr]`, never in herdr's own `config.toml`; `home tab` persists as the top-level `home_tab` key. The plugin scripts read them through `clauth herdr config get <key>`, which prints one line (`fit`, `on`, `off`, or a count). Knob changes apply immediately: moving `pane tag` or `border label` re-reports every pane at once (from the plugin-pane launch only; a standalone TUI has no panes to reach, and a bare pane lacks the plugin root).
 
 | Knob | Default | What it does |
 |------|---------|--------------|
@@ -103,13 +103,13 @@ Seven knobs tune the plugin. Six live in the dashboard's Plugin tab: select `her
 | `border label` | off | publish `--display-agent "$profile"` so split-pane borders name the account; off clears the stale label |
 | `delegate dot` | on | the `clauth mcp` server reports `clauth_delegate=working\|idle` during delegate runs; off disables the reporting entirely |
 | `delegate row text` | off | the sidebar row `install` writes gains the `$clauth_delegate` token, so a running delegate reads as text beside the row; toggling it in the TUI rewrites only the blocks clauth itself wrote (a block you edited by hand is kept whole), behind a confirm that defaults to cancel |
-| `home tab` | `overview` | the tab every launch opens on (`overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `plugin`); the first herdr launch lands on the Plugin tab with the herdr row open instead. edited from the Config tab's appearance band, not the herdr detail |
+| `home tab` | `overview` | the tab every launch opens on (`overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, `services`); a saved `plugin` loads as `services`. the first herdr launch lands on the Services tab with the herdr row open instead. edited from the Config tab's appearance band, not the herdr detail |
 
-The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing: the first herdr launch opens the Plugin tab with the herdr row selected and its detail open; every later launch opens the `home tab`.
+The options render whether the TUI runs inside herdr or standalone. herdr mode differs only in the header tag and the first-launch landing: the first herdr launch opens the Services tab with the herdr row selected and its detail open; every later launch opens the `home tab`.
 
 ## Checking it from the TUI
 
-The dashboard's [Plugin tab](Interface-And-Keys#plugin-tab) carries a `herdr` row, shown only if herdr is installed. It reports the herdr version, whether the plugin is linked or installed and whether it is enabled, the key you bound and its spelling, and whether the sidebar row is templated. A registry entry whose checkout has been moved or deleted reads as danger, since herdr keeps the entry and the plugin cannot run.
+The dashboard's [Services tab](Interface-And-Keys#services-tab) carries a `herdr` row, shown only if herdr is installed (press <kbd>r</kbd> once to probe it; only the first herdr launch probes on its own). It reports the herdr version, whether the plugin is linked or installed and whether it is enabled, the key you bound and its spelling, and whether the sidebar row is templated. A registry entry whose checkout has been moved or deleted reads as danger, since herdr keeps the entry and the plugin cannot run.
 
 <kbd>f</kbd> on that row appends whichever of the keybinding and the sidebar row is missing, behind a confirm that defaults to cancel. It is the same write `clauth herdr install` performs, so it is the repair for a config edited by hand since. If your config spells one of those tables in a way clauth cannot extend by appending, it says so and leaves that half to you rather than guessing.
 
