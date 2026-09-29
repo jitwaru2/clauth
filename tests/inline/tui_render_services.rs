@@ -58,33 +58,36 @@ fn healthy_config() -> ConfigStatus {
     config(true, Some("prefix+a"), SidebarState::Templated)
 }
 
-/// A `plugin` row with two fixable problems (wire, then install) and the folded
-/// readout, built directly so the render pins never touch the FS probes.
+/// A `plugin` row with two fixable problems (install, then wire) and the folded
+/// readout in the builder's order, built directly so the render pins never
+/// touch the FS probes.
 fn plugin_check_with_problems() -> Check {
     Check {
         label: "plugin",
         health: Health::Warn,
         detail: vec![
-            "data: /home/u/.clauth".to_string(),
-            "path: /usr/local/bin/clauth".to_string(),
-            "mcp wired: no".to_string(),
-            "mcp source: none".to_string(),
-            "writes the clauth entry into ~/.claude.json".to_string(),
-            "f  wire mcp server".to_string(),
             "installed: no (marketplace known)".to_string(),
             "installs at user scope".to_string(),
             "f  install plugin".to_string(),
+            String::new(),
+            "mcp entry: not registered".to_string(),
+            "mcp source: none".to_string(),
+            "writes the clauth entry into ~/.claude.json".to_string(),
+            "f  wire mcp server".to_string(),
+            String::new(),
             "claude: press r to probe".to_string(),
+            "path: /usr/local/bin/clauth".to_string(),
+            "data: /home/u/.clauth".to_string(),
         ],
-        fix: Some(ServiceFix::WireMcpServers),
+        fix: Some(ServiceFix::InstallPlugin),
         problems: vec![
             Problem {
-                line: 5,
-                fix: ServiceFix::WireMcpServers,
+                line: 2,
+                fix: ServiceFix::InstallPlugin,
             },
             Problem {
-                line: 8,
-                fix: ServiceFix::InstallPlugin,
+                line: 7,
+                fix: ServiceFix::WireMcpServers,
             },
         ],
     }
@@ -280,14 +283,14 @@ fn the_shunt_detail_renders_every_set_field() {
     assert_eq!(
         detail_rows(&rows),
         vec![
-            "state      healthy",
-            "config     /home/u/.clauth/gateway.toml",
             "binary     /usr/local/bin/shunt",
-            "port       3001",
-            "pid        4242",
+            "config     /home/u/.clauth/gateway.toml",
             "version    0.49.1",
-            "restarts   2",
+            "state      healthy",
             "reason     port busy",
+            "pid        4242",
+            "port       3001",
+            "restarts   2",
             "last exit  exit 1",
         ],
         "every set field renders in order"
@@ -346,7 +349,7 @@ fn the_services_footer_hints_pin_each_focus_state() {
             ("↑↓", "row"),
             ("↵", "detail"),
             ("r", "refresh"),
-            ("f", "wire mcp server"),
+            ("f", "install plugin"),
             ("a", "actions"),
             ("?", "help"),
         ],
@@ -376,11 +379,11 @@ fn the_services_footer_hints_pin_each_focus_state() {
         vec![
             ("↑↓", "problem"),
             ("r", "refresh"),
-            ("f", "wire mcp server"),
+            ("f", "install plugin"),
             ("a", "actions"),
             ("?", "help"),
         ],
-        "the wire problem names its verb"
+        "the install problem names its verb"
     );
     app.services.problem_cursor = 1;
     assert_eq!(
@@ -388,11 +391,11 @@ fn the_services_footer_hints_pin_each_focus_state() {
         vec![
             ("↑↓", "problem"),
             ("r", "refresh"),
-            ("f", "install plugin"),
+            ("f", "wire mcp server"),
             ("a", "actions"),
             ("?", "help"),
         ],
-        "the install problem names its verb"
+        "the wire problem names its verb"
     );
 
     // Herdr detail: the options row keys, no `f` on a healthy check.
@@ -411,28 +414,31 @@ fn the_services_footer_hints_pin_each_focus_state() {
 }
 
 /// The plugin detail folds the four readouts and renders each fix as a dim
-/// `f  <verb>` line under its problem — never a bracketed `[f]` cue.
+/// `f  <verb>` line under its problem — never a bracketed `[f]` cue. The
+/// content rows pin by equality (key column 12 cells: widest key `mcp source`
+/// + the 2-space gap; blank separators dropped by `detail_rows`).
 #[test]
 fn the_plugin_detail_folds_the_readouts_and_renders_bare_f_lines() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = app_with(plugin_check_with_problems());
     let (rows, buf) = render(&app);
     let screen = rows.join("\n");
-    // `key: value` rows render with the colon dropped and the value trailing the
-    // padded key column, so the pins assert the surviving value substrings.
-    for needle in [
-        "/home/u/.clauth",
-        "/usr/local/bin/clauth",
-        "mcp wired",
-        "mcp source",
-        "no (marketplace known)",
-        "press r to probe",
-    ] {
-        assert!(screen.contains(needle), "`{needle}` missing:\n{screen}");
-    }
-    for needle in ["f  wire mcp server", "f  install plugin"] {
-        assert!(screen.contains(needle), "`{needle}` missing:\n{screen}");
-    }
+    assert_eq!(
+        detail_rows(&rows),
+        vec![
+            "installed   no (marketplace known)",
+            "installs at user scope",
+            "f  install plugin",
+            "mcp entry   not registered",
+            "mcp source  none",
+            "writes the clauth entry into ~/.claude.json",
+            "f  wire mcp server",
+            "claude      press r to probe",
+            "path        /usr/local/bin/clauth",
+            "data        /home/u/.clauth",
+        ],
+        "every readout in order, by equality"
+    );
     assert!(
         !screen.contains("[f]"),
         "the bracketed `[f]` anti-pattern is gone:\n{screen}"
@@ -467,26 +473,26 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.services.focus, ServicesFocus::Detail);
 
-    // First problem (wire) is focused; the footer names its verb.
+    // First problem (install) is focused; the footer names its verb.
     let dump = dump_full(&app);
     assert!(
-        dump.contains("f wire mcp server"),
+        dump.contains("f install plugin"),
         "the footer names the focused problem's verb:\n{dump}"
     );
     let (rows, buf) = render(&app);
     let screen = rows.join("\n");
     assert!(
         rows.iter()
-            .any(|r| r.contains("❯") && r.contains("wire mcp server")),
+            .any(|r| r.contains("❯") && r.contains("install plugin")),
         "the focused problem takes the caret:\n{screen}"
     );
     // The focused problem line takes the same hover tint a focused herdr
     // option takes: bg pinned off the styled buffer, not the glyph text.
     let caret_row = rows
         .iter()
-        .position(|r| r.contains("❯") && r.contains("wire mcp server"))
+        .position(|r| r.contains("❯") && r.contains("install plugin"))
         .expect("focused problem row");
-    let caret_byte = rows[caret_row].find("f").expect("f glyph");
+    let caret_byte = rows[caret_row].find("f  install").expect("f glyph");
     let caret_col = rows[caret_row][..caret_byte].chars().count();
     assert_eq!(
         buf.content[caret_row * W as usize + caret_col].bg,
@@ -494,30 +500,7 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
         "the focused problem line carries the hover tint:\n{screen}"
     );
 
-    // `f` from the focused problem opens the wire confirm.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
-    assert!(
-        matches!(app.modals.last(), Some(Modal::Confirm(_))),
-        "f on a problem opens its confirm"
-    );
-    app.modals.clear();
-
-    // Walk to the second problem (install); the footer and caret follow.
-    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    let dump = dump_full(&app);
-    assert!(
-        dump.contains("f install plugin"),
-        "the footer follows the focus to the install verb:\n{dump}"
-    );
-    let (rows, _) = render(&app);
-    let screen = rows.join("\n");
-    assert!(
-        rows.iter()
-            .any(|r| r.contains("❯") && r.contains("install plugin")),
-        "the caret follows to the install problem:\n{screen}"
-    );
-
-    // `f` now fires the install fix.
+    // `f` from the focused problem opens the install confirm.
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
     match app.modals.last() {
         Some(Modal::Confirm(state)) => assert!(
@@ -528,6 +511,35 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
             "f on the focused install problem runs the install"
         ),
         other => panic!("expected an install confirm, got {other:?}"),
+    }
+    app.modals.clear();
+
+    // Walk to the second problem (wire); the footer and caret follow.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let dump = dump_full(&app);
+    assert!(
+        dump.contains("f wire mcp server"),
+        "the footer follows the focus to the wire verb:\n{dump}"
+    );
+    let (rows, _) = render(&app);
+    let screen = rows.join("\n");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("❯") && r.contains("wire mcp server")),
+        "the caret follows to the wire problem:\n{screen}"
+    );
+
+    // `f` now fires the wire fix.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(
+                state.on_confirm,
+                crate::tui::app::ConfirmAction::WireMcpServers
+            ),
+            "f on the focused wire problem writes the entry"
+        ),
+        other => panic!("expected a wire confirm, got {other:?}"),
     }
 }
 
@@ -546,7 +558,7 @@ fn the_plugin_detail_renders_a_shrunk_problem_set_without_panicking() {
     app.services.checks = vec![check];
     let (rows, _) = render(&app);
     assert!(
-        rows.iter().any(|r| r.contains("wire mcp server")),
+        rows.iter().any(|r| r.contains("install plugin")),
         "the surviving problem still renders:\n{}",
         rows.join("\n")
     );
@@ -609,29 +621,24 @@ fn the_shunt_path_keys_truncate_on_the_shared_middle_ellipsis() {
     );
 }
 
-/// The Services detail value colouring follows the renamed keys: a boot
-/// failure is danger, an unwired server warns (what `present: no` was), and an
-/// absent install stays warning.
+/// The Services detail value colouring follows the mcp wording: a server that
+/// won't start is danger, an unregistered entry warns, an absent install stays
+/// warning, and the healthy words (`registered`, `ok`) read success.
 #[test]
 fn the_plugin_detail_tones_the_mcp_and_install_values() {
     use ratatui::style::Color;
     let _home = crate::testutil::HomeSandbox::new();
-    let app = app_with(Check {
-        label: "plugin",
-        health: Health::Warn,
-        detail: vec![
-            "mcp wired: no".to_string(),
-            "mcp server: failed (refused)".to_string(),
-            "installed: no (marketplace unknown)".to_string(),
-        ],
-        fix: None,
-        problems: Vec::new(),
-    });
-    let (rows, buf) = render(&app);
-
-    // The widest key here is `mcp server` (10), so every value starts 12 cells
-    // after its key column.
-    let value_fg = |key: &str| -> Color {
+    // The widest key in each fixture is `mcp server` (10), so every value
+    // starts 12 cells after its key column.
+    let value_fg = |detail: [&str; 3], key: &str| -> Color {
+        let app = app_with(Check {
+            label: "plugin",
+            health: Health::Warn,
+            detail: detail.iter().map(|s| s.to_string()).collect(),
+            fix: None,
+            problems: Vec::new(),
+        });
+        let (rows, buf) = render(&app);
         let row_idx = rows
             .iter()
             .position(|r| r.contains(key))
@@ -641,25 +648,43 @@ fn the_plugin_detail_tones_the_mcp_and_install_values() {
         buf.content[row_idx * W as usize + key_col + 12].fg
     };
 
+    let unhealthy = [
+        "installed: no (marketplace unknown)",
+        "mcp entry: not registered",
+        "mcp server: won't start (refused)",
+    ];
     assert_eq!(
-        value_fg("mcp wired"),
+        value_fg(unhealthy, "mcp entry"),
         super::theme::warning_color(),
-        "an unwired server warns"
+        "an unregistered entry warns"
     );
     assert_eq!(
-        value_fg("mcp server"),
+        value_fg(unhealthy, "mcp server"),
         super::theme::danger_color(),
-        "a boot failure is danger"
+        "a server that won't start is danger"
     );
     assert_eq!(
-        value_fg("installed"),
+        value_fg(unhealthy, "installed"),
         super::theme::warning_color(),
         "an absent install stays warning"
     );
+
+    let healthy = [
+        "installed: yes (user)",
+        "mcp entry: registered",
+        "mcp server: ok",
+    ];
+    for key in ["installed", "mcp entry", "mcp server"] {
+        assert_eq!(
+            value_fg(healthy, key),
+            super::theme::success_color(),
+            "a healthy `{key}` reads success"
+        );
+    }
 }
 
 /// From the list, `f` on the plugin row fixes the FIRST fixable problem shown
-/// (wire), never the second.
+/// (install), never the second.
 #[test]
 fn the_list_f_fixes_the_first_fixable_problem() {
     use crate::tui::app::{Modal, handle_key};
@@ -672,11 +697,11 @@ fn the_list_f_fixes_the_first_fixable_problem() {
         Some(Modal::Confirm(state)) => assert!(
             matches!(
                 state.on_confirm,
-                crate::tui::app::ConfirmAction::WireMcpServers
+                crate::tui::app::ConfirmAction::InstallPlugin
             ),
-            "list f fixes the first fixable problem (wire)"
+            "list f fixes the first fixable problem (install)"
         ),
-        other => panic!("expected a wire confirm, got {other:?}"),
+        other => panic!("expected an install confirm, got {other:?}"),
     }
 }
 

@@ -278,10 +278,11 @@ fn the_plugin_check_health_is_the_worst_of_the_four() {
     let check = super::plugin_check(None, Some(Some("1.2.3".to_string())), Some(McpProbe::Ok));
     assert_eq!(check.health, super::Health::Danger);
 
-    // clauth present, nothing wired or installed: both fixes warn.
+    // clauth present, nothing wired or installed: both fixes warn, and the
+    // install leads.
     let check = super::plugin_check(Some(&path), None, None);
     assert_eq!(check.health, super::Health::Warn);
-    assert_eq!(check.fix, Some(super::ServiceFix::WireMcpServers));
+    assert_eq!(check.fix, Some(super::ServiceFix::InstallPlugin));
 
     // A user-scope install wires the server and installs globally: ok, no fix.
     write_plugin_install("user");
@@ -302,11 +303,12 @@ fn the_plugin_check_health_is_the_worst_of_the_four() {
     assert_eq!(check.health, super::Health::Danger);
 }
 
-/// The folded plugin check carries every readout line in fold order (PATH,
-/// wiring, install, CC version), pinned by equality against the production
-/// builder — the four readouts plus the blank separators and the plain
-/// explanation line above each fix. Health is the worst, the problems walk in
-/// the same order, and the list `f` is the first problem's fix.
+/// The folded plugin check carries every readout line in cloudy's order (the
+/// install block, the mcp entry / server / source, then claude, path, data),
+/// pinned by equality against the production builder — the readouts plus the
+/// blank separators and the plain explanation line above each fix. Health is
+/// the worst, the problems walk in the same order, and the list `f` is the
+/// first problem's fix: the install.
 #[test]
 fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
     use crate::plugin_probe::McpProbe;
@@ -327,22 +329,22 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
             .unwrap_or_else(|_| "\u{2014}".to_string())
     );
     let expected = vec![
-        data_line,
-        "path: /usr/bin/clauth".to_string(),
-        "mcp wired: yes".to_string(),
-        "mcp source: plugin install (project)".to_string(),
-        "mcp server: boots".to_string(),
-        String::new(),
-        "wired for this project only, not global".to_string(),
-        "writes the clauth entry into ~/.claude.json".to_string(),
-        "f  wire mcp server".to_string(),
         "installed: yes (local)".to_string(),
         "version: 0.1.0".to_string(),
-        String::new(),
         "installed for this project only, not global".to_string(),
         "installs at user scope".to_string(),
         "f  install plugin".to_string(),
+        String::new(),
+        "mcp entry: registered".to_string(),
+        "mcp server: ok".to_string(),
+        "mcp source: plugin install (project)".to_string(),
+        "registered for this project only, not global".to_string(),
+        "writes the clauth entry into ~/.claude.json".to_string(),
+        "f  wire mcp server".to_string(),
+        String::new(),
         "claude: 1.2.3".to_string(),
+        "path: /usr/bin/clauth".to_string(),
+        data_line,
     ];
     assert_eq!(
         check.detail, expected,
@@ -351,8 +353,8 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
     assert_eq!(check.health, super::Health::Warn, "worst-of-four is warn");
     assert_eq!(
         check.fix,
-        Some(super::ServiceFix::WireMcpServers),
-        "list `f` fixes the first fixable problem shown"
+        Some(super::ServiceFix::InstallPlugin),
+        "list `f` fixes the first fixable problem shown: the install"
     );
     assert_eq!(
         check
@@ -360,7 +362,7 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
             .iter()
             .map(|p| (p.line, super::fix_verb(&p.fix)))
             .collect::<Vec<_>>(),
-        vec![(8, "wire mcp server"), (14, "install plugin")],
+        vec![(4, "install plugin"), (11, "wire mcp server")],
         "the problems carry their detail-line indices and walk in order"
     );
     assert!(
@@ -370,8 +372,8 @@ fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
     );
 }
 
-/// A manual global `~/.claude.json` wire reads `mcp wired: yes` and leaves no
-/// wire fix; the only remaining problem is the (absent) install.
+/// A manual global `~/.claude.json` wire reads `mcp entry: registered` and
+/// leaves no wire fix; the only remaining problem is the (absent) install.
 #[test]
 fn the_plugin_check_reads_a_global_wire_as_wired() {
     use crate::plugin_probe::McpProbe;
@@ -383,8 +385,8 @@ fn the_plugin_check_reads_a_global_wire_as_wired() {
         Some(McpProbe::Ok),
     );
     assert!(
-        check.detail.iter().any(|l| l == "mcp wired: yes"),
-        "a globally wired server reads wired: {:?}",
+        check.detail.iter().any(|l| l == "mcp entry: registered"),
+        "a globally wired server reads registered: {:?}",
         check.detail
     );
     assert!(
@@ -427,6 +429,74 @@ fn the_plugin_check_reads_a_user_install_as_healthy() {
         "no problems on a healthy global install"
     );
     assert!(check.fix.is_none());
+}
+
+/// The builder's fresh-box plugin detail (nothing installed, no `mcpServers`
+/// entry, nothing probed yet), whole: the three groups cloudy picked, each fix
+/// under its field.
+#[test]
+fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
+    let data_line = format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "installed: no (marketplace unknown)".to_string(),
+            "installs at user scope".to_string(),
+            "f  install plugin".to_string(),
+            String::new(),
+            "mcp entry: not registered".to_string(),
+            "mcp source: none".to_string(),
+            "writes the clauth entry into ~/.claude.json".to_string(),
+            "f  wire mcp server".to_string(),
+            String::new(),
+            "claude: press r to probe".to_string(),
+            "path: /usr/bin/clauth".to_string(),
+            data_line,
+        ],
+        "the fresh-box detail, by equality"
+    );
+    assert_eq!(
+        check.problems.iter().map(|p| p.line).collect::<Vec<_>>(),
+        vec![2, 7],
+        "each fix line's index"
+    );
+}
+
+/// On a fresh box (nothing installed, no `mcpServers` entry anywhere) list-level
+/// `f` on the plugin row opens the install confirm, never the manual wire: the
+/// install also registers the server, so it is the one fix such a box needs.
+#[test]
+fn list_f_on_a_fresh_box_opens_the_install_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    app.services.focus = super::ServicesFocus::List;
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('f')),
+    );
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => assert!(
+            matches!(state.on_confirm, super::ConfirmAction::InstallPlugin),
+            "list f on a fresh box installs, got {:?}",
+            state.on_confirm
+        ),
+        other => panic!("expected the install confirm, got {other:?}"),
+    }
 }
 
 /// A recent delegate rate-limit on any profile names itself in the delegates
@@ -519,7 +589,8 @@ fn enter_does_not_descend_into_the_delegates_detail() {
     );
 }
 
-/// The shunt row's readout: state + every field that has a value, in order —
+/// The shunt row's readout: every field that has a value, in cloudy's order
+/// (binary, config, version, state, reason, pid, port, restarts, last exit) —
 /// `restarts` and `last exit` only when the slot came from the daemon's feed,
 /// `reason` split onto indented sub-lines when it spans more than one line.
 #[test]
@@ -547,16 +618,16 @@ fn shunt_check_reads_the_slot_fields_in_order() {
     assert_eq!(
         check.detail,
         vec![
-            "state: healthy".to_string(),
-            "config: /home/u/.clauth/gateway.toml".to_string(),
             "binary: /usr/local/bin/shunt".to_string(),
-            "port: 3001".to_string(),
-            "pid: 4242".to_string(),
+            "config: /home/u/.clauth/gateway.toml".to_string(),
             "version: 0.49.1".to_string(),
-            "restarts: 2".to_string(),
+            "state: healthy".to_string(),
             "reason: TOML parse error at line 1".to_string(),
             "    |".to_string(),
             "  1 | foo =".to_string(),
+            "pid: 4242".to_string(),
+            "port: 3001".to_string(),
+            "restarts: 2".to_string(),
             "last exit: exit 1".to_string(),
         ],
         "every set field renders in order, a multi-line reason splits"
@@ -707,8 +778,8 @@ fn shunt_check_escapes_the_untrusted_slot_strings() {
     assert!(find("reason:").contains("\\u{202e}"), "reason is escaped");
 }
 
-/// A `foreign` slot names what answered on the bind port, so the red dot states
-/// its cause.
+/// A `foreign` slot names what answered on the bind port, beside the reason,
+/// so the red dot states its cause.
 #[test]
 fn shunt_check_renders_the_foreign_answerer() {
     use crate::daemon::gateway::{Answerer, GatewaySlot, GatewayState};
@@ -723,37 +794,33 @@ fn shunt_check_renders_the_foreign_answerer() {
         floor: "0.48.0".to_string(),
         restarts: 0,
         last_exit: None,
-        reason: None,
+        reason: Some("the port is held".to_string()),
         since: None,
+    };
+    let expect = |word: &str| {
+        vec![
+            "state: foreign".to_string(),
+            "reason: the port is held".to_string(),
+            format!("answerer: {word}"),
+            "port: 3001".to_string(),
+        ]
     };
     let check = super::shunt_check(&foreign(Some(Answerer::Shunt)), false);
     assert_eq!(
         check.detail,
-        vec![
-            "state: foreign".to_string(),
-            "port: 3001".to_string(),
-            "answerer: shunt".to_string()
-        ],
+        expect("shunt"),
         "a shunt-shaped foreign answerer names itself"
     );
     let check = super::shunt_check(&foreign(Some(Answerer::NotShunt)), false);
     assert_eq!(
         check.detail,
-        vec![
-            "state: foreign".to_string(),
-            "port: 3001".to_string(),
-            "answerer: not shunt".to_string()
-        ],
+        expect("not shunt"),
         "a non-shunt HTTP answerer names itself"
     );
     let check = super::shunt_check(&foreign(Some(Answerer::NoAnswer)), false);
     assert_eq!(
         check.detail,
-        vec![
-            "state: foreign".to_string(),
-            "port: 3001".to_string(),
-            "answerer: no answer".to_string()
-        ],
+        expect("no answer"),
         "a silent answerer names itself"
     );
 }
@@ -862,9 +929,9 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
     assert_eq!(
         shunt.detail,
         vec![
-            "state: unobserved".to_string(),
-            format!("config: {}", config.to_string_lossy()),
             "binary: shunt".to_string(),
+            format!("config: {}", config.to_string_lossy()),
+            "state: unobserved".to_string(),
             "the daemon runs the gateway".to_string(),
         ],
         "an unobserved record names the daemon as what would run the gateway"
@@ -12119,6 +12186,101 @@ fn herdr_check_warns_and_offers_fix_when_key_unbound() {
         &check.fix,
         Some(super::ServiceFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
     ));
+}
+
+/// The whole herdr detail in cloudy's order: the linked checkout's root first,
+/// then the plugin, the herdr version, key, sidebar, and the fix block last.
+#[test]
+fn herdr_check_reads_root_first_and_the_fix_last() {
+    let mut entry = herdr_entry(true, Some("0.8.0"), vec![]);
+    entry.source_kind = Some("local".into());
+    entry.plugin_root = Some("/home/u/src/clauth/herdr-plugin".into());
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), Some(entry), None),
+        Some(&herdr_config(true, None, SidebarState::Templated)),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "herdr: 0.8.2".to_string(),
+            "key: not bound".to_string(),
+            "sidebar: templated".to_string(),
+            "adds the keybinding and sidebar row to herdr's config".to_string(),
+            "f  heal herdr config".to_string(),
+        ],
+        "every line in order, by equality"
+    );
+    assert_eq!(
+        check.problems.iter().map(|p| p.line).collect::<Vec<_>>(),
+        vec![6],
+        "the fix line's index follows the reorder"
+    );
+
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), None, None),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: not installed".to_string(),
+            "herdr: 0.8.2".to_string(),
+            String::new(),
+            "  clauth herdr install".to_string(),
+        ],
+        "an uninstalled plugin leads with its verdict"
+    );
+
+    // The registry warnings follow `plugin`, the version follows them, and the
+    // floor warning sits under the version it compares.
+    let mut entry = herdr_entry(true, Some("0.8.0"), vec!["plugin root is gone"]);
+    entry.source_kind = Some("local".into());
+    entry.plugin_root = Some("/home/u/src/clauth/herdr-plugin".into());
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.7.0"), Some(entry.clone()), None),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "  plugin root is gone".to_string(),
+            "herdr: 0.7.0".to_string(),
+            "plugin needs herdr 0.8.0 or newer".to_string(),
+            "key: prefix+a".to_string(),
+            "sidebar: templated".to_string(),
+        ],
+        "warnings, version and floor warning in order"
+    );
+
+    // A probe error sits under the version, with or without a registry entry.
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), Some(entry), Some("boom: it broke")),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail[..5].to_vec(),
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "  plugin root is gone".to_string(),
+            "herdr: 0.8.2".to_string(),
+            "  boom: it broke".to_string(),
+        ],
+        "the error follows the version when an entry exists"
+    );
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), None, Some("boom: it broke")),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec!["herdr: 0.8.2".to_string(), "  boom: it broke".to_string()],
+        "with no entry the version and the error are the whole detail"
+    );
 }
 
 #[test]

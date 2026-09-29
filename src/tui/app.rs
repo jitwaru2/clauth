@@ -4297,7 +4297,8 @@ fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
 }
 
 /// The Services tab's `herdr` row: the installed herdr's clauth plugin plus the
-/// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
+/// keybinding/sidebar config `clauth herdr install` adds, read root, plugin,
+/// herdr version, key, sidebar, then the fix. Pure so the verdict
 /// logic unit-tests without an `App`; the caller supplies the probe and the
 /// config readout (`None` when the config file could not be read at all).
 pub(crate) fn herdr_check(
@@ -4305,10 +4306,10 @@ pub(crate) fn herdr_check(
     config: Option<&crate::herdr::ConfigStatus>,
 ) -> Check {
     let mut detail = Vec::new();
-    detail.push(match &probe.version {
+    let herdr_line = match &probe.version {
         Some(version) => format!("herdr: {version}"),
         None => "herdr: unknown".to_string(),
-    });
+    };
 
     let mut danger = false;
     let mut warn = false;
@@ -4316,9 +4317,9 @@ pub(crate) fn herdr_check(
     let mut problems: Vec<Problem> = Vec::new();
 
     // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
-    if let Some(error) = &probe.error {
+    let error_line = probe.error.as_ref().map(|error| format!("  {error}"));
+    if error_line.is_some() {
         danger = true;
-        detail.push(format!("  {error}"));
     }
 
     if let Some(entry) = &probe.entry {
@@ -4328,6 +4329,9 @@ pub(crate) fn herdr_check(
         if !entry.warnings.is_empty() {
             danger = true;
         }
+        if local && let Some(root) = &entry.plugin_root {
+            detail.push(format!("root: {root}"));
+        }
         if !entry.enabled {
             warn = true;
             detail.push("plugin: disabled".to_string());
@@ -4336,12 +4340,11 @@ pub(crate) fn herdr_check(
         } else {
             detail.push("plugin: installed (github)".to_string());
         }
-        if local && let Some(root) = &entry.plugin_root {
-            detail.push(format!("root: {root}"));
-        }
         for warning in &entry.warnings {
             detail.push(format!("  {warning}"));
         }
+        detail.push(herdr_line);
+        detail.extend(error_line);
         if !version_satisfies(probe.version.as_deref(), entry.min_herdr_version.as_deref()) {
             warn = true;
             detail.push(format!(
@@ -4379,7 +4382,6 @@ pub(crate) fn herdr_check(
         }
 
         if parsed && (config.and_then(|c| c.bound_key.as_deref()).is_none() || !templated) {
-            detail.push(String::new());
             detail.push("adds the keybinding and sidebar row to herdr's config".to_string());
             let line = detail.len();
             let fix = probe.config_path.clone().map(ServiceFix::HealHerdrConfig);
@@ -4392,9 +4394,13 @@ pub(crate) fn herdr_check(
             }
             fixed = fix;
         }
-    } else if probe.error.is_none() {
+    } else if let Some(error_line) = error_line {
+        detail.push(herdr_line);
+        detail.push(error_line);
+    } else {
         warn = true;
         detail.push("plugin: not installed".to_string());
+        detail.push(herdr_line);
         detail.push(String::new());
         detail.push("  clauth herdr install".to_string());
     }
@@ -4442,7 +4448,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 
     // `clauth mcp` boot self-probe — `r`-gated only (heavier than the other reads:
     // it spawns the real server). Cleared when clauth no longer resolves so a stale
-    // "boots" can't linger. Skipped under test so the suite never boots the server.
+    // "ok" can't linger. Skipped under test so the suite never boots the server.
     let clauth_path = probe::on_path("clauth");
     if refresh_version {
         app.services.fetching = true;
@@ -4601,21 +4607,27 @@ pub(crate) fn delegates_check(
 /// the verdict logic unit-tests without touching `status.json`.
 pub(crate) fn shunt_check(slot: &crate::daemon::gateway::GatewaySlot, supervised: bool) -> Check {
     let mut detail = Vec::new();
-    detail.push(format!("state: {}", gateway_state_word(slot.state)));
-    if let Some(config) = &slot.config {
-        detail.push(format!("config: {}", escape_control(config)));
-    }
     if let Some(binary) = &slot.binary {
         detail.push(format!("binary: {}", escape_control(binary)));
     }
-    if let Some(port) = slot.port {
-        detail.push(format!("port: {port}"));
-    }
-    if let Some(pid) = slot.pid {
-        detail.push(format!("pid: {pid}"));
+    if let Some(config) = &slot.config {
+        detail.push(format!("config: {}", escape_control(config)));
     }
     if let Some(version) = &slot.version {
         detail.push(format!("version: {}", escape_control(version)));
+    }
+    detail.push(format!("state: {}", gateway_state_word(slot.state)));
+    if let Some(reason) = &slot.reason {
+        // A multi-line reason (a TOML parse error with its snippet) splits onto
+        // one indented sub-line per further line instead of one garbled row; the
+        // detail renderer truncates each line to the pane.
+        let mut lines = reason.split('\n');
+        if let Some(first) = lines.next() {
+            detail.push(format!("reason: {}", escape_control(first)));
+        }
+        for line in lines {
+            detail.push(format!("  {}", escape_control(line)));
+        }
     }
     // A foreign answerer names what holds the port, so a red `foreign` dot
     // states its cause instead of leaving it to the state word alone.
@@ -4629,22 +4641,16 @@ pub(crate) fn shunt_check(slot: &crate::daemon::gateway::GatewaySlot, supervised
         };
         detail.push(format!("answerer: {word}"));
     }
+    if let Some(pid) = slot.pid {
+        detail.push(format!("pid: {pid}"));
+    }
+    if let Some(port) = slot.port {
+        detail.push(format!("port: {port}"));
+    }
     // `restarts` and `last exit` are figures only the daemon observed: on a
     // record-only slot they are literals nobody read, so they do not show.
     if supervised {
         detail.push(format!("restarts: {}", slot.restarts));
-    }
-    if let Some(reason) = &slot.reason {
-        // A multi-line reason (a TOML parse error with its snippet) splits onto
-        // one indented sub-line per further line instead of one garbled row; the
-        // detail renderer truncates each line to the pane.
-        let mut lines = reason.split('\n');
-        if let Some(first) = lines.next() {
-            detail.push(format!("reason: {}", escape_control(first)));
-        }
-        for line in lines {
-            detail.push(format!("  {}", escape_control(line)));
-        }
     }
     if supervised && let Some(exit) = &slot.last_exit {
         detail.push(format!("last exit: {exit}"));
@@ -4713,11 +4719,14 @@ fn escape_control(s: &str) -> String {
         .collect()
 }
 
-/// The `plugin` row: one detail holding clauth on PATH (+ the data dir), the
-/// mcpServers wiring (+ the `r`-gated boot probe), the plugin install, then the
-/// Claude Code version. Health is the worst of the four; the fixable problems
-/// walk in the same order. `clauth_path` is passed in (the recompute also gates
-/// the boot probe on it) so the verdict logic unit-tests without a live `PATH`.
+/// The `plugin` row: one detail holding the plugin install, the mcpServers
+/// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
+/// on PATH and the data dir, a blank line between the three groups. The
+/// install leads because installing is the fix a fresh box needs, and it also
+/// registers the server. Health is the worst of the four; the fixable problems
+/// walk in detail order, so list-level `f` installs first. `clauth_path` is
+/// passed in (the recompute also gates the start probe on it) so the verdict
+/// logic unit-tests without a live `PATH`.
 fn plugin_check(
     clauth_path: Option<&std::path::Path>,
     cc_version: Option<Option<String>>,
@@ -4727,90 +4736,13 @@ fn plugin_check(
 
     let mut detail: Vec<String> = Vec::new();
     let mut health = Health::Ok;
+    let mut problems: Vec<Problem> = Vec::new();
 
-    // clauth on PATH + the data dir.
-    detail.push(format!(
-        "data: {}",
-        crate::profile::clauth_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "\u{2014}".to_string())
-    ));
-    match &clauth_path {
-        Some(path) => detail.push(format!("path: {}", path.display())),
-        None => {
-            detail.push("path: not on PATH".to_string());
-            detail.push(
-                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
-            );
-            detail.push("install clauth so its bin directory is on PATH".to_string());
-            health = worst(health, Health::Danger);
-        }
-    }
-
-    // mcpServers wiring + boot probe. "global" == active in every project: a CC
-    // `user`-scope plugin install. A `local`/`project` install (or a `./.mcp.json`)
-    // binds clauth to one repo.
+    // "global" == active in every project: a CC `user`-scope plugin install. A
+    // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
     let records = probe::installed_records();
     let installed = !records.is_empty();
     let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
-    let wiring = probe::manual_mcp_wiring();
-    let wired = installed || wiring != probe::McpWiring::None;
-    let manual_global = wiring == probe::McpWiring::GlobalConfig;
-    // A manual `~/.claude.json` entry whose command/args no longer match the
-    // canonical launch line reads as wired but won't start the current server.
-    // Only the operative manual entry matters — a `user`-scope plugin install
-    // supersedes it, so drift under one is moot.
-    let drifted = manual_global && !plugin_global && probe::global_entry_drifted() == Some(true);
-    let globally_wired = plugin_global || (manual_global && !drifted);
-    let project_only = wired && !globally_wired && !drifted;
-    let source = if plugin_global {
-        "mcp source: plugin install (user)"
-    } else if manual_global {
-        "mcp source: ~/.claude.json (manual)"
-    } else if installed {
-        "mcp source: plugin install (project)"
-    } else if wiring == probe::McpWiring::ProjectFile {
-        "mcp source: ./.mcp.json (manual)"
-    } else {
-        "mcp source: none"
-    };
-    detail.push(format!("mcp wired: {}", if wired { "yes" } else { "no" }));
-    detail.push(source.to_string());
-    match &mcp_boot {
-        Some(probe::McpProbe::Ok) => detail.push("mcp server: boots".to_string()),
-        Some(probe::McpProbe::Failed(reason)) => {
-            detail.push(format!("mcp server: failed ({reason})"));
-        }
-        None => {}
-    }
-    let needs_wire = !globally_wired || drifted;
-    let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
-    health = worst(
-        health,
-        if boot_failed {
-            Health::Danger
-        } else if needs_wire {
-            Health::Warn
-        } else {
-            Health::Ok
-        },
-    );
-    let mut problems: Vec<Problem> = Vec::new();
-    if needs_wire {
-        detail.push(String::new());
-        if drifted {
-            detail.push("entry doesn't match the current launch line".to_string());
-        } else if project_only {
-            detail.push("wired for this project only, not global".to_string());
-        }
-        detail.push("writes the clauth entry into ~/.claude.json".to_string());
-        let line = detail.len();
-        detail.push(fix_line(&ServiceFix::WireMcpServers));
-        problems.push(Problem {
-            line,
-            fix: ServiceFix::WireMcpServers,
-        });
-    }
 
     // plugin install record — installed-only verdict (CC exposes no clean
     // per-scope "enabled" boolean, so the row reports presence + scope, not
@@ -4850,7 +4782,6 @@ fn plugin_check(
         if plugin_global {
             health = worst(health, Health::Ok);
         } else {
-            detail.push(String::new());
             detail.push("installed for this project only, not global".to_string());
             detail.push("installs at user scope".to_string());
             let line = detail.len();
@@ -4874,7 +4805,6 @@ fn plugin_check(
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        detail.push(String::new());
         detail.push("installs at user scope".to_string());
         let line = detail.len();
         detail.push(fix_line(&ServiceFix::InstallPlugin));
@@ -4885,7 +4815,76 @@ fn plugin_check(
         health = worst(health, Health::Warn);
     }
 
-    // Claude Code version, last.
+    // mcpServers entry + start probe.
+    detail.push(String::new());
+    let wiring = probe::manual_mcp_wiring();
+    let wired = installed || wiring != probe::McpWiring::None;
+    let manual_global = wiring == probe::McpWiring::GlobalConfig;
+    // A manual `~/.claude.json` entry whose command/args no longer match the
+    // canonical launch line reads as registered but won't start the current
+    // server. Only the operative manual entry matters — a `user`-scope plugin
+    // install supersedes it, so drift under one is moot.
+    let drifted = manual_global && !plugin_global && probe::global_entry_drifted() == Some(true);
+    let globally_wired = plugin_global || (manual_global && !drifted);
+    let project_only = wired && !globally_wired && !drifted;
+    detail.push(format!(
+        "mcp entry: {}",
+        if wired {
+            "registered"
+        } else {
+            "not registered"
+        }
+    ));
+    match &mcp_boot {
+        Some(probe::McpProbe::Ok) => detail.push("mcp server: ok".to_string()),
+        Some(probe::McpProbe::Failed(reason)) => {
+            detail.push(format!("mcp server: won't start ({reason})"));
+        }
+        None => {}
+    }
+    detail.push(
+        if plugin_global {
+            "mcp source: plugin install (user)"
+        } else if manual_global {
+            "mcp source: ~/.claude.json (manual)"
+        } else if installed {
+            "mcp source: plugin install (project)"
+        } else if wiring == probe::McpWiring::ProjectFile {
+            "mcp source: ./.mcp.json (manual)"
+        } else {
+            "mcp source: none"
+        }
+        .to_string(),
+    );
+    let needs_wire = !globally_wired || drifted;
+    let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
+    health = worst(
+        health,
+        if boot_failed {
+            Health::Danger
+        } else if needs_wire {
+            Health::Warn
+        } else {
+            Health::Ok
+        },
+    );
+    if needs_wire {
+        if drifted {
+            detail.push("entry doesn't match the current launch line".to_string());
+        } else if project_only {
+            detail.push("registered for this project only, not global".to_string());
+        }
+        detail.push("writes the clauth entry into ~/.claude.json".to_string());
+        let line = detail.len();
+        detail.push(fix_line(&ServiceFix::WireMcpServers));
+        problems.push(Problem {
+            line,
+            fix: ServiceFix::WireMcpServers,
+        });
+    }
+
+    // Claude Code version, then clauth on PATH + the data dir.
+    detail.push(String::new());
     match &cc_version {
         Some(Some(version)) => detail.push(format!("claude: {version}")),
         Some(None) => {
@@ -4899,9 +4898,26 @@ fn plugin_check(
         // a binary is absent.
         None => detail.push("claude: press r to probe".to_string()),
     }
+    match &clauth_path {
+        Some(path) => detail.push(format!("path: {}", path.display())),
+        None => {
+            detail.push("path: not on PATH".to_string());
+            detail.push(
+                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
+            );
+            detail.push("install clauth so its bin directory is on PATH".to_string());
+            health = worst(health, Health::Danger);
+        }
+    }
+    detail.push(format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    ));
 
     // List-focus `f` fixes the first fixable problem shown, in the same order
-    // the detail walk presents them (wire, then install).
+    // the detail walk presents them (install, then wire).
     let fix = problems.first().map(|p| p.fix.clone());
 
     Check {

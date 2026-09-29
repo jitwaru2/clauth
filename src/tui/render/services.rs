@@ -597,10 +597,11 @@ fn value_tone(key: &str, value: &str) -> Style {
     }
     let head = value.split_whitespace().next().unwrap_or(value);
     match (key, head) {
-        ("mcp wired" | "installed", "yes") => theme::success(),
-        ("mcp wired" | "installed", "no") => theme::warning(),
-        ("mcp server", "boots") => theme::success(),
-        ("mcp server", "failed") => theme::danger(),
+        ("installed", "yes") | ("mcp entry", "registered") | ("mcp server", "ok") => {
+            theme::success()
+        }
+        ("installed", "no") | ("mcp entry", "not") => theme::warning(),
+        ("mcp server", "won't") => theme::danger(),
         ("plugin", "linked") => theme::success(),
         ("plugin", "installed") => theme::success(),
         ("plugin", "disabled") => theme::warning(),
