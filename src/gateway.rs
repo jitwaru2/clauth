@@ -1303,24 +1303,25 @@ struct HealthBody {
     version: String,
 }
 
-/// `GET http://<addr>/health`, its connect and response phases bounded apart
-/// and together by [`HEALTH_PROBE_TIMEOUT`]. Only a refused connection reads
-/// as [`Health::Silent`], on every platform: a connect that times out, or a
-/// listener that takes the connection and never answers, is an error, never
-/// an empty port.
-pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
+/// `GET http://<addr>/health` under [`health_agent`]'s bounds: the status and
+/// body. Only a refused connection reads `None` (silent), on every platform: a
+/// connect that times out, or a listener that takes the connection and never
+/// answers, is an error, never an empty port. A non-200 status returns an
+/// empty body (its caller never reads it). The two probes parse the returned
+/// status/body their own way, so one trust-boundary HTTP read serves both.
+fn get_health(addr: SocketAddr) -> Result<Option<(u16, Vec<u8>)>> {
     let agent = health_agent();
     let url = format!("http://{addr}/health");
     let mut response = match agent.get(&url).call() {
         Ok(response) => response,
         Err(ureq::Error::Io(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-            return Ok(Health::Silent(GatewaySilent { addr }));
+            return Ok(None);
         }
         Err(e) => return Err(anyhow::Error::new(e).context(format!("GET {url}"))),
     };
     let status = response.status().as_u16();
     if status != 200 {
-        return Ok(Health::NotShunt { status });
+        return Ok(Some((status, Vec::new())));
     }
     let body = match response
         .body_mut()
@@ -1329,16 +1330,88 @@ pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
         .read_to_vec()
     {
         Ok(body) => body,
-        Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(Health::NotShunt { status }),
+        Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(Some((status, Vec::new()))),
         Err(e) => {
             return Err(anyhow::Error::new(e).context(format!("GET {url}: reading the body")));
         }
     };
+    Ok(Some((status, body)))
+}
+
+/// `GET http://<addr>/health`, its connect and response phases bounded apart
+/// and together by [`HEALTH_PROBE_TIMEOUT`]. Only a refused connection reads
+/// as [`Health::Silent`], on every platform: a connect that times out, or a
+/// listener that takes the connection and never answers, is an error, never
+/// an empty port.
+pub(crate) fn probe_health(addr: SocketAddr) -> Result<Health> {
+    let Some((status, body)) = get_health(addr)? else {
+        return Ok(Health::Silent(GatewaySilent { addr }));
+    };
+    if status != 200 {
+        return Ok(Health::NotShunt { status });
+    }
     Ok(match serde_json::from_slice::<HealthBody>(&body) {
         Ok(health) => Health::Shunt {
             version: health.version,
         },
         Err(_) => Health::NotShunt { status },
+    })
+}
+
+// ── the proxy /health probe ────────────────────────────────────────────────
+
+/// A clauth proxy's `/health` answer: `{status, service, version, contract}`,
+/// the core's `server.ts`. `service` is `None` when the body omits it, which
+/// the proxy supervisor refuses by name rather than treat as healthy.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProxyHealth {
+    pub(crate) status: String,
+    pub(crate) service: Option<String>,
+    pub(crate) version: String,
+    pub(crate) contract: String,
+}
+
+/// What answered `GET /health` at a proxy's bind address.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProxyProbe {
+    /// Nothing listens there: the connection was refused.
+    Silent,
+    /// A proxy-shaped `/health` body.
+    Answered(ProxyHealth),
+    /// Something answered, but not with a proxy `/health` body.
+    NotProxy { status: u16 },
+}
+
+#[derive(Deserialize)]
+struct ProxyHealthBody {
+    status: String,
+    #[serde(default)]
+    service: Option<String>,
+    version: String,
+    contract: String,
+}
+
+/// `GET http://<addr>/health`, parsed as a proxy's body, under
+/// [`health_agent`]'s bounds. Only a refused connection reads
+/// [`ProxyProbe::Silent`]; a body missing a required field reads
+/// [`ProxyProbe::NotProxy`], and a body missing `service` alone reads
+/// [`ProxyProbe::Answered`] with `service: None`, which the caller refuses by
+/// name.
+pub(crate) fn probe_proxy_health(addr: SocketAddr) -> Result<ProxyProbe> {
+    let Some((status, body)) = get_health(addr)? else {
+        return Ok(ProxyProbe::Silent);
+    };
+    if status != 200 {
+        return Ok(ProxyProbe::NotProxy { status });
+    }
+    Ok(match serde_json::from_slice::<ProxyHealthBody>(&body) {
+        Ok(health) => ProxyProbe::Answered(ProxyHealth {
+            status: health.status,
+            service: health.service,
+            version: health.version,
+            contract: health.contract,
+        }),
+        Err(_) => ProxyProbe::NotProxy { status },
     })
 }
 
@@ -1918,6 +1991,32 @@ pub(crate) fn run_bounded(
     bound: Duration,
     stdout_limit: Option<usize>,
 ) -> Result<Bounded> {
+    run_bounded_impl(command, binary, bound, stdout_limit, None)
+}
+
+/// [`run_bounded`] under a cancellation flag: once `cancel` is set the child
+/// is killed and reaped at once and the run reports the cancellation, instead
+/// of waiting its bound out. `cancel` is the stop signal a supervisor shares
+/// with its thread, so a shutdown preempts a proxy's `manifest` read.
+pub(crate) fn run_bounded_cancellable(
+    command: &mut Command,
+    binary: &Path,
+    bound: Duration,
+    stdout_limit: Option<usize>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Bounded> {
+    run_bounded_impl(command, binary, bound, stdout_limit, Some(cancel))
+}
+
+fn run_bounded_impl(
+    command: &mut Command,
+    binary: &Path,
+    bound: Duration,
+    stdout_limit: Option<usize>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Bounded> {
+    use std::sync::atomic::Ordering;
+
     command
         .stdin(Stdio::null())
         .stdout(if stdout_limit.is_some() {
@@ -1942,6 +2041,15 @@ pub(crate) fn run_bounded(
         .map(|pipe| drain_output(pipe, CHECK_STDERR_LIMIT));
     let deadline = Instant::now() + bound;
     let status = loop {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+            // A stop asked for while the child ran: kill and reap it now, the
+            // caller is ending and must not wait the bound out.
+            let _ = child.kill();
+            child
+                .wait()
+                .with_context(|| format!("failed to reap {}", binary.display()))?;
+            return Err(anyhow!("{} was cancelled while it ran", binary.display()));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(CHECK_POLL_INTERVAL),

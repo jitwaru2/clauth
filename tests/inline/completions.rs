@@ -487,6 +487,14 @@ fn fish_keeps_the_profile_verb_offers_out_of_proxy_enable_and_disable() {
             r#"complete -c clauth -f -n "__fish_seen_subcommand_from disable; and not __fish_seen_subcommand_from proxy" -a -y -d "Skip the confirm prompt""#,
             r#"__fish_seen_subcommand_from disable" -a -y"#,
         ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --all -d "Also list disabled profiles""#,
+            r#"__fish_seen_subcommand_from list" -a --all"#,
+        ),
+        (
+            r#"complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --disabled -d "Also list disabled profiles""#,
+            r#"__fish_seen_subcommand_from list" -a --disabled"#,
+        ),
     ] {
         assert!(
             FISH.lines().any(|line| line == guarded),
@@ -642,15 +650,18 @@ fn subcommand_branch(shell: &str, script: &str, name: &str) -> Option<String> {
         // zsh pins it in `[[ "${words[2]}" == … ]]`, bare or as an alternation.
         "zsh" => guarded_arms(script, |guard| zsh_word_matches(guard, 2, name)),
         // fish pins it in a `__fish_seen_subcommand_from` condition, which may
-        // name several subcommands, and chains them with `; and `. A chained
-        // line's first group reads `devices;`, so the token compare strips the
-        // separator.
+        // name several subcommands, and chains them with `; and `. Only the
+        // FIRST group names the subcommand's own position; a later group is a
+        // nested verb (`proxy; and __fish_seen_subcommand_from list` is the
+        // `proxy list` verb, not the top-level `list` branch), so the token
+        // compare reads the first group alone.
         "fish" => joined(script.lines().filter(|l| {
             l.split("__fish_seen_subcommand_from ")
-                .skip(1)
-                .filter_map(|rest| rest.split('"').next())
-                .any(|list| {
-                    list.split_whitespace()
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .is_some_and(|first| {
+                    first
+                        .split_whitespace()
                         .any(|w| w.trim_end_matches(';') == name)
                 })
         })),
@@ -779,8 +790,8 @@ fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
         assert!(offers_token(&list, "--all"), "{shell}: list offers --all");
         assert!(
             !offers_token(&list, "--json"),
-            "{shell}: `list` takes no --json, so its branch must not span the \
-             sibling branches that do",
+            "{shell}: the `list` branch must not span the sibling `proxy list` \
+             branch that takes --json",
         );
         assert!(
             subcommand_branch(shell, script, "nonesuch").is_none(),

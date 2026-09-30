@@ -107,6 +107,72 @@ pub fn write_stub(dir: &Path) -> PathBuf {
     path
 }
 
+/// Write a stub `clauth-<service>-proxy` into `dir` and create the pipe it
+/// holds. `manifest` records its pid in `dir/manifests`, sleeps 3 s when the
+/// `slow-manifest` marker is present, and prints the manifest JSON, its
+/// `version`, `contract` and `drain_secs` steered by the `version`, `contract`
+/// and `drain` marker files (defaults `1.2.0`, `1.0`, `0`); `serve` records
+/// its argv, cwd and the three `CLAUTH_PROXY_*` variables, answers `/health`
+/// through the named pipe, and records each SIGTERM, waiting `drain` seconds
+/// before it dies. Files in `dir` steer a run: `ignore-term` (record TERM and
+/// live on), `no-health` (skip the pipe).
+pub fn write_proxy_stub(dir: &Path, service: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("stub dir");
+    let fifo = dir.join("fifo");
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "mkfifo {}", fifo.display());
+    let path = dir.join(format!("clauth-{service}-proxy"));
+    let script = format!(
+        "#!/bin/sh\n\
+         d='{dir}'\n\
+         if [ \"$1\" = \"manifest\" ]; then\n\
+         \x20 echo \"$$\" >> \"$d/manifests\"\n\
+         \x20 if [ -e \"$d/slow-manifest\" ]; then sleep 3; fi\n\
+         \x20 ver=\"$(cat \"$d/version\" 2>/dev/null || echo 1.2.0)\"\n\
+         \x20 con=\"$(cat \"$d/contract\" 2>/dev/null || echo 1.0)\"\n\
+         \x20 drain=\"$(cat \"$d/drain\" 2>/dev/null || echo 0)\"\n\
+         \x20 printf '{{\"service\":\"{service}\",\"display_name\":\"\",\"version\":\"%s\",\"contract\":\"%s\",\"capabilities\":[],\"drain_secs\":%s}}\\n' \"$ver\" \"$con\" \"$drain\"\n\
+         \x20 exit 0\n\
+         fi\n\
+         if [ ! \"$1\" = \"serve\" ]; then exit 2; fi\n\
+         if [ -e \"$d/ignore-term\" ]; then\n\
+         \x20 trap 'echo \"term $$\" >> \"$d/signals\"' TERM\n\
+         else\n\
+         \x20 trap 'echo \"term $$\" >> \"$d/signals\"; trap - TERM; drain=\"$(cat \"$d/drain\" 2>/dev/null || echo 0)\"; sleep \"$drain\"; kill -s TERM $$' TERM\n\
+         fi\n\
+         {{\n\
+         \x20 echo \"pid $$\"\n\
+         \x20 echo \"bin $0\"\n\
+         \x20 for a in \"$@\"; do echo \"arg $a\"; done\n\
+         \x20 echo \"cwd $(pwd -P)\"\n\
+         \x20 env | grep -e '^CLAUTH_PROXY_' | LC_ALL=C sort | sed 's/^/env /'\n\
+         \x20 echo end\n\
+         }} >> \"$d/calls\"\n\
+         echo \"proxy stub stdout $$\"\n\
+         echo \"proxy stub stderr $$\" >&2\n\
+         if [ ! -e \"$d/no-health\" ]; then exec 3>\"$d/fifo\"; fi\n\
+         i=0\n\
+         while [ \"$i\" -lt {STUB_LIFETIME_SECS} ]; do\n\
+         \x20 sleep 1 3>&- &\n\
+         \x20 wait $!\n\
+         \x20 i=$((i + 1))\n\
+         done\n",
+        dir = dir.display(),
+        service = service,
+    );
+    std::fs::write(&path, script).expect("write the proxy stub");
+    let chmod = Command::new("chmod")
+        .args(["755"])
+        .arg(&path)
+        .status()
+        .expect("run chmod");
+    assert!(chmod.success(), "chmod the proxy stub");
+    path
+}
+
 /// One recorded run of the stub.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -400,10 +466,39 @@ pub struct HealthServer {
 
 impl HealthServer {
     pub fn start(stub_dir: &Path, port: u16, version: &str) -> Self {
+        let body = format!(r#"{{"status":"ok","version":"{version}"}}"#);
+        Self::start_body(stub_dir, port, body)
+    }
+
+    /// `/health` answered with a proxy's body while the stub holds the pipe.
+    pub fn start_proxy(
+        stub_dir: &Path,
+        port: u16,
+        service: &str,
+        version: &str,
+        contract: &str,
+    ) -> Self {
+        let body = format!(
+            r#"{{"status":"ok","service":"{service}","version":"{version}","contract":"{contract}"}}"#
+        );
+        Self::start_body(stub_dir, port, body)
+    }
+
+    /// A proxy `/health` lacking the `service` field, for the refusal.
+    pub fn start_proxy_without_service(
+        stub_dir: &Path,
+        port: u16,
+        version: &str,
+        contract: &str,
+    ) -> Self {
+        let body = format!(r#"{{"status":"ok","version":"{version}","contract":"{contract}"}}"#);
+        Self::start_body(stub_dir, port, body)
+    }
+
+    fn start_body(stub_dir: &Path, port: u16, body: String) -> Self {
         let fifo = stub_dir.join("fifo");
         let stop = Arc::new(AtomicBool::new(false));
         let serving = Arc::new(AtomicBool::new(false));
-        let body = format!(r#"{{"status":"ok","version":"{version}"}}"#);
         let thread = std::thread::spawn({
             let (fifo, stop, serving) = (fifo.clone(), Arc::clone(&stop), Arc::clone(&serving));
             move || {

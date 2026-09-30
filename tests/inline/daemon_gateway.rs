@@ -21,7 +21,7 @@ use crate::testutil::HomeSandbox;
 
 #[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
-mod stub;
+pub(crate) mod stub;
 
 /// The injected wall clock every stepped test starts at, and its stamps.
 #[cfg(unix)]
@@ -2000,5 +2000,100 @@ fn a_supervisor_that_panics_is_logged_as_a_panic() {
             "clauth daemon: the shunt gateway supervisor panicked; the next daemon start finishes the stop"
         ],
         "the panic is logged as a panic, and nothing else is"
+    );
+}
+
+// ── the shipped gateway's baseline behaviour (adopted from the reviewer's
+// probes; each pinned against `7e60b8e9`) ─────────────────────────────────────
+
+/// A below-floor answer keeps the version read on the `stopping` slot, the
+/// way baseline did: `running.version` is set before `begin_stop`.
+#[cfg(unix)]
+#[test]
+fn a_below_floor_stopping_slot_carries_the_version_read() {
+    let rig = Rig::new("0.47.0");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    let _ = rig.only_call();
+    rig.server.wait_serving(true);
+    let mut seen = None;
+    stub::wait_until("a stopping or below-floor slot", secs(10), || {
+        supervisor.step(t0.after(secs(1)));
+        let slot = rig.slot();
+        if slot.state == GatewayState::Stopping && seen.is_none() {
+            seen = Some(slot.clone());
+        }
+        slot.state == GatewayState::Stopping || slot.state == GatewayState::BelowFloor
+    });
+    let stopping = seen.expect("the stop publishes a stopping slot first");
+    assert_eq!(
+        stopping.version.as_deref(),
+        Some("0.47.0"),
+        "stopping slot: {stopping:?}"
+    );
+}
+
+/// A spawn error's `reason` names the binary path, the bad input, as baseline
+/// did.
+#[cfg(unix)]
+#[test]
+fn a_spawn_error_reason_names_the_binary() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let rig = Rig::new("0.49.1");
+    fs::set_permissions(&rig.binary, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    let slot = rig.slot();
+    assert_eq!(slot.state, GatewayState::Misconfigured, "{slot:?}");
+    assert_eq!(
+        slot.reason,
+        Some(format!(
+            "cannot run {}: Permission denied (os error 13)",
+            rig.binary.display()
+        )),
+        "{slot:?}"
+    );
+}
+
+/// A misconfigured gateway logs its reason once per distinct reason, not once
+/// per retry round.
+#[cfg(unix)]
+#[test]
+fn a_misconfigured_gateway_logs_its_reason_once() {
+    let rig = Rig::new("0.49.1");
+    fs::remove_file(&rig.env_file).expect("remove the env file");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    assert_eq!(rig.slot().state, GatewayState::Misconfigured);
+    supervisor.step(t0.after(secs(5)));
+    supervisor.step(t0.after(secs(10)));
+    let lines: Vec<String> = rig
+        .lines
+        .snapshot()
+        .into_iter()
+        .filter(|line| line.starts_with("clauth daemon: cannot start the shunt gateway: "))
+        .collect();
+    assert_eq!(lines.len(), 1, "one line per distinct reason: {lines:?}");
+}
+
+/// A missing binary's line names the binary path and the fix, as baseline did.
+#[cfg(unix)]
+#[test]
+fn a_missing_binary_line_names_the_binary_and_the_fix() {
+    let rig = Rig::new("0.49.1");
+    let missing = rig.home.home().join("bin").join("shunt");
+    rig.save(|record| record.binary = Some(missing.clone()));
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    let expected = format!(
+        "clauth daemon: cannot start the shunt gateway: {} not found; install shunt or point the gateway at its binary",
+        missing.display()
+    );
+    assert!(
+        rig.lines.snapshot().contains(&expected),
+        "lines: {:?}",
+        rig.lines.snapshot()
     );
 }

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::gateway::{GatewaySlot, slot_or_record};
+use super::proxies::ProxySlot;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -95,6 +96,11 @@ pub(crate) struct LiveSignals<'a> {
     /// single-shot or before the supervisor's first publish, where the slot
     /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
     pub(crate) gateway: Option<&'a GatewaySlot>,
+    /// The per-proxy slots the daemon's supervisors last published, in
+    /// service-name order. `None` single-shot or before the supervisors'
+    /// first publish, where each slot reads its row alone
+    /// ([`super::proxies::unsupervised_slot`]).
+    pub(crate) proxies: Option<&'a [ProxySlot]>,
 }
 
 fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -674,6 +680,12 @@ pub(crate) struct StatusBody {
     #[serde(default)]
     #[schema(required = true)]
     pub(crate) gateway: Option<GatewaySlot>,
+    /// Additive: the managed proxies, one object per registry row, the array
+    /// `GET /api/v1/proxies` serves. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) proxies: Vec<ProxySlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -710,6 +722,7 @@ pub(crate) fn build_status(
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
+        proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         profiles,
     }
 }

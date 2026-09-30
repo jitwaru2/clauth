@@ -63,9 +63,11 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--no-config --yes -y" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "proxy" ]; then
-        COMPREPLY=( $(compgen -W "enable disable check" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "list enable disable check" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "enable" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--port" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && { [ "$prev" = "--admin-token-file" ] || [ "$prev" = "--key-file" ]; }; then
         COMPREPLY=( $(compgen -f -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "proxy" ] && [ "${COMP_WORDS[2]}" = "check" ] && [ "${cur:0:2}" = "--" ]; then
@@ -156,11 +158,14 @@ _clauth() {
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == herdr && "${words[3]}" == uninstall ]]; then
         _values 'flag' '--no-config[leave herdr'"'"'s config.toml alone]' '--yes[skip both confirm prompts]' '-y[skip both confirm prompts]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == proxy ]]; then
-        _values 'subcommand' 'enable[record a proxy found on PATH, for the daemon to run]' \
+        _values 'subcommand' 'list[show every clauth proxy on PATH or registered, with its live state]' \
+            'enable[record a proxy found on PATH, for the daemon to run]' \
             'disable[stop running a proxy, keeping its port, admin token and state]' \
             'check[check a running proxy against the clauth proxy contract]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == enable ]]; then
         _values 'flag' '--port[loopback port to serve on, first enable only]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == list ]]; then
+        _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check && "${words[CURRENT-1]}" == (--admin-token-file|--key-file) ]]; then
         _files
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == proxy && "${words[3]}" == check ]]; then
@@ -265,10 +270,12 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --no-config -d "Leave herdr's config.toml alone"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall" -a --yes -d "Skip both confirm prompts"
 complete -c clauth -f -n __fish_is_first_token -a proxy -d "Register clauth-compatible proxies and check them against the contract"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a list -d "Show every clauth proxy on PATH or registered, with its live state"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a enable -d "Record a proxy found on PATH, for the daemon to run"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a disable -d "Stop running a proxy, keeping its port, admin token and state"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy" -a check -d "Check a running proxy against the clauth proxy contract"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from enable" -a --port -d "Loopback port to serve on, first enable only"
+complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from list" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --admin-token-file -d "File holding the proxy admin token"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --key-file -d "File holding an inference key of one of its accounts"
 complete -c clauth -f -n "__fish_seen_subcommand_from proxy; and __fish_seen_subcommand_from check" -a --destructive -d "Also run the mutating routes for real on this account"
@@ -304,8 +311,8 @@ complete -c clauth -f -n "__fish_seen_subcommand_from limit-reset" -a -y -d "Ski
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --all -d "Also list disabled profiles"
-complete -c clauth -f -n "__fish_seen_subcommand_from list" -a --disabled -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --all -d "Also list disabled profiles"
+complete -c clauth -f -n "__fish_seen_subcommand_from list; and not __fish_seen_subcommand_from proxy" -a --disabled -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "Wait and take over when the running daemon exits"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"

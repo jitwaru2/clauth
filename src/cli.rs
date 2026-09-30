@@ -706,6 +706,17 @@ pub(crate) enum HerdrCommand {
 /// `clauth proxy <cmd>`.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProxyCommand {
+    /// Show every clauth proxy on PATH or registered, with its live state
+    ///
+    /// One row per `clauth-<service>-proxy` binary on PATH or registered with
+    /// `clauth proxy enable`, joined with the running daemon's live state:
+    /// service, version, contract, enabled, port and state.
+    List {
+        /// Emit a stable array of objects instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Record a proxy found on PATH, for the daemon to run
     ///
     /// Reads `clauth-<service>-proxy manifest` and refuses a proxy speaking a

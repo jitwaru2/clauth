@@ -17,7 +17,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::gateway::{AdminToken, Bounded, MIN_ADMIN_KEY_LEN, ensure_token_file, run_bounded};
+use crate::gateway::{
+    AdminToken, Bounded, MIN_ADMIN_KEY_LEN, ensure_token_file, run_bounded, run_bounded_cancellable,
+};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::plugin_probe::is_executable;
 use crate::profile::{atomic_write_600, clauth_dir, mkdir_700, read_toml_file};
@@ -103,25 +105,22 @@ pub(crate) fn state_dir(service: &Service) -> Result<PathBuf> {
     Ok(clauth_dir()?.join("proxies").join(service.as_str()))
 }
 
+/// `~/.clauth/proxies/`, the root holding one state dir per service.
+pub(crate) fn proxies_dir() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join("proxies"))
+}
+
 /// The proxy's admin token, its `CLAUTH_PROXY_ADMIN_TOKEN_FILE`.
 pub(crate) fn admin_token_path(service: &Service) -> Result<PathBuf> {
     Ok(state_dir(service)?.join("clauth-admin-token"))
 }
 
 /// The supervisor's record of the proxy it spawned.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the per-proxy supervisor writes it")
-)]
 pub(crate) fn child_marker_path(service: &Service) -> Result<PathBuf> {
     Ok(state_dir(service)?.join("clauth-child.json"))
 }
 
 /// The proxy's stdout and stderr, as the supervisor captures them.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the per-proxy supervisor writes it")
-)]
 pub(crate) fn log_path(service: &Service) -> Result<PathBuf> {
     Ok(state_dir(service)?.join("clauth.log"))
 }
@@ -227,6 +226,11 @@ impl Registry {
 
     pub(crate) fn get(&self, service: &Service) -> Option<&ProxyRow> {
         self.rows.get(service)
+    }
+
+    /// Every row, in service-name order, for the daemon's per-row supervisors.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&Service, &ProxyRow)> {
+        self.rows.iter()
     }
 
     /// The service whose row holds `port`.
@@ -516,13 +520,44 @@ pub(crate) fn read_manifest(service: &Service, binary: &Path) -> Result<Manifest
     read_manifest_within(service, binary, MANIFEST_TIMEOUT)
 }
 
+/// [`read_manifest`] under a cancellation flag: a stop set while the `manifest`
+/// child runs kills and reaps it at once, so a shutdown preempts a wedged read
+/// instead of waiting its bound out.
+pub(crate) fn read_manifest_cancellable(
+    service: &Service,
+    binary: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Manifest> {
+    read_manifest_within_cancel(service, binary, MANIFEST_TIMEOUT, Some(cancel))
+}
+
 /// [`read_manifest`] under `bound`.
 fn read_manifest_within(service: &Service, binary: &Path, bound: Duration) -> Result<Manifest> {
+    read_manifest_within_cancel(service, binary, bound, None)
+}
+
+/// [`read_manifest_within`] under an optional cancellation flag.
+fn read_manifest_within_cancel(
+    service: &Service,
+    binary: &Path,
+    bound: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Manifest> {
     let refuse = |refusal: ManifestRefusal| Err(refusal.into());
     let path = binary.to_path_buf();
     let mut command = Command::new(binary);
     command.arg("manifest");
-    let exited = match run_bounded(&mut command, binary, bound, Some(MANIFEST_STDOUT_LIMIT + 1))? {
+    let bounded = match cancel {
+        Some(cancel) => run_bounded_cancellable(
+            &mut command,
+            binary,
+            bound,
+            Some(MANIFEST_STDOUT_LIMIT + 1),
+            cancel,
+        ),
+        None => run_bounded(&mut command, binary, bound, Some(MANIFEST_STDOUT_LIMIT + 1)),
+    };
+    let exited = match bounded? {
         Bounded::Missing => return refuse(ManifestRefusal::Missing { binary: path }),
         Bounded::TimedOut => {
             return refuse(ManifestRefusal::TimedOut {

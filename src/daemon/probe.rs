@@ -166,6 +166,39 @@ pub(crate) fn gateway_slot(health: DaemonHealth) -> (super::gateway::GatewaySlot
     }
 }
 
+/// The managed proxies' slots for `clauth proxy list` (and the P8 TUI): with a
+/// fresh daemon, the `proxies` array the daemon published in `status.json`
+/// (the supervisors' live reads); otherwise the record-only entries
+/// ([`super::proxies::entries`] over no live slots). A fresh daemon whose feed
+/// cannot be read, whose `proxies` key is absent (an older daemon), or whose
+/// array this binary cannot parse falls back to the record-only entries rather
+/// than guessing a state — the [`gateway_slot`] discipline, for the array.
+pub(crate) fn proxy_slots(health: DaemonHealth) -> Vec<super::proxies::ProxySlot> {
+    if health != DaemonHealth::Fresh {
+        return super::proxies::entries(None);
+    }
+    let Ok(dir) = clauth_dir() else {
+        return super::proxies::entries(None);
+    };
+    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
+        return super::proxies::entries(None);
+    };
+    // Parse only the `proxies` key: one unrelated profile entry that this
+    // binary cannot read must not discard a fresh daemon's slots.
+    #[derive(serde::Deserialize)]
+    struct ProxiesFeed {
+        #[serde(default)]
+        proxies: Option<Vec<super::proxies::ProxySlot>>,
+    }
+    let Ok(feed) = serde_json::from_str::<ProxiesFeed>(&body) else {
+        return super::proxies::entries(None);
+    };
+    match feed.proxies {
+        Some(slots) => slots,
+        None => super::proxies::entries(None),
+    }
+}
+
 /// What a starting `clauth daemon` is allowed to become (#57).
 ///
 /// Standby exists because a supervisor's instance must be able to take over
@@ -449,6 +482,7 @@ pub(crate) fn stop_running_with(
         return Ok(DaemonStop::Replaced);
     }
     super::gateway::stop_left_behind_gateway();
+    super::proxies::stop_left_behind_proxies();
     Ok(DaemonStop::Stopped)
 }
 

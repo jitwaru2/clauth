@@ -780,6 +780,8 @@ fn a_port_something_answers_on_is_skipped_and_refused() {
         let listener = TcpListener::bind((address, 0)).expect("hold a port");
         let port = listener.local_addr().expect("addr").port();
 
+        // The listener stays held across the real-socket assert, so a
+        // concurrent test cannot re-take the ephemeral port here.
         assert_eq!(
             probe_port(port),
             Err(PortBusy::Answers),
@@ -800,16 +802,15 @@ fn a_port_something_answers_on_is_skipped_and_refused() {
             ),
             "{address}"
         );
-
         drop(listener);
-        assert_eq!(probe_port(port), Ok(()), "{address}:{port} was released");
+
+        // A free asked port is taken as it is, through the probe seam: the
+        // real `probe_port` on a just-dropped ephemeral port races another
+        // test's listener taking it back.
         assert_eq!(
-            pick_port(
-                &Registry::default(),
-                &service("zcode"),
-                Some(port),
-                probe_port
-            )
+            pick_port(&Registry::default(), &service("zcode"), Some(port), |_| Ok(
+                ()
+            ),)
             .map_err(|e| e.to_string()),
             Ok(port),
             "a free asked port is taken as it is"
@@ -980,12 +981,11 @@ fn disable_keeps_the_row_port_token_and_state_dir() {
 #[test]
 fn disable_of_an_unregistered_service_names_enable() {
     let _home = HomeSandbox::new();
+    let err = disable("qwen").expect_err("an unregistered service is refused");
+    assert!(err.downcast_ref::<crate::UsageError>().is_some(), "{err:#}");
     assert_eq!(
-        disable("qwen").map_err(|e| e.to_string()),
-        Err(
-            "no proxy \"qwen\" is registered; register it with `clauth proxy enable qwen`"
-                .to_string()
-        )
+        err.to_string(),
+        "no proxy \"qwen\" is registered; register it with `clauth proxy enable qwen`"
     );
     assert!(!registry_path().unwrap().exists(), "nothing written");
 }

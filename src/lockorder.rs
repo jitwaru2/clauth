@@ -254,6 +254,10 @@ pub(crate) mod rank {
         /// one clone or one assignment, with no IO, probe or child wait under
         /// it.
         GatewayPublished = 1900;
+        /// A managed proxy's published slot (`daemon::proxies`): one shared map
+        /// for the kind, same leaf discipline as the gateway's. One rank for
+        /// the kind, so the ranks never nest.
+        ProxyPublished = 1901;
     }
 }
 

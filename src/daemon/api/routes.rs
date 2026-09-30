@@ -39,6 +39,7 @@ pub(crate) use super::http::ErrorBody;
 use super::http::{Request, Response, flatten_control_chars, sanitize_for_log};
 use super::pairing::{self, Code, Redeemed};
 use super::panes::{self, PaneProbe};
+use super::proxies;
 use super::sessions;
 use super::terminal;
 
@@ -262,6 +263,18 @@ pub(crate) static ROUTES: &[Route] = &[
         path: "/gateway",
         access: Access::View,
         handler: gateway::gateway,
+    },
+    Route {
+        method: "GET",
+        path: "/proxies",
+        access: Access::View,
+        handler: proxies::proxies,
+    },
+    Route {
+        method: "HEAD",
+        path: "/proxies",
+        access: Access::View,
+        handler: proxies::proxies,
     },
 ];
 
@@ -974,7 +987,7 @@ fn pair(_: &ApiContext, req: &Request, caller: &Caller<'_>) -> Response {
 /// endpoint cannot ship undocumented.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway),
+    paths(health, status, events, switch, chain::order, chain::threshold, chain::wrap_off, pair, openapi_document, panes::panes, sessions::sessions, sessions::session_history, create::create, agent::prompt, agent::keys, gateway::gateway, proxies::proxies),
     modifiers(&BearerScheme)
 )]
 struct ApiDoc;

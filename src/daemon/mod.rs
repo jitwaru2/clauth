@@ -16,6 +16,7 @@ pub(crate) mod api;
 pub(crate) mod gateway;
 pub(crate) mod log_rotate;
 mod probe;
+pub(crate) mod proxies;
 mod status_json;
 mod tick;
 mod types;
@@ -23,7 +24,9 @@ mod types;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
-pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health, gateway_slot, singleton_held};
+pub(crate) use probe::{
+    DaemonHealth, FetchLease, daemon_health, gateway_slot, proxy_slots, singleton_held,
+};
 /// The TUI's `stop daemon`: `--replace`'s termination with no claim after it.
 pub(crate) use probe::{DaemonStop, stop_running};
 #[cfg(test)]
@@ -459,14 +462,25 @@ pub(crate) fn serve(
     }
 
     // After the listener, the last start step that can fail, so a start that
-    // dies leaves no gateway behind; before `run`, which never returns, so
-    // the supervisor (or the signal watcher holding it) lives as long as the
-    // process. A standby reaches this only once promoted: the gateway runs
-    // under the singleton's holder alone.
-    let _supervisor = match gateway::start(Arc::clone(&daemon.gateway), &lock) {
-        Ok(supervisor) => gateway::stop_on_signal(supervisor),
-        Err(e) => {
+    // dies leaves no child behind; before `run`, which never returns, so the
+    // supervisors (or the signal watcher holding them) live as long as the
+    // process. A standby reaches this only once promoted: the gateway and the
+    // proxies run under the singleton's holder alone.
+    let gateway = gateway::start(Arc::clone(&daemon.gateway), &lock);
+    let proxies = proxies::start(Arc::clone(&daemon.proxies), &lock);
+    let _supervisor = match (gateway, proxies) {
+        (Ok(gateway), Ok(proxies)) => gateway::stop_on_signal(Some(gateway), proxies),
+        (Ok(gateway), Err(e)) => {
+            logline!("clauth daemon: {e:#}; proxies are not supervised");
+            gateway::stop_on_signal(Some(gateway), proxies::ProxySupervision::idle())
+        }
+        (Err(e), Ok(proxies)) => {
             logline!("clauth daemon: {e:#}; the shunt gateway is not supervised");
+            gateway::stop_on_signal(None, proxies)
+        }
+        (Err(gateway), Err(proxy)) => {
+            logline!("clauth daemon: {gateway:#}; the shunt gateway is not supervised");
+            logline!("clauth daemon: {proxy:#}; proxies are not supervised");
             None
         }
     };
@@ -852,6 +866,8 @@ pub(crate) struct LiveStores {
     pub(crate) kick_blocks: KickBlocks,
     /// The gateway supervisor's published slot.
     pub(crate) gateway: gateway::GatewayHandle,
+    /// The per-proxy supervisors' published slots.
+    pub(crate) proxies: proxies::ProxySlots,
 }
 
 #[cfg(test)]
@@ -869,6 +885,7 @@ impl Default for LiveStores {
             auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
             kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
             gateway: gateway::new_handle(),
+            proxies: proxies::new_slots(),
         }
     }
 }
@@ -885,6 +902,7 @@ pub(crate) struct LiveSnapshot {
     queue_anchor: Option<i64>,
     queue_blocked: Vec<ProfileName>,
     gateway: Option<gateway::GatewaySlot>,
+    proxies: Vec<proxies::ProxySlot>,
 }
 
 impl LiveStores {
@@ -952,6 +970,7 @@ impl LiveStores {
             queue_anchor,
             queue_blocked,
             gateway: gateway::published(&self.gateway),
+            proxies: proxies::slots(&self.proxies),
         }
     }
 }
@@ -968,6 +987,7 @@ impl LiveSnapshot {
             queue_anchor: self.queue_anchor,
             queue_blocked: &self.queue_blocked,
             gateway: self.gateway.as_ref(),
+            proxies: Some(&self.proxies),
         }
     }
 }
@@ -1031,6 +1051,9 @@ struct Daemon {
     status_path: PathBuf,
     /// The slot the gateway supervisor publishes, read by every status write.
     gateway: gateway::GatewayHandle,
+    /// The per-proxy slots every proxy supervisor publishes into, read by
+    /// every status write as the `proxies` array.
+    proxies: proxies::ProxySlots,
 }
 
 impl Daemon {
@@ -1072,6 +1095,7 @@ impl Daemon {
             day_claim_notices: Vec::new(),
             status_path,
             gateway: gateway::new_handle(),
+            proxies: proxies::new_slots(),
         }
     }
 
@@ -1260,6 +1284,7 @@ impl Daemon {
             auto_start_queue: Arc::clone(&self.auto_start_queue),
             kick_blocks: Arc::clone(&self.kick_blocks),
             gateway: Arc::clone(&self.gateway),
+            proxies: Arc::clone(&self.proxies),
         }
     }
 

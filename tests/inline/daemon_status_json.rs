@@ -76,6 +76,7 @@ fn build_status_top_level_shape_and_active() {
             "generated_at",
             "pending_switch",
             "profiles",
+            "proxies",
             "refresh_interval_ms",
             "schema",
             "wrap_off",
@@ -346,6 +347,7 @@ fn build_status_pending_switch_reflects_live_signal() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -391,6 +393,7 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         queue_anchor: Some(anchor),
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
         v["profiles"]
@@ -497,6 +500,7 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -780,6 +784,7 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -850,6 +855,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -877,6 +883,7 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1061,6 +1068,7 @@ fn build_status_stale_flags_an_overdue_cache_on_the_single_shot_path() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 90_000, Some(&live), false);
     assert_eq!(
@@ -1106,6 +1114,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -1129,6 +1138,7 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -1160,6 +1170,7 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -1617,6 +1628,7 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         queue_anchor: Some(anchor),
         queue_blocked: &blocked,
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert!(
@@ -1730,6 +1742,7 @@ fn status_body_matches_legacy_json_bytes() {
         refresh_interval_ms: 300_000,
         clauth_version: "9.9.9".to_string(),
         gateway: None,
+        proxies: Vec::new(),
         profiles: vec![
             ProfileEntry {
                 name: "all-some".into(),
@@ -1821,7 +1834,7 @@ fn status_body_matches_legacy_json_bytes() {
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":"work","#,
         r#""pending_switch":"later","wrap_off":true,"active_codex_profile":"cx","#,
         r#""codex_fallback_chain":["cx"],"codex_wrap_off":true,"refresh_interval_ms":300000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"profiles":["#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":["#,
         r#"{"name":"all-some","active":true,"rolling_token":true,"provider":"anthropic","#,
         r#""base_url":"https://api.anthropic.com","tier":"Max 5x","harness":"claude","has_live_session":true,"#,
         r#""auth_status":"ok","fetch_status":"Fresh","stale":true,"fetched_at":"2026-09-13T00:00:00Z","#,
@@ -1856,13 +1869,14 @@ fn status_body_matches_legacy_json_bytes() {
         refresh_interval_ms: 60_000,
         clauth_version: "9.9.9".to_string(),
         gateway: None,
+        proxies: Vec::new(),
         profiles: vec![],
     };
     let expected = concat!(
         r#"{"schema":2,"generated_at":"2026-09-13T00:00:00Z","active_profile":null,"#,
         r#""pending_switch":null,"wrap_off":false,"active_codex_profile":null,"#,
         r#""codex_fallback_chain":[],"codex_wrap_off":false,"refresh_interval_ms":60000,"#,
-        r#""clauth_version":"9.9.9","gateway":null,"profiles":[]}"#,
+        r#""clauth_version":"9.9.9","gateway":null,"proxies":[],"profiles":[]}"#,
     );
     assert_eq!(serde_json::to_string(&body).unwrap(), expected);
 }
@@ -2175,6 +2189,7 @@ fn status_body_never_leaks_a_credential() {
         queue_anchor: Some(now / 1000),
         queue_blocked: &blocked,
         gateway: None,
+        proxies: None,
     };
     let body_live = build_status(&config, 300_000, Some(&live), true);
     let body_live_str =
@@ -2715,6 +2730,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -2735,6 +2751,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -2757,6 +2774,7 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         queue_anchor: None,
         queue_blocked: &[],
         gateway: None,
+        proxies: None,
     };
     let v = status_value(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -2764,4 +2782,102 @@ fn build_status_stale_reads_the_third_party_streak_for_a_member_without_oauth() 
         false,
         "a hybrid's OAuth Cached reading outranks its third-party stuck reading"
     );
+}
+
+/// The `proxies` array is additive: one record-only entry per registry row in
+/// service order, the supervisor's slot where one is published. A row whose
+/// recorded binary is gone reads `binary_missing` naming the recorded path.
+#[test]
+fn the_proxies_array_publishes_one_record_only_entry_per_row() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("dir");
+    std::fs::create_dir_all(&dir).expect("dir");
+    // An absolute path to a binary that does not exist, derived from the
+    // sandbox dir and written with forward slashes, so it is absolute on every
+    // platform and the hand-written TOML stays free of `\` escapes.
+    let gone = dir
+        .join("gone")
+        .join("clauth-zcode-proxy")
+        .to_string_lossy()
+        .replace('\\', "/");
+    std::fs::write(
+        dir.join("proxies.toml"),
+        format!(
+            "[zcode]\nport = 9101\nenabled = true\nbinary = \"{gone}\"\n\n[qwen]\nport = 9102\nenabled = false\n"
+        ),
+    )
+    .expect("registry");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let v = status_value(&config, 300_000, None, false);
+    let proxies = v["proxies"].as_array().expect("a proxies array");
+    assert_eq!(proxies.len(), 2, "one entry per row, in service order");
+    assert_eq!(proxies[0]["service"], "qwen");
+    assert_eq!(proxies[0]["state"], "disabled");
+    assert_eq!(proxies[0]["port"], 9102);
+    assert_eq!(proxies[1]["service"], "zcode");
+    assert_eq!(proxies[1]["state"], "binary_missing");
+    assert_eq!(proxies[1]["port"], 9101);
+    assert_eq!(proxies[1]["binary"], gone);
+}
+
+/// A live supervisor slot wins over the record-only verdict for its row, and
+/// a sibling row without one reads its record-only verdict.
+#[test]
+fn the_proxies_array_merges_a_live_slot_over_the_record() {
+    use crate::daemon::proxies::{ProxySlot, ProxyState};
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("dir");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("proxies.toml"),
+        "[zcode]\nport = 9101\nenabled = true\n\n[qwen]\nport = 9102\nenabled = false\n",
+    )
+    .expect("registry");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let slot = ProxySlot {
+        service: "zcode".to_string(),
+        state: ProxyState::Healthy,
+        binary: Some("/usr/local/bin/clauth-zcode-proxy".to_string()),
+        port: Some(9101),
+        pid: Some(4242),
+        version: Some("1.2.0".to_string()),
+        contract: Some("1.0".to_string()),
+        answerer: None,
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: Some("2026-09-29T00:00:00Z".to_string()),
+    };
+    let proxies = [slot];
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        third_party_streaks: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+        gateway: None,
+        proxies: Some(&proxies),
+    };
+    let v = status_value(&config, 300_000, Some(&live), false);
+    let proxies = v["proxies"].as_array().expect("a proxies array");
+    assert_eq!(proxies.len(), 2, "one entry per row, in service order");
+    assert_eq!(proxies[0]["service"], "qwen");
+    assert_eq!(proxies[0]["state"], "disabled", "qwen has no live slot");
+    assert_eq!(proxies[1]["service"], "zcode");
+    assert_eq!(proxies[1]["state"], "healthy", "the live slot wins");
+    assert_eq!(proxies[1]["version"], "1.2.0");
+    assert_eq!(proxies[1]["contract"], "1.0");
+    assert_eq!(proxies[1]["pid"], 4242);
 }

@@ -43,6 +43,7 @@ mod profile_notes;
 mod providers;
 mod proxy;
 mod proxy_check;
+mod proxy_list;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -420,6 +421,7 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
 
 fn cmd_proxy(cmd: cli::ProxyCommand) -> Result<()> {
     match cmd {
+        cli::ProxyCommand::List { json } => proxy_list::run(json),
         cli::ProxyCommand::Enable { service, port } => {
             let bind = proxy::enable(&service, port, std::env::var_os("PATH").as_deref())?;
             outln!("clauth: enabled proxy '{service}' on {bind}");

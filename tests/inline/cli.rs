@@ -2287,6 +2287,26 @@ fn proxy_enable_and_disable_parse_their_service_and_port() {
     }
 }
 
+/// `clauth proxy list` and its `--json` flag.
+#[test]
+fn proxy_list_parses_its_json_flag() {
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::List { json },
+    } = command(&["proxy", "list"])
+    else {
+        panic!("`proxy list` must select the list arm");
+    };
+    assert!(!json);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::List { json },
+    } = command(&["proxy", "list", "--json"])
+    else {
+        panic!("`proxy list --json` must select the list arm");
+    };
+    assert!(json);
+}
+
 /// `clauth herdr install` and its flags. The grammar is what makes the setup a
 /// single command, so a rename or a dropped flag reds here rather than in a
 /// user's shell.
