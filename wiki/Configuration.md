@@ -241,6 +241,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
   gateway-admin-token      # the gateway's admin write key, alone in its file (0600)
   gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
+  gateway-hold             # the TUI's transient gateway stop: the pid + start time of the daemon whose gateway it holds off (0600)
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
   proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
