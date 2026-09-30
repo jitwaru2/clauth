@@ -9,7 +9,9 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener};
 
 use super::*;
-use crate::testutil::{HomeSandbox, serve_endpoints};
+use crate::testutil::{
+    HomeSandbox, request_header, request_path, serve_endpoints, serve_endpoints_raw,
+};
 
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -4444,4 +4446,345 @@ fn the_gateway_probe_reads_the_same_env_as_the_plan() {
         gateway_probe(&record).expect("probe"),
         addr("127.0.0.1:3999")
     );
+}
+
+// ── chatgpt_oauth providers needing a pool login ───────────────────────────
+
+/// A test token long enough for shunt to accept (>= 32 characters).
+const POOL_TOKEN: &str = "test-admin-token-0123456789abcdef0123456789abcdef";
+
+/// A pool body whose `chatgpt_oauth` providers A and D hold no accounts, B
+/// holds one and C is `claude_oauth`; the extra fields exercise the parse's
+/// tolerance of everything clauth does not read.
+const POOL_BODY: &str = r#"{"providers":[
+  {"provider":"A","auth":"chatgpt_oauth","accounts":[]},
+  {"provider":"B","auth":"chatgpt_oauth","accounts":[{"name":"mine","plan":"plus"}]},
+  {"provider":"C","auth":"claude_oauth","accounts":[]},
+  {"provider":"D","auth":"chatgpt_oauth","accounts":[]}
+]}"#;
+
+/// A record whose config binds the gateway at `addr`.
+fn pool_record(home: &HomeSandbox, addr: SocketAddr) -> GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, &format!("[server]\nbind = \"{addr}\"\n"));
+    GatewayRecord::new(config).expect("adoptable")
+}
+
+/// The admin token alone in the sandbox's `~/.clauth/gateway-admin-token`.
+fn write_pool_token(home: &HomeSandbox, token: &str) {
+    write(
+        &home.home().join(".clauth").join("gateway-admin-token"),
+        token,
+    );
+}
+
+/// The pinned `CODEX_AUTH_FILE` under the sandbox's `~/.clauth/shunt`.
+fn pinned_codex_auth_file(home: &HomeSandbox) -> PathBuf {
+    home.home()
+        .join(".clauth")
+        .join("shunt")
+        .join("codex-auth.json")
+}
+
+/// A bound-then-dropped listener's address: a port nothing answers.
+fn closed_port() -> SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    addr
+}
+
+#[test]
+fn the_pool_login_list_names_every_loginless_chatgpt_oauth_provider() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let (base, seen) = serve_endpoints(1, |_, _| (200, POOL_BODY.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    assert_eq!(
+        chatgpt_oauth_providers_needing_login(&record).expect("providers"),
+        vec!["A".to_string(), "D".to_string()]
+    );
+    seen.join().expect("listener");
+}
+
+#[test]
+fn the_pool_read_sends_the_token_and_hits_the_pool_route() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let (base, seen) = serve_endpoints_raw(1, |_, _| (200, POOL_BODY.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    chatgpt_oauth_providers_needing_login(&record).expect("providers");
+    let raw = seen.join().expect("listener");
+    assert_eq!(request_path(&raw[0]), "/admin/api/pool");
+    assert_eq!(
+        request_header(&raw[0], "x-api-key").as_deref(),
+        Some(POOL_TOKEN)
+    );
+}
+
+#[test]
+fn the_pinned_single_file_short_circuits_the_pool_read() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    write(&pinned_codex_auth_file(&home), "{}");
+    // The bind points at a port nothing answers: a short-circuit never dials.
+    let record = pool_record(&home, closed_port());
+    assert!(
+        chatgpt_oauth_providers_needing_login(&record)
+            .expect("empty")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_directory_at_the_pinned_path_still_reads_the_pool() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    fs::create_dir_all(pinned_codex_auth_file(&home)).expect("dir");
+    let (base, seen) = serve_endpoints(1, |_, _| (200, POOL_BODY.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    assert_eq!(
+        chatgpt_oauth_providers_needing_login(&record).expect("providers"),
+        vec!["A".to_string(), "D".to_string()]
+    );
+    seen.join().expect("listener");
+}
+
+#[test]
+fn a_missing_admin_token_is_the_typed_error_and_nothing_is_written() {
+    let home = HomeSandbox::new();
+    let record = pool_record(&home, closed_port());
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("no token");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::NoAdminToken),
+        "a missing token file is the NoAdminToken variant, got {typed:?}"
+    );
+    assert_eq!(format!("{err:#}"), "no gateway admin token");
+    assert!(
+        !home
+            .home()
+            .join(".clauth")
+            .join("gateway-admin-token")
+            .exists(),
+        "the pool read must never mint a token"
+    );
+}
+
+#[test]
+fn a_refused_pool_read_is_the_unreachable_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let addr = closed_port();
+    let record = pool_record(&home, addr);
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("unreachable");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::Unreachable { addr: refused } if *refused == addr),
+        "a refused connection is the Unreachable variant, got {typed:?}"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        format!("the gateway at {addr} did not answer")
+    );
+}
+
+#[test]
+fn each_pool_status_is_its_own_typed_error_without_the_body() {
+    let home = HomeSandbox::new();
+    for (status, message) in [
+        (
+            401u16,
+            "the gateway did not accept clauth's admin token (status 401)",
+        ),
+        (
+            403u16,
+            "the gateway did not accept clauth's admin token (status 403)",
+        ),
+        (404u16, "the gateway has no admin pool route (status 404)"),
+        (
+            500u16,
+            "the gateway could not read its pool (status 500); its log names the provider",
+        ),
+        (502u16, "the gateway's pool answered status 502"),
+    ] {
+        write_pool_token(&home, POOL_TOKEN);
+        let marker = format!("marker-{status}-body");
+        let (base, seen) = serve_endpoints(1, move |_, _| (status, marker.clone()));
+        let record = pool_record(&home, listener_addr(&base));
+        let err = chatgpt_oauth_providers_needing_login(&record).expect_err("typed");
+        let text = format!("{err:#}");
+        assert_eq!(text, message, "status {status}");
+        assert!(
+            !text.contains("marker"),
+            "the body never reaches the error: {text}"
+        );
+        assert!(
+            !text.contains(POOL_TOKEN),
+            "the token never reaches the error: {text}"
+        );
+        seen.join().expect("listener");
+    }
+}
+
+#[test]
+fn a_non_json_pool_body_is_its_own_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let (base, seen) = serve_endpoints(1, |_, _| (200, "not json".to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("unparseable");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::Unparseable),
+        "a non-JSON body is the Unparseable variant, got {typed:?}"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "the gateway's pool response does not parse"
+    );
+    seen.join().expect("listener");
+}
+
+#[test]
+fn an_oversized_pool_body_is_its_own_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let body = "x".repeat((POOL_BODY_LIMIT + 1) as usize);
+    let (base, seen) = serve_endpoints(1, move |_, _| (200, body.clone()));
+    let record = pool_record(&home, listener_addr(&base));
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("too large");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::TooLarge { limit } if *limit == POOL_BODY_LIMIT),
+        "an over-cap body is the TooLarge variant, got {typed:?}"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        format!("the gateway's pool response exceeds {POOL_BODY_LIMIT} bytes")
+    );
+    seen.join().expect("listener");
+}
+
+#[test]
+fn an_unknown_auth_mode_is_ignored_and_the_parse_succeeds() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let body = r#"{"providers":[
+      {"provider":"A","auth":"future_oauth","accounts":[]},
+      {"provider":"B","auth":"chatgpt_oauth","accounts":[]}
+    ]}"#;
+    let (base, seen) = serve_endpoints(1, |_, _| (200, body.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    assert_eq!(
+        chatgpt_oauth_providers_needing_login(&record).expect("providers"),
+        vec!["B".to_string()]
+    );
+    seen.join().expect("listener");
+}
+
+/// JSON of another shape is the same typed error as a body that is not JSON.
+#[test]
+fn a_pool_body_of_another_shape_is_the_unparseable_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let (base, seen) = serve_endpoints(1, |_, _| (200, r#"{"accounts":[]}"#.to_string()));
+    let record = pool_record(&home, listener_addr(&base));
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("unparseable");
+    assert_eq!(
+        format!("{err:#}"),
+        "the gateway's pool response does not parse"
+    );
+    seen.join().expect("listener");
+}
+
+/// A 200 whose body stops before its declared length is its own typed error,
+/// never a transport failure's "did not answer", and carries none of the body.
+#[test]
+fn a_pool_body_that_breaks_off_is_its_own_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).expect("request");
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"marker-broken")
+            .expect("head");
+    });
+    let record = pool_record(&home, addr);
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("broken");
+    server.join().expect("server");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::BodyBroken),
+        "a body that breaks off is the BodyBroken variant, got {typed:?}"
+    );
+    assert_eq!(format!("{err:#}"), "the gateway's pool response broke off");
+}
+
+/// A live daemon with no env record naming it: the gateway's address cannot be
+/// resolved the way the daemon spawned it, so the pool read refuses with its
+/// own typed error, never the store move's copy.
+#[test]
+fn a_daemon_with_no_env_record_is_the_pool_reads_own_typed_error() {
+    let home = HomeSandbox::new();
+    write_pool_token(&home, POOL_TOKEN);
+    let record = pool_record(&home, closed_port());
+    let _held = crate::daemon::hold_daemon_lock();
+    let err = chatgpt_oauth_providers_needing_login(&record).expect_err("unrecorded");
+    let typed = err
+        .downcast_ref::<ChatgptOauthProvidersError>()
+        .expect("a typed ChatgptOauthProvidersError");
+    assert!(
+        matches!(typed, ChatgptOauthProvidersError::DaemonEnvUnrecorded),
+        "an unrecorded daemon is the DaemonEnvUnrecorded variant, got {typed:?}"
+    );
+    assert_eq!(
+        format!("{err:#}"),
+        "the running daemon recorded no environment; restart it"
+    );
+}
+
+/// Both gateway clients ask their target directly with every phase bounded:
+/// a proxy the builder arrived with (as ureq's default takes one from the
+/// env) is dropped, no redirect is followed, and a wedged gateway cannot park
+/// the caller. Health: 4 s connect + 2 s response = 6 s; pool: 4 s + 20 s = 24 s.
+#[test]
+fn the_gateway_clients_go_direct_and_bound_every_phase() {
+    for (response, global) in [(2u64, 6u64), (20, 24)] {
+        let preset = ureq::Agent::config_builder()
+            .proxy(Some(ureq::Proxy::new("http://127.0.0.1:9").expect("proxy")));
+        let agent: ureq::Agent = direct_config(preset, Duration::from_secs(response))
+            .build()
+            .into();
+        let config = agent.config();
+        assert!(config.proxy().is_none(), "response {response}: no proxy");
+        assert_eq!(config.max_redirects(), 0, "response {response}");
+        let timeouts = config.timeouts();
+        assert_eq!(timeouts.connect, Some(Duration::from_secs(4)));
+        assert_eq!(timeouts.recv_response, Some(Duration::from_secs(response)));
+        assert_eq!(timeouts.recv_body, Some(Duration::from_secs(response)));
+        assert_eq!(timeouts.global, Some(Duration::from_secs(global)));
+    }
+    for (agent, global) in [(health_agent(), 6u64), (pool_agent(), 24)] {
+        assert_eq!(
+            agent.config().timeouts().global,
+            Some(Duration::from_secs(global))
+        );
+        assert!(agent.config().proxy().is_none());
+    }
 }

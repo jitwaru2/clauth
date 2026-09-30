@@ -1,7 +1,8 @@
 //! The managed shunt gateway's engine: the `~/.clauth/gateway.toml` record,
 //! the admin token file, config discovery, bind resolution, the env file
 //! reader, the admin-key edit behind its `shunt check` gate, the `/health`
-//! version floor and the standalone-store move.
+//! version floor, the standalone-store move and the admin pool read naming
+//! the `chatgpt_oauth` providers with no login.
 //!
 //! No function here spawns, signals or supervises a process other than the
 //! bounded children [`run_bounded`] runs (`shunt check`, and a clauth proxy's
@@ -1580,20 +1581,35 @@ impl GatewaySilent {
 /// The `/health` probe's client, its connect and response phases bounded
 /// apart and together; `clauth proxy check` holds a proxy to the same bounds.
 pub(crate) fn health_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(HEALTH_CONNECT_SECS)))
-        .timeout_recv_response(Some(Duration::from_secs(HEALTH_RESPONSE_SECS)))
-        .timeout_recv_body(Some(Duration::from_secs(HEALTH_RESPONSE_SECS)))
-        .timeout_global(Some(HEALTH_PROBE_TIMEOUT))
+    direct_config(
+        ureq::Agent::config_builder(),
+        Duration::from_secs(HEALTH_RESPONSE_SECS),
+    )
+    .build()
+    .into()
+}
+
+/// `builder` bounded for a gateway request: the health probe's connect phase,
+/// `response` for the response and the body, and their sum as one global
+/// bound (ureq re-arms its response deadline before every wait,
+/// `oauth::TOKEN_HTTP_DEADLINES`). No redirect is followed and no proxy is
+/// used, whatever `builder` carried: through an env-configured proxy a
+/// loopback target resolves on the proxy's own host, any other target's
+/// delays and errors would be the proxy's, and the admin key would reach it.
+fn direct_config(
+    builder: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    response: Duration,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    let connect = Duration::from_secs(HEALTH_CONNECT_SECS);
+    builder
+        .timeout_connect(Some(connect))
+        .timeout_recv_response(Some(response))
+        .timeout_recv_body(Some(response))
+        .timeout_global(Some(connect + response))
         .http_status_as_error(false)
         .max_redirects(0)
         .max_redirects_will_error(false)
-        // The probe asks its target directly: through an env-configured
-        // proxy a loopback target resolves on the proxy's own host, and any
-        // other target's delays and errors would be the proxy's.
         .proxy(None)
-        .build()
-        .into()
 }
 
 #[derive(Deserialize)]
@@ -2521,6 +2537,10 @@ struct Store {
     home: Option<HomeRule>,
 }
 
+/// The store env key whose managed path holds the pinned single-file codex
+/// login.
+const CODEX_AUTH_FILE_ENV: &str = "CODEX_AUTH_FILE";
+
 const STORES: [Store; 9] = [
     Store {
         env: "SHUNT_CLAUDE_ACCOUNTS_DIR",
@@ -2572,7 +2592,7 @@ const STORES: [Store; 9] = [
         home: Some(HomeRule::HomeThenUserProfile),
     },
     Store {
-        env: "CODEX_AUTH_FILE",
+        env: CODEX_AUTH_FILE_ENV,
         segments: &["codex-auth.json"],
         kind: StoreKind::File,
         source: Source::NamedOnly,
@@ -3465,6 +3485,216 @@ fn stage_copy(from: &Path, to: &Path) -> std::io::Result<Staged> {
     std::io::copy(&mut source, &mut file)?;
     file.sync_all()?;
     Ok(staged)
+}
+
+// ── chatgpt_oauth providers without a pool login ───────────────────────────
+
+/// The pool body read cap. `GET /admin/api/pool` returns
+/// `{"providers":[{"provider": ..., "auth": ..., "accounts": [...]}]}`, of
+/// which clauth reads only the name, the auth string and the account count; a
+/// legitimate body is a few KB even with a large pool, so 1 MiB still bounds
+/// a hostile or misconfigured peer.
+const POOL_BODY_LIMIT: u64 = 1024 * 1024;
+
+/// The pool route's response bound, above the 8 s the handler budgets for one
+/// request's account backfill (shunt `plan::BackfillBudgets::default().total`,
+/// `src/admin/plan.rs:168`). The handler's ceiling is `total + (n - 1) *
+/// min_slice` (2 s per extra oauth provider) plus its unbudgeted store scans,
+/// so 20 s covers up to six oauth providers; past that a slow backfill reads
+/// as [`ChatgptOauthProvidersError::Unreachable`], and a wedged gateway is
+/// still bounded.
+const POOL_RESPONSE_SECS: u64 = 20;
+
+/// Why the Services card cannot name the `chatgpt_oauth` providers that need
+/// their own pool login.
+#[derive(Debug)]
+pub(crate) enum ChatgptOauthProvidersError {
+    /// clauth's gateway admin token file does not exist; the card's read
+    /// never mints one.
+    NoAdminToken,
+    /// The gateway did not answer: a refused connection, a timeout, or any
+    /// other transport failure.
+    Unreachable { addr: SocketAddr },
+    /// The gateway did not accept clauth's admin token (shunt also answers 401
+    /// when a reload disabled its admin surface).
+    Unauthorized { status: u16 },
+    /// The gateway has no `[server.admin]` surface, or no pool route.
+    NotFound { status: u16 },
+    /// The gateway answered 500: shunt fails the whole pool list when one
+    /// provider's pool cannot be resolved (a scoped account that is gone),
+    /// and its log names that provider.
+    PoolUnreadable,
+    /// The gateway answered with a status other than 200, 401, 403, 404 or
+    /// 500.
+    UnexpectedStatus { status: u16 },
+    /// The pool body is not JSON of the pool's shape.
+    Unparseable,
+    /// The pool body exceeds [`POOL_BODY_LIMIT`].
+    TooLarge { limit: u64 },
+    /// A 200 whose body stopped before its end (the gateway died or stalled
+    /// mid-response).
+    BodyBroken,
+    /// A daemon holds the singleton but no env record names it, so the
+    /// gateway's address cannot be resolved the way the daemon spawned it.
+    DaemonEnvUnrecorded,
+}
+
+impl std::fmt::Display for ChatgptOauthProvidersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatgptOauthProvidersError::NoAdminToken => {
+                write!(f, "no gateway admin token")
+            }
+            ChatgptOauthProvidersError::Unreachable { addr } => {
+                write!(f, "the gateway at {addr} did not answer")
+            }
+            ChatgptOauthProvidersError::Unauthorized { status } => {
+                write!(
+                    f,
+                    "the gateway did not accept clauth's admin token (status {status})"
+                )
+            }
+            ChatgptOauthProvidersError::NotFound { status } => {
+                write!(f, "the gateway has no admin pool route (status {status})")
+            }
+            ChatgptOauthProvidersError::PoolUnreadable => f.write_str(
+                "the gateway could not read its pool (status 500); its log names the provider",
+            ),
+            ChatgptOauthProvidersError::UnexpectedStatus { status } => {
+                write!(f, "the gateway's pool answered status {status}")
+            }
+            ChatgptOauthProvidersError::Unparseable => {
+                write!(f, "the gateway's pool response does not parse")
+            }
+            ChatgptOauthProvidersError::TooLarge { limit } => {
+                write!(f, "the gateway's pool response exceeds {limit} bytes")
+            }
+            ChatgptOauthProvidersError::BodyBroken => {
+                write!(f, "the gateway's pool response broke off")
+            }
+            ChatgptOauthProvidersError::DaemonEnvUnrecorded => {
+                write!(f, "the running daemon recorded no environment; restart it")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatgptOauthProvidersError {}
+
+/// The `chatgpt_oauth` providers the running gateway serves while no pool
+/// account logs in for them, in the gateway's own `/admin/api/pool` order.
+/// Empty when the pinned `CODEX_AUTH_FILE` exists as a regular file (shunt
+/// serves those providers from it then), or when the gateway reports none. A
+/// missing admin token, an unrecorded daemon, an unanswerable gateway, a
+/// refused token, a missing route, a non-200 status, a body that does not
+/// parse, breaks off or exceeds [`POOL_BODY_LIMIT`] is
+/// [`ChatgptOauthProvidersError`], never an empty list.
+pub(crate) fn chatgpt_oauth_providers_needing_login(record: &GatewayRecord) -> Result<Vec<String>> {
+    if managed_codex_auth_file()?.is_file() {
+        return Ok(Vec::new());
+    }
+    let addr = gateway_probe(record).map_err(|e| match e.downcast_ref::<StoreMoveRefusal>() {
+        Some(StoreMoveRefusal::DaemonEnvUnrecorded) => {
+            ChatgptOauthProvidersError::DaemonEnvUnrecorded.into()
+        }
+        _ => e,
+    })?;
+    let token = read_admin_token()?;
+    let body = pool_body(addr, &token)?;
+    let parsed: PoolBody =
+        serde_json::from_slice(&body).map_err(|_| ChatgptOauthProvidersError::Unparseable)?;
+    Ok(parsed
+        .providers
+        .into_iter()
+        .filter(|provider| provider.auth == "chatgpt_oauth" && provider.accounts.is_empty())
+        .map(|provider| provider.provider)
+        .collect())
+}
+
+/// The pinned `CODEX_AUTH_FILE` path under `~/.clauth/shunt`, from
+/// [`store_env`] so it cannot drift from the gateway's spawn env.
+fn managed_codex_auth_file() -> Result<PathBuf> {
+    let env = store_env()?;
+    env.into_iter()
+        .find(|(key, _)| *key == CODEX_AUTH_FILE_ENV)
+        .map(|(_, path)| path)
+        .ok_or_else(|| anyhow!("the store env holds no {CODEX_AUTH_FILE_ENV}"))
+}
+
+/// The gateway's admin token for a read, trimmed the way [`ensure_token_file`]
+/// reads it. Never mints one: the Services card's pool read must not write,
+/// so a missing token file is [`ChatgptOauthProvidersError::NoAdminToken`].
+fn read_admin_token() -> Result<AdminToken> {
+    let path = admin_token_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(AdminToken(text.trim().to_string())),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            Err(ChatgptOauthProvidersError::NoAdminToken.into())
+        }
+        Err(cause) => Err(cause).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// `GET http://<addr>/admin/api/pool` with the token in `x-api-key`, under
+/// [`pool_agent`]'s bounds: the body for status 200, or a
+/// [`ChatgptOauthProvidersError`] for every other outcome. The error never
+/// carries the response body, a header value or the token.
+fn pool_body(addr: SocketAddr, token: &AdminToken) -> Result<Vec<u8>> {
+    let agent = pool_agent();
+    let url = format!("http://{addr}/admin/api/pool");
+    let mut response = match agent.get(&url).header("x-api-key", token.expose()).call() {
+        Ok(response) => response,
+        Err(_) => return Err(ChatgptOauthProvidersError::Unreachable { addr }.into()),
+    };
+    let status = response.status().as_u16();
+    match status {
+        200 => {}
+        401 | 403 => return Err(ChatgptOauthProvidersError::Unauthorized { status }.into()),
+        404 => return Err(ChatgptOauthProvidersError::NotFound { status }.into()),
+        500 => return Err(ChatgptOauthProvidersError::PoolUnreadable.into()),
+        other => return Err(ChatgptOauthProvidersError::UnexpectedStatus { status: other }.into()),
+    }
+    match response
+        .body_mut()
+        .with_config()
+        .limit(POOL_BODY_LIMIT)
+        .read_to_vec()
+    {
+        Ok(body) => Ok(body),
+        Err(ureq::Error::BodyExceedsLimit(_)) => Err(ChatgptOauthProvidersError::TooLarge {
+            limit: POOL_BODY_LIMIT,
+        }
+        .into()),
+        Err(_) => Err(ChatgptOauthProvidersError::BodyBroken.into()),
+    }
+}
+
+/// The `/admin/api/pool` client: [`direct_config`] with a response bound
+/// above the handler's own budget ([`POOL_RESPONSE_SECS`]).
+fn pool_agent() -> ureq::Agent {
+    direct_config(
+        ureq::Agent::config_builder(),
+        Duration::from_secs(POOL_RESPONSE_SECS),
+    )
+    .build()
+    .into()
+}
+
+/// `GET /admin/api/pool`'s body, read only for the provider name, the auth
+/// mode and the account count; every other field is ignored.
+#[derive(Deserialize)]
+struct PoolBody {
+    providers: Vec<PoolProvider>,
+}
+
+#[derive(Deserialize)]
+struct PoolProvider {
+    provider: String,
+    /// A string, never a mirror of shunt's `AuthMode`: an unknown future mode
+    /// still parses.
+    auth: String,
+    /// Count only; the account objects are never read.
+    accounts: Vec<serde::de::IgnoredAny>,
 }
 
 #[cfg(test)]
