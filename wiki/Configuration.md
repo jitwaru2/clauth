@@ -243,6 +243,13 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
+  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
+  proxies/<service>/       # one state dir per proxy, its CLAUTH_PROXY_STATE_DIR (0700)
+    accounts/              # the proxy's own account store
+    config.json            # the proxy's own proxy-wide settings
+    clauth-admin-token     # the proxy's admin token, alone in its file (0600)
+    clauth-child.json      # the proxy the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop (0600)
+    clauth.log             # the proxy's own stdout and stderr, size-capped like daemon.log (0600)
   completions/             # generated shell completion scripts
   .completions_installed   # marker: completions have been installed
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
