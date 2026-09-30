@@ -733,6 +733,31 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         ],
         "an answerer with no config found, its version escaped like every slot string",
     );
+    let split = detail(
+        GatewayState::Absent,
+        &super::StandaloneShunt {
+            found: None,
+            unread_bind: None,
+            answer: Some(("0.49.1: forged".to_string(), addr)),
+        },
+    );
+    assert_eq!(
+        split[1], "standalone shunt 0.49.1\\u{3a} forged answers on 127.0.0.1:3067",
+        "a `: ` in the version is escaped, so the line stays prose",
+    );
+    assert_eq!(split[1].split_once(": "), None);
+    let trailing = detail(
+        GatewayState::Absent,
+        &super::StandaloneShunt {
+            found: None,
+            unread_bind: None,
+            answer: Some(("0.49.1:".to_string(), addr)),
+        },
+    );
+    assert_eq!(
+        trailing[1], "standalone shunt 0.49.1\\u{3a} answers on 127.0.0.1:3067",
+        "a trailing `:` would meet the space after it",
+    );
     assert_eq!(
         detail(
             GatewayState::Absent,
@@ -775,6 +800,10 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         (
             super::UnreadBind::Value("${SHUNT_\u{1b}BIND}".to_string()),
             "bind: not read (${SHUNT_\\u{1b}BIND})",
+        ),
+        (
+            super::UnreadBind::Value(String::new()),
+            "bind: not read (empty)",
         ),
     ] {
         assert_eq!(
@@ -910,6 +939,20 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
         Some(UnreadBind::Value("3001".to_string())),
         "a non-string bind is named in its TOML spelling",
     );
+    assert_eq!(
+        toml_case("[server]\nbind = 3001 # the port alone\n"),
+        Some(UnreadBind::Value("3001".to_string())),
+        "a trailing comment is not part of the value",
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = \"\"\n"),
+        Some(UnreadBind::Value(String::new())),
+    );
+    assert_eq!(
+        toml_case("[server.bind]\nx = 1 # a comment\n"),
+        Some(UnreadBind::Value("{ x = 1 }".to_string())),
+        "a table-shaped bind is named inline, its comment dropped",
+    );
     assert_eq!(toml_case("[server\n"), Some(UnreadBind::Unparsed));
     let dir = home.home().join("a-dir-not-a-file");
     std::fs::create_dir_all(&dir).unwrap();
@@ -924,6 +967,9 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
         "127.0.0.1:3001",
         "127.0.0.1:3001",
         "127.0.0.1:4200",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
         "127.0.0.1:3001",
         "127.0.0.1:3001",
         "127.0.0.1:3001",
@@ -12722,6 +12768,47 @@ fn r_during_a_running_probe_queues_one_follow_up_run() {
     );
 }
 
+/// A drain adopts the newest of the results that landed since the last one,
+/// and a drain with nothing landed leaves the rows as they are: no recompute.
+#[test]
+fn a_probe_drain_adopts_the_newest_result_and_skips_an_empty_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let readout = |version: &str| super::StandaloneShunt {
+        found: None,
+        unread_bind: None,
+        answer: Some((version.to_string(), "127.0.0.1:3067".parse().unwrap())),
+    };
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.standalone_probe.running = true;
+    for version in ["0.49.0", "0.49.1"] {
+        app.services
+            .standalone_probe
+            .tx
+            .send(readout(version))
+            .expect("send");
+    }
+    super::drain_service_probes(&mut app);
+    assert_eq!(
+        app.services.standalone,
+        Some(readout("0.49.1")),
+        "the newest landing wins"
+    );
+    assert!(!app.services.standalone_probe.running);
+
+    app.services.checks.clear();
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.checks.is_empty(),
+        "a drain with nothing landed recomputes nothing"
+    );
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.checks.is_empty(),
+        "fixture control: a recompute refills the rows"
+    );
+}
+
 /// With no gateway adopted, entering the tab probes what runs standalone on a
 /// worker, and the readout lands on the `shunt` row with no key; `r` probes
 /// again. The adopted-gateway path never starts it.
@@ -12775,7 +12862,8 @@ fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
     await_service_probes(&mut app);
     assert_eq!(RUNS.load(Ordering::SeqCst), 2, "one run per trigger");
 
-    // An adopted gateway: no standalone probe, no readout on the row.
+    // An adopted gateway: no standalone probe, and a readout cached from
+    // before the adoption never reaches the row.
     let dir = crate::profile::clauth_dir().expect("clauth dir");
     std::fs::create_dir_all(&dir).expect("mkdir");
     let config = dir.join("shunt.toml");
@@ -12787,15 +12875,25 @@ fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
     .expect("record");
     let mut app = bare_app();
     app.services.standalone_probe.prober = Some(stub);
+    app.services.standalone = Some(super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: Some(super::UnreadBind::Yaml),
+        answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
+    });
     super::recompute_services_checks(&mut app, true);
     assert!(
         !app.services.standalone_probe.running,
         "an adopted gateway never probes for a standalone one"
     );
     assert!(
-        !shunt(&app)
-            .iter()
-            .any(|l| l.starts_with("found") || l.starts_with("standalone")),
+        shunt(&app).iter().any(|l| l.starts_with("config: ")),
+        "fixture control: the row reads the adopted record: {:?}",
+        shunt(&app)
+    );
+    assert!(
+        !shunt(&app).iter().any(|l| l.starts_with("found")
+            || l.starts_with("bind")
+            || l.starts_with("standalone")),
         "{:?}",
         shunt(&app)
     );

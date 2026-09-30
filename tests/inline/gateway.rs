@@ -604,27 +604,48 @@ fn the_bind_is_the_env_then_the_config_then_shunts_default() {
 #[test]
 fn an_unusable_bind_is_refused_by_its_source_never_its_value() {
     let _home = HomeSandbox::new();
-    for (config, env, expected, message) in [
+    for (config, env, expected, written, message) in [
         (
             "[server]\nbind = \"localhost:3001\"\n",
             None,
             BindRefusal::NotAnAddress {
                 source: "[server].bind",
             },
+            Some("localhost:3001"),
             "[server].bind is not an ip:port address; set it to an ip:port address like 127.0.0.1:3001",
         ),
         (
-            "[server]\nbind = 3001\n",
+            "[server]\nbind = 3001 # the port alone\n",
             None,
             BindRefusal::NotAnAddress {
                 source: "[server].bind",
             },
+            Some("3001"),
+            "[server].bind is not an ip:port address; set it to an ip:port address like 127.0.0.1:3001",
+        ),
+        (
+            "[server.bind]\nx = 1 # a comment\n",
+            None,
+            BindRefusal::NotAnAddress {
+                source: "[server].bind",
+            },
+            Some("{ x = 1 }"),
+            "[server].bind is not an ip:port address; set it to an ip:port address like 127.0.0.1:3001",
+        ),
+        (
+            "[server]\nbind = \"\"\n",
+            None,
+            BindRefusal::NotAnAddress {
+                source: "[server].bind",
+            },
+            Some(""),
             "[server].bind is not an ip:port address; set it to an ip:port address like 127.0.0.1:3001",
         ),
         (
             "",
             Some("secret-looking-value"),
             BindRefusal::NotAnAddress { source: BIND_ENV },
+            None,
             "SHUNT_SERVER__BIND is not an ip:port address; set it to an ip:port address like 127.0.0.1:3001",
         ),
         (
@@ -633,21 +654,26 @@ fn an_unusable_bind_is_refused_by_its_source_never_its_value() {
             BindRefusal::OsAssignedPort {
                 source: "[server].bind",
             },
+            Some("127.0.0.1:0"),
             "[server].bind asks for an OS-assigned port, so clauth cannot know where the gateway listens; set it to a fixed port like 127.0.0.1:3001",
         ),
         (
             "[server]\nbind = \"${GATEWAY_BIND}\"\n",
             None,
             BindRefusal::ConfigReference,
+            Some("${GATEWAY_BIND}"),
             "[server].bind is a ${...} reference, which clauth does not resolve; set SHUNT_SERVER__BIND in the gateway's env file to the address instead",
         ),
     ] {
         let err = resolve_bind(config, env).expect_err(config);
-        assert_eq!(
-            err.downcast_ref::<BindRefusal>(),
-            Some(&expected),
-            "{config:?}"
-        );
+        // A config value rides its refusal for the Services row; an env value
+        // never does.
+        let (refusal, carried) = match err.downcast_ref::<ConfigBindRefused>() {
+            Some(refused) => (Some(refused.refusal), Some(refused.written.as_str())),
+            None => (err.downcast_ref::<BindRefusal>().copied(), None),
+        };
+        assert_eq!(refusal, Some(expected), "{config:?}");
+        assert_eq!(carried, written, "{config:?}");
         assert_eq!(err.to_string(), message, "{config:?}");
     }
 }

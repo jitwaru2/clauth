@@ -437,13 +437,27 @@ pub(crate) fn resolve_bind(config_text: &str, env_bind: Option<&str>) -> Result<
             match doc.get("server").and_then(|server| server.get("bind")) {
                 None => SHUNT_DEFAULT_BIND,
                 Some(bind) => {
-                    let value = bind.as_str().ok_or(BindRefusal::NotAnAddress {
-                        source: CONFIG_BIND,
+                    let refused = |refusal| ConfigBindRefused {
+                        refusal,
+                        // A table-shaped bind converts to its inline form, so
+                        // no comment or layout of the file rides along.
+                        written: match bind.clone().into_value() {
+                            Ok(value) => match value.as_str() {
+                                Some(text) => text.to_string(),
+                                None => value.decorated("", "").to_string(),
+                            },
+                            Err(_) => String::new(),
+                        },
+                    };
+                    let value = bind.as_str().ok_or_else(|| {
+                        refused(BindRefusal::NotAnAddress {
+                            source: CONFIG_BIND,
+                        })
                     })?;
                     if value.contains("${") {
-                        return Err(BindRefusal::ConfigReference.into());
+                        return Err(refused(BindRefusal::ConfigReference).into());
                     }
-                    parse_bind(value, CONFIG_BIND)?
+                    parse_bind(value, CONFIG_BIND).map_err(refused)?
                 }
             }
         }
@@ -667,6 +681,26 @@ impl std::fmt::Display for BindRefusal {
 }
 
 impl std::error::Error for BindRefusal {}
+
+/// A `[server].bind` from the config that clauth refused, with the value the
+/// config holds, for the Services row that names it: the config is the user's
+/// own file, while an env-file value never rides a refusal. `Display` is the
+/// refusal's alone, so no message carries the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigBindRefused {
+    pub(crate) refusal: BindRefusal,
+    /// The string itself, or any other value's TOML spelling, a table in its
+    /// inline form, without the comment after it or the whitespace around it.
+    pub(crate) written: String,
+}
+
+impl std::fmt::Display for ConfigBindRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.refusal.fmt(f)
+    }
+}
+
+impl std::error::Error for ConfigBindRefused {}
 
 // ── env ─────────────────────────────────────────────────────────────────────
 

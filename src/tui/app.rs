@@ -5098,6 +5098,7 @@ impl UnreadBind {
             UnreadBind::Yaml => "yaml".to_string(),
             UnreadBind::Unreadable => "config unreadable".to_string(),
             UnreadBind::Unparsed => "config does not parse".to_string(),
+            UnreadBind::Value(value) if value.is_empty() => "empty".to_string(),
             UnreadBind::Value(value) => value.clone(),
         }
     }
@@ -5134,10 +5135,10 @@ pub(crate) fn standalone_readout_from(
         Err(e) => {
             let reason = match env_bind {
                 Some(value) => UnreadBind::Value(format!("{}={value}", crate::gateway::BIND_ENV)),
-                None if e.downcast_ref::<crate::gateway::BindRefusal>().is_some() => {
-                    UnreadBind::Value(raw_config_bind(&config_text))
-                }
-                None => UnreadBind::Unparsed,
+                None => match e.downcast_ref::<crate::gateway::ConfigBindRefused>() {
+                    Some(refused) => UnreadBind::Value(refused.written.clone()),
+                    None => UnreadBind::Unparsed,
+                },
             };
             (crate::gateway::SHUNT_DEFAULT_BIND, Some(reason))
         }
@@ -5152,22 +5153,6 @@ pub(crate) fn standalone_readout_from(
         unread_bind,
         answer,
     }
-}
-
-/// `[server].bind` as the config writes it, for a bind clauth refused: the
-/// string itself, or a non-string value's TOML spelling.
-fn raw_config_bind(config_text: &str) -> String {
-    config_text
-        .parse::<toml_edit::DocumentMut>()
-        .ok()
-        .and_then(|doc| {
-            let bind = doc.get("server")?.get("bind")?;
-            Some(match bind.as_str() {
-                Some(value) => value.to_string(),
-                None => bind.to_string().trim().to_string(),
-            })
-        })
-        .unwrap_or_default()
 }
 
 /// [`standalone_readout_from`] over this process's cwd and env: the Services
@@ -5218,9 +5203,12 @@ pub(crate) fn shunt_check(
             ));
         }
         if let Some((version, addr)) = standalone.and_then(|s| s.answer.as_ref()) {
+            // A `:` in the version, followed by a space of its own or the one
+            // after it, would make the detail renderer split this prose line
+            // into a key and a value.
             detail.push(format!(
                 "standalone shunt {} answers on {addr}",
-                escape_control(version)
+                escape_control(version).replace(':', "\\u{3a}")
             ));
         }
     } else {
