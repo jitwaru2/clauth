@@ -213,26 +213,76 @@ pub(crate) fn hold_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join(HOLD_FILE))
 }
 
+/// Why the daemon holding the singleton cannot be named: either none holds it,
+/// or one holds it (or presence is unreadable) but its identity cannot be
+/// read. [`recorded_env_for_live_daemon`] branches on the first to fall back
+/// to the caller's own env; every other caller treats both as an error.
+#[derive(Debug)]
+enum NoHolder {
+    /// No daemon holds the singleton.
+    NotHeld,
+    /// A daemon holds (or presence is unreadable) but its identity cannot be
+    /// read.
+    Unreadable(anyhow::Error),
+}
+
+impl std::fmt::Display for NoHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoHolder::NotHeld => f.write_str("no daemon holds the clauth singleton"),
+            NoHolder::Unreadable(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NoHolder {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // The head already prints `e`'s own message, so the chain goes on
+            // from `e`'s cause; returning `e` would print it twice under `{:#}`.
+            NoHolder::Unreadable(e) => e.source(),
+            NoHolder::NotHeld => None,
+        }
+    }
+}
+
+/// The identity of the daemon that holds the singleton now: presence by the
+/// flock first ([`crate::daemon::singleton_held`]), then the pid sidecar, then
+/// that pid's process start time, which narrows the recycled-pid window. The
+/// one way every writer names the running daemon — [`write_hold`] and the
+/// start-time env record — and the one way [`inherited_env`] reads it.
+fn current_holder_identity() -> Result<DaemonIdentity, NoHolder> {
+    // The sidecar is informational and never removed: a stale pid left by a
+    // dead daemon, or recycled onto an unrelated process, must not read as a
+    // daemon to name. Presence is the flock (`status_probe`'s precedent).
+    match crate::daemon::singleton_held() {
+        Ok(true) => {}
+        Ok(false) => return Err(NoHolder::NotHeld),
+        Err(e) => return Err(NoHolder::Unreadable(e)),
+    }
+    let pid = crate::daemon::holder_pid().ok_or_else(|| {
+        NoHolder::Unreadable(anyhow!(
+            "a clauth daemon is running but its pid is unreadable"
+        ))
+    })?;
+    let start = crate::daemon::gateway::process_start_time(pid).ok_or_else(|| {
+        NoHolder::Unreadable(anyhow!(
+            "cannot read the start time of the daemon (pid {pid})"
+        ))
+    })?;
+    Ok(DaemonIdentity {
+        pid,
+        start: Some(start),
+    })
+}
+
 /// Write a hold naming the daemon that holds the singleton now. The TUI's
 /// transient "stop the gateway" writes it; that daemon honours it and any
 /// later daemon ignores and removes it, so a restart clears it by
 /// construction. Errors when no daemon holds the singleton, its pid sidecar is
 /// unreadable, or its start time cannot be read.
 pub(crate) fn write_hold() -> Result<()> {
-    // The sidecar is informational and never removed: a stale pid left by a
-    // dead daemon, or recycled onto an unrelated process, must not read as a
-    // daemon to name. Presence is the flock (`status_probe`'s precedent).
-    if !crate::daemon::singleton_held()? {
-        bail!("no daemon holds the clauth singleton");
-    }
-    let pid = crate::daemon::holder_pid()
-        .ok_or_else(|| anyhow!("a clauth daemon is running but its pid is unreadable"))?;
-    let start = crate::daemon::gateway::process_start_time(pid)
-        .ok_or_else(|| anyhow!("cannot read the start time of the daemon (pid {pid})"))?;
-    let identity = DaemonIdentity {
-        pid,
-        start: Some(start),
-    };
+    let identity = current_holder_identity()?;
     let path = hold_path()?;
     atomic_write_600(&path, serde_json::to_vec(&identity)?)
         .with_context(|| format!("failed to write {}", path.display()))
@@ -247,6 +297,180 @@ pub(crate) fn remove_hold() -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
     }
+}
+
+// ── the daemon's start-time env ─────────────────────────────────────────────
+
+/// `~/.clauth/gateway-env.json`: the env the running daemon inherited for the
+/// keys the store move reads, recorded at its start with the
+/// [`DaemonIdentity`] of the daemon that wrote them, so a reader can tell the
+/// running daemon's record from a dead one's.
+const ENV_FILE: &str = "gateway-env.json";
+
+/// Every env key the store plan, the move and the move's silent-proof bind
+/// read from the inherited env. One list: the daemon's record stores exactly
+/// these (each present, losslessly) and the no-daemon fallback reads exactly
+/// these from the caller's env, so a value only the daemon inherited is seen,
+/// and a value only the caller's shell holds cannot make the plan and the
+/// proof disagree. None is a secret: two homes, a Windows home and a bind
+/// address.
+const INHERITED_KEYS: [&str; 4] = ["CODEX_HOME", "HOME", "USERPROFILE", BIND_ENV];
+
+fn daemon_env_path() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join(ENV_FILE))
+}
+
+/// The daemon's start-time env record. Each value is stored as its
+/// platform-native bytes ([`env_value_bytes`]), never lossy-converted, so a
+/// non-UTF-8 `HOME` survives the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DaemonEnvRecord {
+    identity: DaemonIdentity,
+    /// Each key from [`INHERITED_KEYS`] the daemon inherited, as its
+    /// platform-native bytes; an unset key is absent.
+    env: Vec<(String, Vec<u8>)>,
+}
+
+/// Write the daemon's start-time env record, naming the daemon that holds the
+/// singleton now. The daemon calls this at start; the store plan and move read
+/// it through [`inherited_env`]. Best-effort at its call site: a daemon that
+/// cannot write the record still runs, and the plan refuses until it restarts.
+pub(crate) fn write_daemon_env() -> Result<()> {
+    write_daemon_env_from(|key| std::env::var_os(key))
+}
+
+/// [`write_daemon_env`] over an injected env source, so a test drives the
+/// capture (its key list and bytes) without reading the process's own env.
+fn write_daemon_env_from(var: impl Fn(&str) -> Option<OsString>) -> Result<()> {
+    write_env_record(DaemonEnvRecord {
+        identity: current_holder_identity()?,
+        env: INHERITED_KEYS
+            .iter()
+            .filter_map(|key| var(key).map(|value| ((*key).to_string(), env_value_bytes(&value))))
+            .collect(),
+    })
+}
+
+fn write_env_record(record: DaemonEnvRecord) -> Result<()> {
+    let path = daemon_env_path()?;
+    atomic_write_600(&path, serde_json::to_vec(&record)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_env_record() -> Result<Option<DaemonEnvRecord>> {
+    let path = daemon_env_path()?;
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// The daemon's recorded env as (key, value) pairs, only when a record exists
+/// and names the daemon holding the singleton now ([`current_holder_identity`]'s
+/// one way). `None` means no daemon holds the singleton: this process's own
+/// env is the inherited one. A daemon that holds the singleton (or whose
+/// presence cannot be read) but left no matching record — missing, stale,
+/// unreadable, unparseable, or with a value that does not decode — refuses the
+/// plan and move with [`StoreMoveRefusal::DaemonEnvUnrecorded`], never silently
+/// reading the caller's env under a live daemon.
+fn recorded_env_for_live_daemon() -> Result<Option<Vec<(OsString, OsString)>>> {
+    // One presence probe: `current_holder_identity` reads the flock. No daemon
+    // holds it -> this process's own env is the inherited one. A holder (or
+    // presence unreadable) needs a record naming it, else the plan refuses.
+    let current = match current_holder_identity() {
+        Err(NoHolder::NotHeld) => return Ok(None),
+        Err(NoHolder::Unreadable(_)) => return Err(StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+        Ok(identity) => identity,
+    };
+    match read_env_record() {
+        Ok(Some(record)) if record.identity.is_named_by(&current) => recorded_pairs(&record)
+            .map(Some)
+            .map_err(|_| StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+        // Missing, stale, unreadable or unparseable: refuse until this daemon
+        // restarts and records its env.
+        _ => Err(StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+    }
+}
+
+/// The inherited env the store plan and move resolve against, and where a
+/// `CODEX_HOME` it holds came from: the running daemon's record, else this
+/// process's own env, with a clauth codex home scrubbed the way `start daemon`
+/// scrubs it ([`crate::runtime::scrub_clauth_homes`]). A daemon that holds the
+/// singleton but recorded no env refuses with
+/// [`StoreMoveRefusal::DaemonEnvUnrecorded`].
+pub(crate) fn inherited_env() -> Result<(Vec<(OsString, OsString)>, CodexHomeSource)> {
+    match recorded_env_for_live_daemon()? {
+        Some(pairs) => Ok((pairs, CodexHomeSource::DaemonRecord)),
+        None => Ok((
+            own_env(|key| std::env::var_os(key)),
+            CodexHomeSource::Inherited,
+        )),
+    }
+}
+
+/// The recorded env as (key, value) pairs, each value back to an [`OsString`]
+/// losslessly; a value that does not decode (a corrupt record) refuses.
+fn recorded_pairs(record: &DaemonEnvRecord) -> Result<Vec<(OsString, OsString)>> {
+    record
+        .env
+        .iter()
+        .map(|(name, bytes)| Ok((OsString::from(name), env_value_from_bytes(bytes)?)))
+        .collect()
+}
+
+/// This process's own env, restricted to [`INHERITED_KEYS`], with a clauth
+/// codex home scrubbed the way `start daemon` scrubs it. `var` is the env
+/// source, so a test drives the production fallback over hand-built pairs
+/// without reading the process's own env.
+fn own_env(var: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, OsString)> {
+    INHERITED_KEYS
+        .iter()
+        .filter_map(|key| {
+            let value = var(key)?;
+            let value = if *key == "CODEX_HOME" {
+                crate::runtime::scrubbed_codex_home(Some(value))?
+            } else {
+                value
+            };
+            Some((OsString::from(*key), value))
+        })
+        .collect()
+}
+
+/// An env value's bytes as the record stores them: raw on unix, UTF-16LE on
+/// Windows, lossless in both directions.
+#[cfg(unix)]
+fn env_value_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    value.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn env_value_bytes(value: &OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+    value.encode_wide().flat_map(u16::to_le_bytes).collect()
+}
+
+#[cfg(unix)]
+fn env_value_from_bytes(bytes: &[u8]) -> Result<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Ok(OsString::from_vec(bytes.to_vec()))
+}
+
+/// On Windows an odd byte length is a corrupt record: refused, never silently
+/// truncated to whole UTF-16 units.
+#[cfg(windows)]
+fn env_value_from_bytes(bytes: &[u8]) -> Result<OsString> {
+    use std::os::windows::ffi::OsStringExt as _;
+    let (pairs, rest) = bytes.as_chunks::<2>();
+    if !rest.is_empty() {
+        bail!("the daemon env record holds an odd-length value");
+    }
+    let wide: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+    Ok(OsString::from_wide(&wide))
 }
 
 /// clauth edits the adopted config in place, so it must be TOML, and it is
@@ -629,6 +853,15 @@ fn gateway_bind_in(
         None => None,
     };
     resolve_bind(&text, env_bind.as_deref())
+}
+
+/// The gateway's probe address, resolved from the inherited env the store plan
+/// and move use ([`inherited_env`]), for minting the move's silent proof: the
+/// same env means a `SHUNT_SERVER__BIND` set only in the caller's shell cannot
+/// make the proof and the move disagree.
+pub(crate) fn gateway_probe(record: &GatewayRecord) -> Result<SocketAddr> {
+    let env = gateway_env(record)?;
+    Ok(gateway_bind_in(record, &env, inherited_env()?.0)?.probe)
 }
 
 /// The env override shunt's figment layer maps onto
@@ -2379,13 +2612,18 @@ pub(crate) struct StoreMove {
     pub(crate) kept: Vec<KeptFile>,
 }
 
-/// A file or dir the move left at its source on purpose, by path, or a store
-/// it left out of the move (a `NoHome` reason: `path` is empty, the reason
-/// names the store).
+/// A file or dir the move left at its source on purpose, named by path, or a
+/// store it left out of the move, named by its env key — never an empty path
+/// standing in for a store. The two shapes are distinct: a `NoHome` entry
+/// names a store, every other entry a path, so an illegal pairing is
+/// unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeptFile {
-    pub(crate) path: PathBuf,
-    pub(crate) reason: KeptReason,
+pub(crate) enum KeptFile {
+    /// A file or dir left at this path, for `reason`.
+    At { path: PathBuf, reason: KeptReason },
+    /// A whole store left out of the move because its shunt site has a default
+    /// but no source named a usable home, named by its env key.
+    NoHome { store: &'static str },
 }
 
 /// Why the move left a file or dir at its source.
@@ -2406,24 +2644,19 @@ pub(crate) enum KeptReason {
     /// A subdir, link or non-account file inside a store dir that shunt does
     /// not serve, left in the old dir.
     LeftBehind,
-    /// The store's shunt site has a default, but no source named a usable
-    /// home, so the default is working-directory-relative and clauth cannot
-    /// tell where it lands: the store is left out, never moved to a guessed
-    /// path.
-    NoHome {
-        /// The store's env key, so the plan names the store and its fix.
-        store: &'static str,
-    },
     /// A later store key names the same source file as an earlier planned
     /// entry; the first entry moves it, this one is listed instead.
     DuplicateSource,
 }
 
-/// Which of the two places clauth can read the codex CLI's `CODEX_HOME` set a
-/// value: the recorded env file, or clauth's own inherited environment.
+/// Which of the places clauth can read the codex CLI's `CODEX_HOME` set a
+/// value: the recorded env file, the running daemon's env record, or clauth's
+/// own inherited environment (the no-daemon fallback). The refusal copy for a
+/// relative value names the right one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexHomeSource {
     EnvFile,
+    DaemonRecord,
     Inherited,
 }
 
@@ -2444,9 +2677,16 @@ pub(crate) enum StoreMoveRefusal {
     /// The store's default resolved under a home that is relative, so shunt's
     /// default for the store is working-directory-relative; nothing moved.
     RelativeHome { store: &'static str },
+    /// The home the codex CLI's own `~/.codex` login resolves under is
+    /// relative, so the guard keeping that login out of the move cannot name
+    /// it; nothing moved.
+    RelativeCodexLoginHome,
     /// `CODEX_HOME` is relative; clauth cannot tell which codex login it
     /// names, so nothing moved.
     RelativeCodexHome { source: CodexHomeSource },
+    /// A daemon holds the singleton but no record names it (missing, stale,
+    /// unreadable or unparseable); nothing moved.
+    DaemonEnvUnrecorded,
     /// The `silent` proof was minted at a different address than the one the
     /// record's config says to probe; nothing moved.
     SilentMismatch {
@@ -2467,6 +2707,9 @@ pub(crate) enum StoreMoveRefusal {
         failed: MovedFile,
         cause: std::io::Error,
     },
+    /// The fresh plan at move time differs from the plan the user confirmed;
+    /// nothing moved.
+    PlanChanged,
 }
 
 impl std::fmt::Display for StoreMoveRefusal {
@@ -2503,6 +2746,9 @@ impl std::fmt::Display for StoreMoveRefusal {
                 f,
                 "the standalone's home names no absolute directory, so shunt's default for {store} is relative to the standalone's working directory, which clauth cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
             ),
+            StoreMoveRefusal::RelativeCodexLoginHome => f.write_str(
+                "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again",
+            ),
             StoreMoveRefusal::RelativeCodexHome {
                 source: CodexHomeSource::EnvFile,
             } => f.write_str(
@@ -2513,6 +2759,14 @@ impl std::fmt::Display for StoreMoveRefusal {
             } => f.write_str(
                 "CODEX_HOME in clauth's own environment is a relative path, and clauth cannot tell which codex login it names; nothing was moved; set CODEX_HOME to an absolute path, then run the move again",
             ),
+            StoreMoveRefusal::RelativeCodexHome {
+                source: CodexHomeSource::DaemonRecord,
+            } => f.write_str(
+                "CODEX_HOME in the running daemon's environment is a relative path; restart the daemon with an absolute CODEX_HOME",
+            ),
+            StoreMoveRefusal::DaemonEnvUnrecorded => {
+                f.write_str("the running daemon recorded no environment; restart it, then look at the plan again")
+            }
             StoreMoveRefusal::SilentMismatch { silent, probe } => write!(
                 f,
                 "the silent proof was minted at {silent}, not the gateway's probe address {probe}; probe {probe} and run the move again"
@@ -2538,6 +2792,9 @@ impl std::fmt::Display for StoreMoveRefusal {
                 to = failed.to.display(),
                 moved = moved.len()
             ),
+            StoreMoveRefusal::PlanChanged => {
+                f.write_str("the stores changed since the plan was shown; look at the plan again")
+            }
         }
     }
 }
@@ -2556,43 +2813,141 @@ pub(crate) fn store_env() -> Result<Vec<(&'static str, PathBuf)>> {
         .collect())
 }
 
-/// Move every standalone store under `~/.clauth/shunt/`, file by file. Each
-/// store's source is the path the record's env file sets for its key, read
-/// as shunt reads it ([`Source`]), else shunt's default under the
-/// standalone's home (its shunt site's [`HomeRule`], the env file's `HOME`
-/// over the inherited env, not clauth's own home). A store whose default
-/// home no source names is listed in [`StoreMove::kept`] with its fix, never
-/// moved from a guessed path, and the rest of the move still proceeds.
-/// Another owner's login never moves: the codex CLI's own login
-/// (`~/.codex/auth.json`, `$CODEX_HOME/auth.json` from the env file or the
-/// inherited env) and anything under `~/.clauth` stay at their source and are
-/// named in [`StoreMove::kept`], as does, on every platform, any file with
-/// another name (a hard link, whoever holds the other name) or whose link
-/// count cannot be read; a dir store at a codex home stays whole. The `silent`
-/// proof must name the record's probe address.
+/// What a store move will do, shown before the user's yes: every credential
+/// it will move, and every one it will leave at its source on purpose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreMovePlan {
+    pub(crate) moved: Vec<MovedFile>,
+    pub(crate) kept: Vec<KeptFile>,
+}
+
+/// Plan the standalone-store move over the inherited env [`inherited_env`]
+/// returns (the running daemon's recorded env, else the caller's own). The
+/// card shows the plan before the user's yes; [`move_standalone_stores`]
+/// re-plans and refuses when the tree changed since.
+pub(crate) fn plan_standalone_stores(record: &GatewayRecord) -> Result<StoreMovePlan> {
+    let (inherited, source) = inherited_env()?;
+    plan_standalone_stores_in(record, inherited, source)
+}
+
+/// [`plan_standalone_stores`] over the caller's inherited env, so tests inject
+/// one (for `CODEX_HOME`) instead of reading the process's own or the
+/// daemon's record.
 ///
-/// Refuses before moving anything when a destination already holds a file,
-/// the proof names another address, a `CODEX_HOME` is relative, or a store
-/// itself is a link (one onto another owner's login is kept instead) or not
-/// the directory or regular file its kind names. Each
-/// file is copied into an owner-only staging file, published as its
+/// Each store's source is the path the record's env file sets for its key,
+/// read as shunt reads it ([`Source`]), else shunt's default under the
+/// standalone's home (its shunt site's [`HomeRule`], the env file's `HOME`
+/// over the inherited env, not clauth's own home). A store whose default home
+/// no source names is listed in `kept` with its fix, never moved from a
+/// guessed path, and the rest of the plan still proceeds. Another owner's
+/// login never moves: the codex CLI's own login (`~/.codex/auth.json`,
+/// `$CODEX_HOME/auth.json` from the env file or the inherited env) and
+/// anything under `~/.clauth` stay at their source and are named in `kept`, as
+/// does, on every platform, any file with another name (a hard link, whoever
+/// holds the other name) or whose link count cannot be read; a dir store at a
+/// codex home stays whole.
+///
+/// Refuses when a destination already holds a file, a `CODEX_HOME` is
+/// relative, a store source is a relative path, the home the codex CLI's own
+/// login or a store's default resolves under is relative, or a store itself is a link (one onto another owner's login is
+/// kept instead) or not the directory or regular file its kind names.
+fn plan_standalone_stores_in(
+    record: &GatewayRecord,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    source: CodexHomeSource,
+) -> Result<StoreMovePlan> {
+    let inherited: Vec<(OsString, OsString)> = inherited.into_iter().collect();
+    let named = match &record.env_file {
+        Some(path) => read_env_file(path)?,
+        None => GatewayEnv::default(),
+    };
+    let codex = CodexOwnership::compute(&named, &inherited, source)?;
+    let to_root = managed_store_root()?;
+    let (moved, kept) = plan_stores(&named, &inherited, &codex, &to_root)?;
+    refuse_collisions(&moved)?;
+    Ok(StoreMovePlan { moved, kept })
+}
+
+/// Plan every store's move: `(moved, kept)` against `named` (the env file) and
+/// `inherited` (the daemon's or caller's own env).
+fn plan_stores(
+    named: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    codex: &CodexOwnership,
+    to_root: &Path,
+) -> Result<(Vec<MovedFile>, Vec<KeptFile>)> {
+    let mut plan = Vec::new();
+    let mut kept = Vec::new();
+    let mut seen = HashSet::new();
+    for store in &STORES {
+        match store_source(store, named, inherited)? {
+            StoreSource::Absent => {}
+            StoreSource::NoHome => kept.push(KeptFile::NoHome { store: store.env }),
+            StoreSource::Path(from) => plan_store(
+                store.kind,
+                &from,
+                &under(to_root, store.segments),
+                &mut plan,
+                &mut kept,
+                codex,
+                &mut seen,
+            )?,
+        }
+    }
+    Ok((plan, kept))
+}
+
+/// Refuse the plan when a destination already holds a file, before anything
+/// moves: the publish is a hard link that would refuse the name anyway, and
+/// the check names every collision at once.
+fn refuse_collisions(plan: &[MovedFile]) -> Result<()> {
+    let mut collisions = Vec::new();
+    for file in plan {
+        match std::fs::symlink_metadata(&file.to) {
+            Ok(_) => collisions.push(file.to.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to inspect {}", file.to.display()));
+            }
+        }
+    }
+    if !collisions.is_empty() {
+        return Err(StoreMoveRefusal::Collision { paths: collisions }.into());
+    }
+    Ok(())
+}
+
+/// Move the stores a confirmed [`StoreMovePlan`] names, file by file. The
+/// `silent` proof must name the record's probe address. The move re-plans
+/// against the inherited env [`inherited_env`] returns and refuses with
+/// [`StoreMoveRefusal::PlanChanged`], moving nothing, when the fresh plan
+/// differs from `confirmed`; a fresh-plan refusal (a collision, a relative
+/// `CODEX_HOME`, a store that changed into a link or the wrong kind) refuses
+/// as it would at plan time.
+///
+/// Each file is copied into an owner-only staging file, published as its
 /// destination by a hard link that refuses an existing name, synced into its
-/// dir, and only then removed at its source, so a failure at any step
-/// leaves the credential at its source, its destination or both, never at
-/// neither. Source dirs are left in place.
+/// dir, and only then removed at its source, so a failure at any step leaves
+/// the credential at its source, its destination or both, never at neither.
+/// Source dirs are left in place.
 pub(crate) fn move_standalone_stores(
     record: &GatewayRecord,
     silent: GatewaySilent,
+    confirmed: &StoreMovePlan,
 ) -> Result<StoreMove> {
-    move_standalone_stores_in(record, silent, std::env::vars_os())
+    let (inherited, source) = inherited_env()?;
+    move_standalone_stores_in(record, silent, confirmed, inherited, source)
 }
 
-/// [`move_standalone_stores`] over the caller's inherited env, so tests
-/// inject one (for `CODEX_HOME`) instead of reading the process's own.
+/// [`move_standalone_stores`] over the caller's inherited env, so tests inject
+/// one (for `CODEX_HOME`) instead of reading the process's own or the
+/// daemon's record.
 fn move_standalone_stores_in(
     record: &GatewayRecord,
     silent: GatewaySilent,
+    confirmed: &StoreMovePlan,
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    source: CodexHomeSource,
 ) -> Result<StoreMove> {
     let inherited: Vec<(OsString, OsString)> = inherited.into_iter().collect();
     // The take-over's precondition: the proof must name the address the
@@ -2606,48 +2961,12 @@ fn move_standalone_stores_in(
         }
         .into());
     }
-    let named = match &record.env_file {
-        Some(path) => read_env_file(path)?,
-        None => GatewayEnv::default(),
-    };
-    let codex = CodexOwnership::compute(&named, &inherited)?;
-    let to_root = managed_store_root()?;
-    let mut plan = Vec::new();
-    let mut kept = Vec::new();
-    let mut seen = HashSet::new();
-    for store in &STORES {
-        match store_source(store, &named, &inherited)? {
-            StoreSource::Absent => {}
-            StoreSource::NoHome => kept.push(KeptFile {
-                path: PathBuf::new(),
-                reason: KeptReason::NoHome { store: store.env },
-            }),
-            StoreSource::Path(from) => plan_store(
-                store.kind,
-                &from,
-                &under(&to_root, store.segments),
-                &mut plan,
-                &mut kept,
-                &codex,
-                &mut seen,
-            )?,
-        }
+    let fresh = plan_standalone_stores_in(record, inherited.iter().cloned(), source)?;
+    if &fresh != confirmed {
+        return Err(StoreMoveRefusal::PlanChanged.into());
     }
-    let mut collisions = Vec::new();
-    for file in &plan {
-        match std::fs::symlink_metadata(&file.to) {
-            Ok(_) => collisions.push(file.to.clone()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to inspect {}", file.to.display()));
-            }
-        }
-    }
-    if !collisions.is_empty() {
-        return Err(StoreMoveRefusal::Collision { paths: collisions }.into());
-    }
-    let mut moved = Vec::with_capacity(plan.len());
-    for file in plan {
+    let mut moved = Vec::with_capacity(fresh.moved.len());
+    for file in fresh.moved {
         match move_credential(&file.from, &file.to) {
             Ok(()) => moved.push(file),
             Err(MoveFailure::BeforeCopy(cause)) => {
@@ -2668,7 +2987,10 @@ fn move_standalone_stores_in(
             }
         }
     }
-    Ok(StoreMove { moved, kept })
+    Ok(StoreMove {
+        moved,
+        kept: fresh.kept,
+    })
 }
 
 /// Where the standalone kept `store`.
@@ -2765,6 +3087,22 @@ fn resolve_home(
     named: &GatewayEnv,
     inherited: &[(OsString, OsString)],
 ) -> Option<PathBuf> {
+    match store.home {
+        Some(HomeRule::HomeThenUserProfile) => resolved_home_else_userprofile(named, inherited),
+        Some(HomeRule::RawHome) => standalone_var(named, inherited, "HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from),
+        None => None,
+    }
+}
+
+/// `HOME` non-empty, else `USERPROFILE` non-empty, each from the env file over
+/// the inherited env — the resolution the `HomeThenUserProfile` store defaults
+/// and the codex CLI's `~` share.
+fn resolved_home_else_userprofile(
+    named: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+) -> Option<PathBuf> {
     let home = standalone_var(named, inherited, "HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from);
@@ -2773,11 +3111,29 @@ fn resolve_home(
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
     };
-    match store.home {
-        Some(HomeRule::HomeThenUserProfile) => home.or_else(userprofile),
-        Some(HomeRule::RawHome) => home,
-        None => None,
+    home.or_else(userprofile)
+}
+
+/// The codex CLI's default home `~/.codex`, resolved the way the codex CLI
+/// resolves `~` for the move: `HOME` non-empty, else `USERPROFILE` non-empty,
+/// each from the env file over the inherited env ([`resolved_home_else_userprofile`]),
+/// so a daemon or env file whose home differs from clauth's own still guards
+/// the right login. `None` when no source names a home; clauth's own home is
+/// then the only guess, as it was before the daemon's env was recorded. A
+/// relative home refuses with [`StoreMoveRefusal::RelativeCodexLoginHome`]
+/// rather than a guard that silently stops matching: `~/.codex` under a
+/// relative home names no absolute login.
+fn default_codex_home(
+    named: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+) -> Result<Option<PathBuf>> {
+    let Some(home) = resolved_home_else_userprofile(named, inherited) else {
+        return Ok(None);
+    };
+    if !home.is_absolute() {
+        return Err(StoreMoveRefusal::RelativeCodexLoginHome.into());
     }
+    Ok(Some(home.join(".codex")))
 }
 
 /// The codex CLI's own home and login, computed once per move.
@@ -2790,14 +3146,29 @@ struct CodexOwnership {
 }
 
 impl CodexOwnership {
-    fn compute(named: &GatewayEnv, inherited: &[(OsString, OsString)]) -> Result<Self> {
-        let default_home = home_dir()?.join(".codex");
-        let mut homes = vec![default_home.clone()];
-        let mut logins = vec![default_home.join("auth.json")];
+    fn compute(
+        named: &GatewayEnv,
+        inherited: &[(OsString, OsString)],
+        inherited_source: CodexHomeSource,
+    ) -> Result<Self> {
+        let mut homes = vec![home_dir()?.join(".codex")];
+        let mut logins = vec![home_dir()?.join(".codex").join("auth.json")];
+        // clauth's own home's `.codex` is guarded unconditionally: the codex
+        // CLI's login there stays whoever else's home the env file or the
+        // daemon's record names. The resolved default home (`~/.codex` under
+        // the inherited/env-file HOME) is a second guard, so a home that
+        // differs from clauth's own still guards the right login; the dedupe
+        // keeps the two from double-listing when they name one dir.
+        if let Some(default_home) = default_codex_home(named, inherited)?
+            && !homes.contains(&default_home)
+        {
+            logins.push(default_home.join("auth.json"));
+            homes.push(default_home);
+        }
         // The codex CLI reads `CODEX_HOME` from its own env, which a standalone
         // could have set in either of the two places clauth can see: the
-        // recorded env file, or the env clauth itself inherited. Both are
-        // guarded, neither outranking the other.
+        // recorded env file, or the env the daemon/this process inherited.
+        // Both are guarded, neither outranking the other.
         if let Some(value) = env_value_folded(&named.vars, "CODEX_HOME", var_os_key) {
             push_codex_home(&mut homes, &mut logins, value, CodexHomeSource::EnvFile)?;
         }
@@ -2807,7 +3178,7 @@ impl CodexOwnership {
             name.to_str()
                 .is_some_and(|name| var_os_key(name) == var_os_key("CODEX_HOME"))
         }) {
-            push_codex_home(&mut homes, &mut logins, value, CodexHomeSource::Inherited)?;
+            push_codex_home(&mut homes, &mut logins, value, inherited_source)?;
         }
         Ok(Self { homes, logins })
     }
@@ -2946,7 +3317,7 @@ fn plan_store(
     // codex login canonicalizes to the login, so it is kept by path, not
     // refused as a non-regular store.
     if let Some(reason) = another_owners_login(from, kind == StoreKind::Dir, codex)? {
-        kept.push(KeptFile {
+        kept.push(KeptFile::At {
             path: from.to_path_buf(),
             reason,
         });
@@ -3002,7 +3373,7 @@ fn plan_dir(
             .with_context(|| format!("failed to inspect {}", source.display()))?;
         if file_type.is_file() && is_account_file(&source) {
             if let Some(reason) = another_owners_login(&source, false, codex)? {
-                kept.push(KeptFile {
+                kept.push(KeptFile::At {
                     path: source,
                     reason,
                 });
@@ -3010,7 +3381,7 @@ fn plan_dir(
                 push_planned(source, to.join(entry.file_name()), plan, kept, seen)?;
             }
         } else {
-            kept.push(KeptFile {
+            kept.push(KeptFile::At {
                 path: source,
                 reason: KeptReason::LeftBehind,
             });
@@ -3032,7 +3403,7 @@ fn push_planned(
     if let Some(canonical) = canonical(&from)?
         && !seen.insert(canonical)
     {
-        kept.push(KeptFile {
+        kept.push(KeptFile::At {
             path: from,
             reason: KeptReason::DuplicateSource,
         });

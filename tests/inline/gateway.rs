@@ -2122,10 +2122,7 @@ fn under(root: &Path, segments: &[&str]) -> PathBuf {
 
 /// A store whose default home could not be determined, listed with its key.
 fn no_home(store: &'static str) -> KeptFile {
-    KeptFile {
-        path: PathBuf::new(),
-        reason: KeptReason::NoHome { store },
-    }
+    KeptFile::NoHome { store }
 }
 
 /// [`adopted`] with its env file holding `text`.
@@ -2144,11 +2141,32 @@ fn quoted(path: &Path) -> String {
     format!("'{}'", path.display())
 }
 
-/// [`move_standalone_stores_in`] with the sandbox `HOME` as the inherited
-/// env, so every store's default resolves under the sandbox home, never a
-/// production fallback.
+/// Plan then move with the sandbox `HOME` as the inherited env, so every
+/// store's default resolves under the sandbox home, never a production
+/// fallback.
 fn move_stores(record: &GatewayRecord) -> Result<StoreMove> {
-    move_standalone_stores_in(record, GatewaySilent::for_test(), sandbox_home())
+    move_stores_with(record, sandbox_home())
+}
+
+/// Plan then move over `inherited`, the way the card's flow does over the
+/// reader's env, so a test injects one instead of reading the process's own.
+fn move_stores_with(
+    record: &GatewayRecord,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<StoreMove> {
+    let inherited: Vec<(OsString, OsString)> = inherited.into_iter().collect();
+    let plan = plan_standalone_stores_in(
+        record,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )?;
+    move_standalone_stores_in(
+        record,
+        GatewaySilent::for_test(),
+        &plan,
+        inherited,
+        CodexHomeSource::Inherited,
+    )
 }
 
 /// The sandbox `HOME`, injected as the inherited env: the home every test
@@ -2158,6 +2176,53 @@ fn sandbox_home() -> [(OsString, OsString); 1] {
         OsString::from("HOME"),
         home_dir().expect("the sandbox home").into_os_string(),
     )]
+}
+
+/// The SHA-256 of a file's bytes, so a before/after comparison is a byte
+/// identity check, never a name or length check.
+fn sha256(path: &Path) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(fs::read(path).expect("read")).into()
+}
+
+/// Write the daemon env record naming the current test process as the live
+/// holder (the pid sidecar stamped first), with the given env values. The
+/// caller holds the daemon lock for the whole read that follows.
+fn write_env_record_naming_self(
+    home: &HomeSandbox,
+    codex_home: Option<&Path>,
+    home_env: Option<&Path>,
+) {
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    let identity = DaemonIdentity {
+        pid,
+        start: Some(
+            crate::daemon::gateway::process_start_time(pid).expect("the test process start time"),
+        ),
+    };
+    write_env_record(DaemonEnvRecord {
+        identity,
+        env: record_env(codex_home, home_env),
+    })
+    .expect("write the env record");
+}
+
+/// A record's env for tests: `CODEX_HOME` and `HOME` when `Some`, each as its
+/// platform-native bytes.
+fn record_env(codex_home: Option<&Path>, home_env: Option<&Path>) -> Vec<(String, Vec<u8>)> {
+    let mut env = Vec::new();
+    if let Some(value) = codex_home {
+        env.push(("CODEX_HOME".to_string(), env_value_bytes(value.as_os_str())));
+    }
+    if let Some(home) = home_env {
+        env.push(("HOME".to_string(), env_value_bytes(home.as_os_str())));
+    }
+    env
 }
 
 /// Every store moves file by file into an owner-only layout that holds
@@ -2487,7 +2552,7 @@ fn a_link_inside_a_store_is_left_behind_and_the_files_around_it_move() {
                 from: main.clone(),
                 to: under(&dst, &["accounts", "claude", "main.json"]),
             }],
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: link.clone(),
                 reason: KeptReason::LeftBehind,
             }],
@@ -2538,23 +2603,23 @@ fn a_dir_store_moves_only_the_account_files_and_lists_the_rest_as_left_behind() 
                 to: under(&dst, &claude).join("main.json"),
             }],
             kept: vec![
-                KeptFile {
+                KeptFile::At {
                     path: caps.clone(),
                     reason: KeptReason::LeftBehind,
                 },
-                KeptFile {
+                KeptFile::At {
                     path: a_b.clone(),
                     reason: KeptReason::LeftBehind,
                 },
-                KeptFile {
+                KeptFile::At {
                     path: backup.clone(),
                     reason: KeptReason::LeftBehind,
                 },
-                KeptFile {
+                KeptFile::At {
                     path: link.clone(),
                     reason: KeptReason::LeftBehind,
                 },
-                KeptFile {
+                KeptFile::At {
                     path: notes.clone(),
                     reason: KeptReason::LeftBehind,
                 },
@@ -2922,9 +2987,8 @@ fn each_familys_default_home_follows_its_shunt_site_rule() {
     write(&sandbox_xai, "xai-home");
     let record = adopted(&home);
 
-    let result = move_standalone_stores_in(
+    let result = move_stores_with(
         &record,
-        GatewaySilent::for_test(),
         [(
             OsString::from("USERPROFILE"),
             winhome.as_os_str().to_os_string(),
@@ -2973,12 +3037,8 @@ fn a_store_with_no_home_is_listed_not_refused() {
     write(&main, "claude-main");
     let record = adopted(&home);
 
-    let result = move_standalone_stores_in(
-        &record,
-        GatewaySilent::for_test(),
-        [(OsString::from("HOME"), OsString::new())],
-    )
-    .expect("no home lists the stores, never refuses");
+    let result = move_stores_with(&record, [(OsString::from("HOME"), OsString::new())])
+        .expect("no home lists the stores, never refuses");
 
     assert_eq!(result.moved, Vec::<MovedFile>::new());
     assert_eq!(
@@ -3016,8 +3076,7 @@ fn a_store_with_no_determinable_home_is_listed_not_moved() {
     );
 
     let dst = home.home().join(".clauth").join("shunt");
-    let result = move_standalone_stores_in(&record, GatewaySilent::for_test(), std::iter::empty())
-        .expect("move");
+    let result = move_stores_with(&record, std::iter::empty()).expect("move");
 
     assert_eq!(
         result,
@@ -3049,7 +3108,9 @@ fn a_store_with_no_determinable_home_is_listed_not_moved() {
 }
 
 /// A home the env file names as a relative path still refuses, since the
-/// standalone resolved it against a working directory clauth cannot know.
+/// standalone resolved it against a working directory clauth cannot know. The
+/// codex `~/.codex` guard resolves the same home the store defaults use, so
+/// its refusal is the first to fire.
 #[test]
 fn a_relative_home_still_refuses_the_move() {
     let home = HomeSandbox::new();
@@ -3060,7 +3121,7 @@ fn a_relative_home_still_refuses_the_move() {
     assert_eq!(
         result.map(|m| m.moved).map_err(|e| e.to_string()),
         Err(
-            "the standalone's home names no absolute directory, so shunt's default for SHUNT_CLAUDE_ACCOUNTS_DIR is relative to the standalone's working directory, which clauth cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
+            "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
                 .to_string()
         )
     );
@@ -3092,7 +3153,7 @@ fn two_store_keys_naming_one_file_move_it_once_and_list_the_second() {
                 from: shared.clone(),
                 to: dst.join("xai-auth.json"),
             }],
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: shared.clone(),
                 reason: KeptReason::DuplicateSource,
             }],
@@ -3192,7 +3253,7 @@ fn a_named_codex_file_moves_in_unless_it_is_another_owners_login() {
             move_stores(&record).map_err(|e| format!("{e:#}")),
             Ok(StoreMove {
                 moved: Vec::new(),
-                kept: vec![KeptFile {
+                kept: vec![KeptFile::At {
                     path: path.clone(),
                     reason,
                 }],
@@ -3227,7 +3288,7 @@ fn a_hard_link_onto_the_codex_login_named_by_codex_auth_file_stays() {
         move_stores(&record).map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: hard.clone(),
                 reason: KeptReason::HardLink,
             }],
@@ -3255,7 +3316,7 @@ fn an_unreadable_link_count_keeps_the_file() {
         move_stores(&record).map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: own.clone(),
                 reason: KeptReason::LinkCountUnreadable,
             }],
@@ -3288,7 +3349,7 @@ fn a_dir_store_file_hard_linked_onto_the_codex_login_stays() {
                 from: a.clone(),
                 to: under(&dst, &["accounts", "codex", "a.json"]),
             }],
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: me.clone(),
                 reason: KeptReason::HardLink,
             }],
@@ -3320,7 +3381,7 @@ fn a_dir_store_at_the_codex_home_stays_whole() {
         move_stores(&record).map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: codex_home.clone(),
                 reason: KeptReason::CodexLogin,
             }],
@@ -3358,7 +3419,7 @@ fn a_codex_file_at_a_custom_codex_home_stays() {
         move_stores(&record).map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: login.clone(),
                 reason: KeptReason::CodexLogin,
             }],
@@ -3367,9 +3428,8 @@ fn a_codex_file_at_a_custom_codex_home_stays() {
 
     let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&login)));
     assert_eq!(
-        move_standalone_stores_in(
+        move_stores_with(
             &record,
-            GatewaySilent::for_test(),
             [
                 (
                     OsString::from("CODEX_HOME"),
@@ -3384,7 +3444,7 @@ fn a_codex_file_at_a_custom_codex_home_stays() {
         .map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: login.clone(),
                 reason: KeptReason::CodexLogin,
             }],
@@ -3417,9 +3477,8 @@ fn both_codex_home_sources_are_guarded_at_once() {
         );
 
         assert_eq!(
-            move_standalone_stores_in(
+            move_stores_with(
                 &record,
-                GatewaySilent::for_test(),
                 [
                     (OsString::from("CODEX_HOME"), b.as_os_str().to_os_string()),
                     (
@@ -3431,7 +3490,7 @@ fn both_codex_home_sources_are_guarded_at_once() {
             .map_err(|e| format!("{e:#}")),
             Ok(StoreMove {
                 moved: Vec::new(),
-                kept: vec![KeptFile {
+                kept: vec![KeptFile::At {
                     path: login.clone(),
                     reason: KeptReason::CodexLogin,
                 }],
@@ -3472,9 +3531,8 @@ fn a_dir_store_at_either_codex_home_stays_whole() {
         );
 
         assert_eq!(
-            move_standalone_stores_in(
+            move_stores_with(
                 &record,
-                GatewaySilent::for_test(),
                 [
                     (OsString::from("CODEX_HOME"), b.as_os_str().to_os_string()),
                     (
@@ -3486,7 +3544,7 @@ fn a_dir_store_at_either_codex_home_stays_whole() {
             .map_err(|e| format!("{e:#}")),
             Ok(StoreMove {
                 moved: Vec::new(),
-                kept: vec![KeptFile {
+                kept: vec![KeptFile::At {
                     path: dir.clone(),
                     reason: KeptReason::CodexLogin,
                 }],
@@ -3525,9 +3583,8 @@ fn every_inherited_codex_home_entry_is_guarded() {
     );
 
     assert_eq!(
-        move_standalone_stores_in(
+        move_stores_with(
             &record,
-            GatewaySilent::for_test(),
             [
                 (OsString::from("CODEX_HOME"), c.as_os_str().to_os_string()),
                 (OsString::from("CODEX_HOME"), d.as_os_str().to_os_string()),
@@ -3541,11 +3598,11 @@ fn every_inherited_codex_home_entry_is_guarded() {
         Ok(StoreMove {
             moved: Vec::new(),
             kept: vec![
-                KeptFile {
+                KeptFile::At {
                     path: d.join("auth.json"),
                     reason: KeptReason::CodexLogin,
                 },
-                KeptFile {
+                KeptFile::At {
                     path: c.join("auth.json"),
                     reason: KeptReason::CodexLogin,
                 },
@@ -3582,9 +3639,8 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
     {
         let home = HomeSandbox::new();
         let record = adopted(&home);
-        let err = move_standalone_stores_in(
+        let err = move_stores_with(
             &record,
-            GatewaySilent::for_test(),
             [(OsString::from("CODEX_HOME"), OsString::from("rel-codex"))],
         )
         .expect_err("a relative CODEX_HOME in the inherited env");
@@ -3607,9 +3663,8 @@ fn a_relative_codex_home_refuses_the_move_naming_the_key() {
     {
         let home = HomeSandbox::new();
         let record = adopted(&home);
-        let err = move_standalone_stores_in(
+        let err = move_stores_with(
             &record,
-            GatewaySilent::for_test(),
             [(OsString::from("CODEX_HOME"), OsString::from(" "))],
         )
         .expect_err("a whitespace CODEX_HOME in the inherited env");
@@ -3636,7 +3691,7 @@ fn an_empty_codex_home_is_unset() {
         move_stores(&record).map_err(|e| format!("{e:#}")),
         Ok(StoreMove {
             moved: Vec::new(),
-            kept: vec![KeptFile {
+            kept: vec![KeptFile::At {
                 path: codex_login.clone(),
                 reason: KeptReason::CodexLogin,
             }],
@@ -3656,10 +3711,14 @@ fn the_move_refuses_a_silent_proof_from_another_address() {
     let record = adopted(&home);
     let other: SocketAddr = "127.0.0.1:3999".parse().expect("addr");
 
+    let plan = plan_standalone_stores_in(&record, std::iter::empty(), CodexHomeSource::Inherited)
+        .expect("plan");
     let err = move_standalone_stores_in(
         &record,
         GatewaySilent::for_test_at(other),
+        &plan,
         std::iter::empty(),
+        CodexHomeSource::Inherited,
     )
     .expect_err("a proof from another address");
     assert_eq!(
@@ -3674,4 +3733,715 @@ fn the_move_refuses_a_silent_proof_from_another_address() {
         other => panic!("a SilentMismatch refusal, got {other:?}"),
     }
     assert!(!home.home().join(".clauth").join("shunt").exists());
+}
+
+/// A `CODEX_HOME` set only in the daemon's recorded env (not the test
+/// process's env, not the env file) keeps the login `CODEX_AUTH_FILE` names at
+/// that home: the plan reads the running daemon's record through the reader,
+/// so the codex CLI's own login stays at its source.
+#[test]
+fn a_codex_home_set_only_in_the_daemons_record_keeps_its_auth_json() {
+    let home = HomeSandbox::new();
+    let custom = home.home().join("custom-codex");
+    let login = custom.join("auth.json");
+    write(&login, "codex-cli-login");
+    let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&login)));
+
+    let _held = crate::daemon::hold_daemon_lock();
+    write_env_record_naming_self(&home, Some(&custom), Some(home.home()));
+
+    let plan = plan_standalone_stores(&record).expect("plan");
+    assert_eq!(plan.moved, Vec::<MovedFile>::new(), "nothing moves");
+    assert_eq!(
+        plan.kept,
+        vec![KeptFile::At {
+            path: login.clone(),
+            reason: KeptReason::CodexLogin,
+        }],
+        "only the codex login is kept, as the codex CLI's own"
+    );
+    assert_eq!(fs::read_to_string(&login).expect("kept"), "codex-cli-login");
+    assert!(!home.home().join(".clauth").join("shunt").exists());
+}
+
+/// The reader returns the record only when it names the daemon holding the
+/// singleton now: a record naming another pid, or this pid with another start
+/// token, is a dead daemon's and refuses the plan rather than reading as the
+/// running daemon's env.
+#[test]
+fn the_env_record_reads_only_the_live_holders_record() {
+    let home = HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    let start =
+        crate::daemon::gateway::process_start_time(pid).expect("the test process start time");
+
+    let live = DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(start.clone()),
+        },
+        env: vec![(
+            "CODEX_HOME".to_string(),
+            env_value_bytes(OsStr::new("/live")),
+        )],
+    };
+    write_env_record(live.clone()).expect("write");
+    assert_eq!(
+        recorded_env_for_live_daemon().expect("a live record"),
+        Some(vec![(
+            OsString::from("CODEX_HOME"),
+            OsString::from("/live"),
+        )])
+    );
+
+    // A record naming another pid is a dead daemon's: the plan refuses.
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid: pid + 1,
+            start: Some(start.clone()),
+        },
+        env: vec![(
+            "CODEX_HOME".to_string(),
+            env_value_bytes(OsStr::new("/other")),
+        )],
+    })
+    .expect("write");
+    assert_eq!(
+        recorded_env_for_live_daemon()
+            .expect_err("a stale record refuses")
+            .to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+
+    // A record naming this pid with another start token is another instance's.
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some("another-token".to_string()),
+        },
+        env: vec![(
+            "CODEX_HOME".to_string(),
+            env_value_bytes(OsStr::new("/other")),
+        )],
+    })
+    .expect("write");
+    assert_eq!(
+        recorded_env_for_live_daemon()
+            .expect_err("a stale record refuses")
+            .to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+}
+
+/// A record naming this process while no daemon holds the singleton is not
+/// trusted: the reader falls back to the caller's own env, because presence is
+/// the lock, never a matching record alone.
+#[test]
+fn a_record_naming_this_process_without_the_singleton_held_falls_back() {
+    let home = HomeSandbox::new();
+    // No daemon lock held.
+    std::fs::create_dir_all(home.home().join(".clauth")).expect("mkdir");
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(crate::daemon::gateway::process_start_time(pid).expect("start")),
+        },
+        env: vec![(
+            "CODEX_HOME".to_string(),
+            env_value_bytes(OsStr::new("/live")),
+        )],
+    })
+    .expect("write");
+    assert_eq!(recorded_env_for_live_daemon().expect("no daemon"), None);
+}
+
+/// The daemon writes the record through the production path naming itself,
+/// owner-only on unix, and unset values round-trip as unset (absent) rather
+/// than as an empty value.
+#[test]
+fn the_daemon_env_record_is_0600_and_unset_values_round_trip_as_unset() {
+    let home = HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+
+    write_daemon_env().expect("write");
+    let record = read_env_record().expect("read").expect("present");
+    assert_eq!(
+        record.identity,
+        DaemonIdentity {
+            pid: std::process::id(),
+            start: Some(
+                crate::daemon::gateway::process_start_time(std::process::id())
+                    .expect("the test process start time")
+            ),
+        }
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        mode(&home.home().join(".clauth").join("gateway-env.json")),
+        0o600
+    );
+
+    // An unset value is an absent key, never an empty one.
+    write_env_record(DaemonEnvRecord {
+        identity: record.identity.clone(),
+        env: Vec::new(),
+    })
+    .expect("write unset");
+    let unset = read_env_record().expect("read").expect("present");
+    assert!(unset.env.is_empty());
+    assert_eq!(
+        recorded_pairs(&unset).expect("a test record decodes"),
+        Vec::new()
+    );
+}
+
+/// The daemon's capture records exactly the [`INHERITED_KEYS`] it inherited,
+/// byte-exact, and nothing else: every one of the four keys the plan, move and
+/// probe read is present, so dropping one (or recording nothing) reds here.
+#[test]
+fn the_daemon_env_capture_records_exactly_the_four_inherited_keys() {
+    let home = HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+
+    write_daemon_env_from(|key| match key {
+        "CODEX_HOME" => Some(OsString::from("/codex")),
+        "HOME" => Some(OsString::from("/home")),
+        "USERPROFILE" => Some(OsString::from("/winhome")),
+        "SHUNT_SERVER__BIND" => Some(OsString::from("127.0.0.1:3001")),
+        _ => None,
+    })
+    .expect("write");
+
+    let record = read_env_record().expect("read").expect("present");
+    assert_eq!(
+        record.env,
+        vec![
+            (
+                "CODEX_HOME".to_string(),
+                env_value_bytes(OsStr::new("/codex"))
+            ),
+            ("HOME".to_string(), env_value_bytes(OsStr::new("/home"))),
+            (
+                "USERPROFILE".to_string(),
+                env_value_bytes(OsStr::new("/winhome"))
+            ),
+            (
+                "SHUNT_SERVER__BIND".to_string(),
+                env_value_bytes(OsStr::new("127.0.0.1:3001"))
+            ),
+        ]
+    );
+}
+
+/// `own_env`'s injected source over hand-built pairs, last assignment wins on
+/// a key (the way the process env's lookup reads), so a test drives the
+/// production fallback without reading the process's own env.
+fn env_source(pairs: &[(OsString, OsString)]) -> impl Fn(&str) -> Option<OsString> + '_ {
+    move |key| {
+        pairs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == OsStr::new(key))
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// The fallback scrubs a clauth codex home exactly as `start daemon` scrubs
+/// it, and keeps a directory the user owns.
+#[test]
+fn the_fallback_scrubs_a_clauth_codex_home_and_keeps_the_users_own() {
+    let home = HomeSandbox::new();
+    let clauth_codex = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("p")
+        .join("codex-home");
+    let own = home.home().join("own-codex");
+    let home_env = home.home().as_os_str().to_os_string();
+
+    assert_eq!(
+        own_env(env_source(&[
+            (OsString::from("CODEX_HOME"), clauth_codex.into_os_string()),
+            (OsString::from("HOME"), home_env.clone()),
+        ])),
+        vec![(OsString::from("HOME"), home_env.clone())]
+    );
+    assert_eq!(
+        own_env(env_source(&[
+            (OsString::from("CODEX_HOME"), own.clone().into_os_string()),
+            (OsString::from("HOME"), home_env.clone()),
+        ])),
+        vec![
+            (OsString::from("CODEX_HOME"), own.into_os_string()),
+            (OsString::from("HOME"), home_env),
+        ]
+    );
+}
+
+/// Planning then moving an unchanged tree moves exactly the planned files.
+#[test]
+fn plan_then_move_moves_exactly_the_planned_files() {
+    let home = HomeSandbox::new();
+    let src = home.home().join(".shunt");
+    let dst = home.home().join(".clauth").join("shunt");
+    let claude = src.join("accounts").join("claude");
+    write(&claude.join("main.json"), "claude-main");
+    write(&src.join("xai-auth.json"), "xai");
+    let record = adopted(&home);
+    let inherited: Vec<(OsString, OsString)> = sandbox_home().to_vec();
+
+    let plan = plan_standalone_stores_in(
+        &record,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect("plan");
+    let result = move_standalone_stores_in(
+        &record,
+        GatewaySilent::for_test(),
+        &plan,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect("move");
+
+    assert_eq!(result.moved, plan.moved);
+    assert_eq!(result.kept, plan.kept);
+    assert_eq!(
+        fs::read_to_string(dst.join("accounts").join("claude").join("main.json")).expect("moved"),
+        "claude-main"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join("xai-auth.json")).expect("moved"),
+        "xai"
+    );
+    assert!(!claude.join("main.json").exists());
+    assert!(!src.join("xai-auth.json").exists());
+}
+
+/// A file added to a store after the plan refuses the move with the new
+/// refusal, moving nothing: every source's bytes are unchanged and the
+/// managed root was never created.
+#[test]
+fn the_move_refuses_when_a_file_was_added_to_a_store_since_the_plan() {
+    let home = HomeSandbox::new();
+    let src = home.home().join(".shunt");
+    let dst = home.home().join(".clauth").join("shunt");
+    let claude = src.join("accounts").join("claude");
+    write(&claude.join("main.json"), "claude-main");
+    write(&src.join("xai-auth.json"), "xai");
+    let record = adopted(&home);
+    let inherited: Vec<(OsString, OsString)> = sandbox_home().to_vec();
+
+    let plan = plan_standalone_stores_in(
+        &record,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect("plan");
+    write(&claude.join("extra.json"), "claude-extra");
+    let main = claude.join("main.json");
+    let xai = src.join("xai-auth.json");
+    let extra = claude.join("extra.json");
+    let before = [sha256(&main), sha256(&xai), sha256(&extra)];
+
+    let err = move_standalone_stores_in(
+        &record,
+        GatewaySilent::for_test(),
+        &plan,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect_err("the tree changed since the plan");
+    assert_eq!(
+        err.to_string(),
+        "the stores changed since the plan was shown; look at the plan again"
+    );
+    assert!(matches!(
+        err.downcast_ref::<StoreMoveRefusal>(),
+        Some(StoreMoveRefusal::PlanChanged)
+    ));
+
+    assert_eq!(
+        [sha256(&main), sha256(&xai), sha256(&extra)],
+        before,
+        "no source changed"
+    );
+    assert!(!dst.exists());
+}
+
+/// A daemon holding the singleton with no record naming it (missing, stale,
+/// unreadable or unparseable) refuses the plan and the move, moving nothing,
+/// until that daemon restarts and records its env.
+#[test]
+fn a_daemon_holding_the_singleton_with_no_record_refuses_the_plan_and_move() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    // No gateway-env.json written.
+
+    let err = plan_standalone_stores(&record).expect_err("a daemon with no record refuses");
+    assert_eq!(
+        err.to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+    assert!(matches!(
+        err.downcast_ref::<StoreMoveRefusal>(),
+        Some(StoreMoveRefusal::DaemonEnvUnrecorded)
+    ));
+
+    let empty = StoreMovePlan {
+        moved: Vec::new(),
+        kept: Vec::new(),
+    };
+    let err = move_standalone_stores(&record, GatewaySilent::for_test(), &empty)
+        .expect_err("the move refuses too");
+    assert_eq!(
+        err.to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+    assert!(!home.home().join(".clauth").join("shunt").exists());
+}
+
+/// A relative `CODEX_HOME` in the running daemon's record refuses with the
+/// daemon copy, naming the daemon as the place to fix it: the env-file and
+/// clauth-own copies stay theirs.
+#[test]
+fn a_daemon_whose_recorded_codex_home_is_relative_refuses_with_the_daemon_copy() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let _held = crate::daemon::hold_daemon_lock();
+    write_env_record_naming_self(&home, Some(Path::new("rel")), None);
+
+    let err = plan_standalone_stores(&record).expect_err("a relative daemon CODEX_HOME refuses");
+    assert_eq!(
+        err.to_string(),
+        "CODEX_HOME in the running daemon's environment is a relative path; restart the daemon with an absolute CODEX_HOME"
+    );
+    assert!(matches!(
+        err.downcast_ref::<StoreMoveRefusal>(),
+        Some(StoreMoveRefusal::RelativeCodexHome {
+            source: CodexHomeSource::DaemonRecord
+        })
+    ));
+}
+
+/// A kept-only change between plan and move (a non-account file appearing in a
+/// dir store) refuses with `PlanChanged`, moving nothing, so the confirmed
+/// "N stay behind" count cannot go stale.
+#[test]
+fn the_move_refuses_when_only_a_kept_entry_changes_since_the_plan() {
+    let home = HomeSandbox::new();
+    let src = home.home().join(".shunt");
+    let dst = home.home().join(".clauth").join("shunt");
+    let claude = src.join("accounts").join("claude");
+    write(&claude.join("main.json"), "claude-main");
+    write(&src.join("xai-auth.json"), "xai");
+    let record = adopted(&home);
+    let inherited: Vec<(OsString, OsString)> = sandbox_home().to_vec();
+
+    let plan = plan_standalone_stores_in(
+        &record,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect("plan");
+    let notes = claude.join("notes.txt");
+    write(&notes, "not-a-store-entry");
+    let main = claude.join("main.json");
+    let xai = src.join("xai-auth.json");
+    let before = [sha256(&main), sha256(&xai), sha256(&notes)];
+
+    let err = move_standalone_stores_in(
+        &record,
+        GatewaySilent::for_test(),
+        &plan,
+        inherited.iter().cloned(),
+        CodexHomeSource::Inherited,
+    )
+    .expect_err("the kept list changed since the plan");
+    assert_eq!(
+        err.to_string(),
+        "the stores changed since the plan was shown; look at the plan again"
+    );
+    assert!(matches!(
+        err.downcast_ref::<StoreMoveRefusal>(),
+        Some(StoreMoveRefusal::PlanChanged)
+    ));
+    assert_eq!(
+        [sha256(&main), sha256(&xai), sha256(&notes)],
+        before,
+        "no source changed"
+    );
+    assert!(!dst.exists());
+}
+
+/// A non-UTF-8 env value survives the record losslessly on unix, never a lossy
+/// U+FFFD path: the round trip is against a hand-built pair, not a value the
+/// codec under test computed.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_env_value_round_trips_through_the_record_losslessly() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let _sandbox = HomeSandbox::new();
+    let value = OsStr::from_bytes(b"/tmp/\xff");
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid: 1,
+            start: Some("s".to_string()),
+        },
+        env: vec![("HOME".to_string(), env_value_bytes(value))],
+    })
+    .expect("write");
+    let record = read_env_record().expect("read").expect("present");
+    assert_eq!(
+        recorded_pairs(&record).expect("a test record decodes"),
+        vec![(OsString::from("HOME"), OsString::from(value))]
+    );
+}
+
+/// On Windows an odd byte length in a recorded value is a corrupt record,
+/// refused through the reader with the approved refusal, never silently
+/// truncated to whole UTF-16 units.
+#[cfg(windows)]
+#[test]
+fn an_odd_length_env_value_is_refused_not_truncated() {
+    let home = HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(crate::daemon::gateway::process_start_time(pid).expect("start")),
+        },
+        // One byte is an odd length, which the Windows decoder refuses.
+        env: vec![("CODEX_HOME".to_string(), vec![0x61])],
+    })
+    .expect("write");
+
+    assert_eq!(
+        recorded_env_for_live_daemon()
+            .expect_err("an odd-length value refuses")
+            .to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+}
+
+/// The `~/.codex` guard follows the same resolved home the store defaults use
+/// (the daemon's recorded `HOME`), not clauth's own home: a login at
+/// `<daemon HOME>/.codex/auth.json` stays.
+#[test]
+fn the_default_codex_home_follows_the_resolved_home() {
+    let home = HomeSandbox::new();
+    let daemon_home = home.home().join("daemon-home");
+    let login = daemon_home.join(".codex").join("auth.json");
+    write(&login, "codex-cli-login");
+    let record = with_env_file(&home, &format!("CODEX_AUTH_FILE={}\n", quoted(&login)));
+
+    let _held = crate::daemon::hold_daemon_lock();
+    write_env_record_naming_self(&home, None, Some(&daemon_home));
+
+    let plan = plan_standalone_stores(&record).expect("plan");
+    assert_eq!(plan.moved, Vec::<MovedFile>::new());
+    assert_eq!(
+        plan.kept,
+        vec![KeptFile::At {
+            path: login.clone(),
+            reason: KeptReason::CodexLogin,
+        }],
+        "the login at the daemon's ~/.codex is kept"
+    );
+}
+
+/// The `~/.codex` guard refuses a relative resolved home with its own refusal,
+/// naming the codex CLI's login rather than a store key, instead of silently
+/// stopping matching.
+#[test]
+fn the_default_codex_home_refuses_a_relative_home() {
+    let home = HomeSandbox::new();
+    let env_file = home.home().join("tokens.env");
+    write(&env_file, "HOME=rel-home\n");
+    let named = read_env_file(&env_file).expect("parse");
+    let err = default_codex_home(&named, &[]).expect_err("a relative home refuses");
+    assert!(matches!(
+        err.downcast_ref::<StoreMoveRefusal>(),
+        Some(StoreMoveRefusal::RelativeCodexLoginHome)
+    ));
+}
+
+/// A store default under a relative home refuses by the store's own key. The
+/// codex guard fires first in the plan, so only a direct call reaches this
+/// arm; it stays pinned so a reorder of the plan cannot drop it unseen.
+#[test]
+fn a_store_default_under_a_relative_home_refuses_by_its_key() {
+    let home = HomeSandbox::new();
+    let env_file = home.home().join("tokens.env");
+    write(&env_file, "HOME=rel-home\n");
+    let named = read_env_file(&env_file).expect("parse");
+    for key in ["SHUNT_CLAUDE_ACCOUNTS_DIR", "SHUNT_XAI_AUTH_FILE"] {
+        let store = STORES.iter().find(|s| s.env == key).expect("store");
+        let err = default_store_path(store, &named, &[]).expect_err("a relative home refuses");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "the standalone's home names no absolute directory, so shunt's default for {key} is relative to the standalone's working directory, which clauth cannot tell; nothing was moved; set HOME to an absolute path in the env file, then run the move again"
+            )
+        );
+    }
+}
+
+/// An unreadable holder renders its cause chain once under `{:#}`: the
+/// wrapper's head is the inner error's head, and its source is the inner
+/// error's source, never the inner error itself.
+#[test]
+fn an_unreadable_holder_renders_its_chain_once() {
+    let err = anyhow::Error::from(NoHolder::Unreadable(anyhow::anyhow!("x").context("y")));
+    assert_eq!(format!("{err:#}"), "y: x");
+}
+
+/// The codex CLI's own login under clauth's own home is guarded even when the
+/// env file (or the daemon's record) names another `HOME`: the `~/.codex`
+/// guard keeps clauth's own home unconditionally, and the resolved home's
+/// `.codex` is a second guard, never a replacement.
+#[test]
+fn the_codex_login_in_clauths_own_home_stays_when_the_env_file_names_another_home() {
+    let home = HomeSandbox::new();
+    let svc_home = home.home().join("svc-home");
+    let login = home.home().join(".codex").join("auth.json");
+    write(&login, "codex-cli-login");
+    let record = with_env_file(
+        &home,
+        &format!(
+            "HOME={}\nCODEX_AUTH_FILE={}\n",
+            quoted(&svc_home),
+            quoted(&login)
+        ),
+    );
+
+    let _held = crate::daemon::hold_daemon_lock();
+    write_env_record_naming_self(&home, None, Some(&svc_home));
+
+    let plan = plan_standalone_stores(&record).expect("plan");
+    assert_eq!(plan.moved, Vec::<MovedFile>::new());
+    assert_eq!(
+        plan.kept,
+        vec![KeptFile::At {
+            path: login.clone(),
+            reason: KeptReason::CodexLogin,
+        }],
+        "the codex CLI's own login under clauth's home is kept"
+    );
+    assert_eq!(fs::read_to_string(&login).expect("kept"), "codex-cli-login");
+}
+
+/// The record carries `USERPROFILE` through to the store defaults: a daemon
+/// whose record holds only `USERPROFILE` (no `HOME`) still resolves a
+/// `HomeThenUserProfile` store's default.
+#[test]
+fn a_record_with_userprofile_resolves_a_store_default() {
+    let home = HomeSandbox::new();
+    let winhome = home.home().join("winhome");
+    let win_cursor = winhome.join(".shunt").join("cursor-auth.json");
+    write(&win_cursor, "cursor-win");
+    let record = adopted(&home);
+
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(crate::daemon::gateway::process_start_time(pid).expect("start")),
+        },
+        env: vec![(
+            "USERPROFILE".to_string(),
+            env_value_bytes(winhome.as_os_str()),
+        )],
+    })
+    .expect("write");
+
+    let plan = plan_standalone_stores(&record).expect("plan");
+    assert_eq!(
+        plan.moved,
+        vec![MovedFile {
+            from: win_cursor.clone(),
+            to: home
+                .home()
+                .join(".clauth")
+                .join("shunt")
+                .join("cursor-auth.json"),
+        }]
+    );
+}
+
+/// The card's probe function reads the same inherited env the plan and move
+/// use, so a `SHUNT_SERVER__BIND` only in the daemon's record (not the
+/// caller's shell) still names the probe the move checks.
+#[test]
+fn the_gateway_probe_reads_the_same_env_as_the_plan() {
+    let home = HomeSandbox::new();
+    let record = adopted(&home);
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    write_env_record(DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(crate::daemon::gateway::process_start_time(pid).expect("start")),
+        },
+        env: vec![
+            ("HOME".to_string(), env_value_bytes(home.home().as_os_str())),
+            (
+                "SHUNT_SERVER__BIND".to_string(),
+                env_value_bytes(OsStr::new("127.0.0.1:3999")),
+            ),
+        ],
+    })
+    .expect("write");
+
+    assert_eq!(
+        gateway_probe(&record).expect("probe"),
+        addr("127.0.0.1:3999")
+    );
 }

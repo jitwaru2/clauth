@@ -365,6 +365,14 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
             == Some(std::ffi::OsStr::new("profiles"))
 }
 
+/// The `CODEX_HOME` a child may inherit: `None` when it names a codex session
+/// home clauth built, else the value itself. The one predicate both
+/// [`scrub_clauth_homes`] and the store move's fallback env apply, so a scrub
+/// rule change lands in both.
+pub(crate) fn scrubbed_codex_home(value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|v| !is_codex_home_path(Path::new(v)))
+}
+
 /// Drop from `command` each session home it would inherit that names a tree
 /// clauth built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
 /// codex home. A process spawned from inside a clauth session otherwise
@@ -376,7 +384,8 @@ pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
     {
         command.env_remove("CLAUDE_CONFIG_DIR");
     }
-    if std::env::var_os("CODEX_HOME").is_some_and(|v| is_codex_home_path(Path::new(&v))) {
+    let codex_home = std::env::var_os("CODEX_HOME");
+    if codex_home.is_some() && scrubbed_codex_home(codex_home).is_none() {
         command.env_remove("CODEX_HOME");
     }
 }

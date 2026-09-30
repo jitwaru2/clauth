@@ -430,6 +430,14 @@ pub(crate) fn serve(
         logline!("clauth daemon: standby promoted; TLS certificate reloaded");
     }
 
+    // Record the env this daemon inherited, once it is definitively the holder,
+    // so the store move resolves the standalone's codex home and store defaults
+    // the way the gateway it spawns will. Best-effort: a daemon that cannot
+    // write it still runs, and the move refuses until this daemon restarts.
+    if let Err(e) = crate::gateway::write_daemon_env() {
+        logline!("clauth daemon: {e:#}; the store move refuses until this daemon restarts");
+    }
+
     log_rotate::warn_if_log_cap_defeated();
     // Tighten an existing looser tree (older builds / CLI umask left it 0o755)
     // before `load_config` runs its own walk. Idempotent, so the standby path
