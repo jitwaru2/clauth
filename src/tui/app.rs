@@ -2471,6 +2471,9 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
+    /// chip renders at least this wide for the TUI's lifetime.
+    pub(crate) live_count_width: usize,
     /// The codex roster as the Overview lists it and the header counts it.
     /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
     /// small files per account, the header draws on every tab every frame, and
@@ -2839,6 +2842,7 @@ impl App {
             wallet_cache,
             wallet_fp,
             session_tokens,
+            live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
@@ -2920,6 +2924,16 @@ impl App {
             self.tab = home;
         }
         self
+    }
+
+    /// The production write path for the tally after construction: it also widens
+    /// the header chip's held count width, so a count shrinking by a digit
+    /// moves nothing right of the chip.
+    pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        self.live_count_width = self
+            .live_count_width
+            .max(live_count_text(tally.total()).chars().count());
+        self.live_sessions = tally;
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
@@ -11664,7 +11678,13 @@ fn poll_live_sessions(app: &mut App) {
     }
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
-    app.live_sessions = tally;
+    app.set_live_sessions(tally);
+}
+
+/// The header chip's number: the fleet total, or `—` for a tally that could
+/// not read the registry or the bare-session markers.
+pub(crate) fn live_count_text(total: Option<usize>) -> String {
+    total.map_or_else(|| "—".to_owned(), |n| n.to_string())
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`

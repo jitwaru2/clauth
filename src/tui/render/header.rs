@@ -16,7 +16,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, Tab};
+use super::super::app::{App, Tab, live_count_text};
 use super::super::theme;
 use super::format::{bar_string_with_cells, fixed_split};
 
@@ -255,7 +255,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         rows[0],
     );
 
-    // ── Row 1: [N live · ][gauge] ...... ● feed ──────────────────────────
+    // ── Row 1: [[ N live ] · ][gauge] ...... ● feed ──────────────────────
     // The fleet's live count and the active profile's gauge, left-aligned, and
     // the status indicator, the only thing right-aligned, across an elastic
     // gap. The account counts and the harness filter left this row for the
@@ -280,15 +280,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
     }
-    // The fleet's live-session count leads the row, zero included: hiding it
-    // at zero would move the gauge each time the first session starts or the
-    // last one ends. It takes only what the gauge and the indicator leave, so
-    // it is the first thing the row sheds, whole, never costing the gauge a
-    // cell.
-    let mut prefix = vec![Span::styled(
-        format!("{} live", app.live_sessions.total()),
-        theme::dim(),
-    )];
+    // The fleet's live-session count leads the row as a counter chip, zero
+    // included: hiding it at zero would move the gauge each time the first
+    // session starts or the last one ends. It takes only what the gauge and the
+    // indicator leave, so it is the first thing the row sheds, whole with its
+    // separator, never costing the gauge a cell.
+    let mut prefix = live_chip_spans(app);
     if !left_spans.is_empty() {
         prefix.push(Span::styled(" · ", theme::dim()));
     }
@@ -317,6 +314,29 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // ── Row 2: tabs ──────────────────────────────────────────────────────
     super::tabs::draw(frame, rows[2], app);
+}
+
+/// `[ N live ]`: brackets and unit dim, the number `TEXT` + bold, dim at zero
+/// and as the `—` of a tally that could not read. Blank cells after the closing
+/// bracket pad it to the widest count the app has read, so a count losing a
+/// digit moves nothing right of the chip.
+fn live_chip_spans(app: &App) -> Vec<Span<'static>> {
+    let total = app.live_sessions.total();
+    let number = live_count_text(total);
+    let number_style = match total {
+        Some(n) if n > 0 => Style::default().fg(theme::text_color()).bold(),
+        Some(_) | None => theme::dim(),
+    };
+    let pad = app.live_count_width.saturating_sub(number.chars().count());
+    let mut spans = vec![
+        Span::styled("[ ", theme::dim()),
+        Span::styled(number, number_style),
+        Span::styled(" live ]", theme::dim()),
+    ];
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans
 }
 
 fn status_dot_color(app: &App) -> ratatui::style::Color {
