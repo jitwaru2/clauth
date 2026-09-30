@@ -16,6 +16,11 @@ use std::process::Command;
 use std::time::Duration;
 
 use super::*;
+// The local `struct Supervised` (unix-only) shadows the trait of the same
+// name, so bring the trait's methods (`.intent`) into scope without binding
+// its name. On windows the glob above already imports the trait.
+#[cfg(unix)]
+use super::Supervised as _;
 use crate::gateway::GatewayRecord;
 use crate::testutil::HomeSandbox;
 
@@ -63,9 +68,10 @@ fn shown(path: &std::path::Path) -> Option<String> {
 
 // ── the slot ────────────────────────────────────────────────────────────────
 
-const ALL_STATES: [GatewayState; 14] = [
+const ALL_STATES: [GatewayState; 15] = [
     GatewayState::Absent,
     GatewayState::Disabled,
+    GatewayState::Held,
     GatewayState::NoConfig,
     GatewayState::YamlRefused,
     GatewayState::Misconfigured,
@@ -107,6 +113,15 @@ fn fixture(state: GatewayState) -> (GatewaySlot, &'static str) {
                 ..blank(state)
             },
             r#"{"state":"disabled","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":2,"last_exit":{"code":null,"signal":15},"reason":null,"since":"2026-09-21T14:13:20+00:00"}"#,
+        ),
+        GatewayState::Held => (
+            GatewaySlot {
+                config,
+                binary,
+                since,
+                ..blank(state)
+            },
+            r#"{"state":"held","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":0,"last_exit":null,"reason":null,"since":"2026-09-21T14:13:20+00:00"}"#,
         ),
         GatewayState::NoConfig => (
             GatewaySlot {
@@ -2096,4 +2111,442 @@ fn a_missing_binary_line_names_the_binary_and_the_fix() {
         "lines: {:?}",
         rig.lines.snapshot()
     );
+}
+
+// ── the hold ────────────────────────────────────────────────────────────────
+
+/// This test process's own daemon identity: the pid the supervisor's
+/// `for_daemon` learns, and its start token.
+#[cfg(unix)]
+fn this_daemon() -> crate::gateway::DaemonIdentity {
+    let pid = std::process::id();
+    crate::gateway::DaemonIdentity {
+        pid,
+        start: process_start_time(pid),
+    }
+}
+
+/// Write a hold naming `identity`, the shape `write_hold` writes.
+#[cfg(unix)]
+fn write_hold_naming(identity: &crate::gateway::DaemonIdentity) {
+    let path = crate::gateway::hold_path().expect("hold path");
+    fs::write(&path, serde_json::to_vec(identity).expect("json")).expect("hold");
+}
+
+/// A hold naming this daemon holds the gateway off: the slot reads `held` and
+/// nothing spawns.
+#[cfg(unix)]
+#[test]
+fn a_hold_naming_this_daemon_holds_the_gateway_off() {
+    let rig = Rig::new("0.49.1");
+    write_hold_naming(&this_daemon());
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            config: shown(&rig.config),
+            binary: shown(&rig.binary),
+            since: Some(AT_T0.to_string()),
+            ..blank(GatewayState::Held)
+        }
+    );
+    assert_eq!(rig.calls().len(), 0, "nothing spawns while held");
+}
+
+/// A hold naming this daemon appearing mid-run stops the running gateway with
+/// the normal stop and lands on `held`.
+#[cfg(unix)]
+#[test]
+fn a_hold_stops_the_running_gateway() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    write_hold_naming(&this_daemon());
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            pid: Some(pid),
+            version: Some("0.49.1".to_string()),
+            since: Some(AT_T2.to_string()),
+            ..rig.described(GatewayState::Stopping)
+        }
+    );
+    step_until(&rig, &mut supervisor, t0.after(secs(2)), GatewayState::Held);
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            port: None,
+            last_exit: Some(ExitReport {
+                code: None,
+                signal: Some(15),
+            }),
+            since: Some(AT_T2.to_string()),
+            ..rig.described(GatewayState::Held)
+        }
+    );
+    assert_eq!(stub::terms(&rig.dir), [pid], "one SIGTERM, the normal stop");
+}
+
+/// A hold naming another pid, and one naming this pid with another start
+/// token, are each removed with one log line and the gateway runs.
+#[cfg(unix)]
+#[test]
+fn a_hold_naming_another_instance_is_removed_and_ignored() {
+    let me = this_daemon();
+    for (label, other) in [
+        (
+            "another pid",
+            crate::gateway::DaemonIdentity {
+                pid: me.pid.wrapping_add(1),
+                start: me.start.clone(),
+            },
+        ),
+        (
+            "this pid, another start token",
+            crate::gateway::DaemonIdentity {
+                pid: me.pid,
+                start: Some("another-start-token".to_string()),
+            },
+        ),
+    ] {
+        let rig = Rig::new("0.49.1");
+        write_hold_naming(&other);
+        let path = crate::gateway::hold_path().expect("hold path");
+        let mut supervisor = rig.supervisor();
+        supervisor.step(t0());
+        assert!(!path.exists(), "{label}: the hold is removed");
+        assert_eq!(rig.calls().len(), 1, "{label}: the gateway runs");
+        let line = format!(
+            "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+            path.display()
+        );
+        assert_eq!(
+            rig.lines.snapshot().iter().filter(|l| **l == line).count(),
+            1,
+            "{label}: one log line"
+        );
+    }
+}
+
+/// A hold that does not parse is removed with one log line and the gateway
+/// runs.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_hold_is_removed_and_ignored() {
+    let rig = Rig::new("0.49.1");
+    let path = crate::gateway::hold_path().expect("hold path");
+    fs::write(&path, b"not json").expect("hold");
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    assert!(!path.exists(), "an unparseable hold is removed");
+    assert_eq!(rig.calls().len(), 1, "and the gateway runs");
+    let line = format!(
+        "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+        path.display()
+    );
+    assert_eq!(
+        rig.lines.snapshot().iter().filter(|l| **l == line).count(),
+        1,
+        "one log line"
+    );
+}
+
+/// Writing and releasing a hold never writes the record's `disabled`: the
+/// record's bytes are identical before and after.
+#[cfg(unix)]
+#[test]
+fn writing_and_releasing_a_hold_leaves_the_record_unchanged() {
+    let _rig = Rig::new("0.49.1");
+    let record = crate::gateway::record_path().expect("record path");
+    let before = fs::read(&record).expect("the record");
+    let dir = clauth_dir().expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    assert!(
+        crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold is written"
+    );
+    crate::gateway::remove_hold().expect("release the hold");
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold is gone"
+    );
+    let after = fs::read(&record).expect("the record");
+    assert_eq!(
+        before, after,
+        "write-hold and release leave the record byte-identical"
+    );
+}
+
+/// `write_hold` errors with no daemon holding the singleton, and the file it
+/// writes is owner-only.
+#[cfg(unix)]
+#[test]
+fn write_hold_errors_without_a_daemon_and_writes_0600() {
+    let _rig = Rig::new("0.49.1");
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(
+        err.to_string(),
+        "no daemon holds the clauth singleton",
+        "names what was missing"
+    );
+
+    let dir = clauth_dir().expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(crate::gateway::hold_path().expect("hold path"))
+        .expect("hold")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the hold is owner-only");
+}
+
+// ── the hold, cross-platform (no unix rig needed) ──────────────────────────
+
+/// A child that stays alive until its stdin closes: `cat` on unix, `cmd /D`
+/// on windows.
+fn parked_child() -> std::process::Child {
+    #[cfg(not(windows))]
+    let (program, args): (&str, &[&str]) = ("cat", &[]);
+    #[cfg(windows)]
+    let (program, args): (&str, &[&str]) = ("cmd", &["/D"]);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a parked child")
+}
+
+/// `write_hold` without a daemon names what was missing, pinned by equality,
+/// on every platform (needs no unix rig).
+#[test]
+fn write_hold_errors_without_a_daemon() {
+    let _home = HomeSandbox::new();
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(err.to_string(), "no daemon holds the clauth singleton");
+}
+
+/// A stale sidecar naming a live pid with no daemon holding the singleton is
+/// the missing-daemon error and writes nothing: the pid is never read past a
+/// true `singleton_held`.
+#[test]
+fn write_hold_refuses_a_stale_sidecar_naming_a_live_pid() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::write(dir.join("clauthd.pid"), format!("{}\n", std::process::id())).expect("sidecar");
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(err.to_string(), "no daemon holds the clauth singleton");
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "no hold file is written"
+    );
+}
+
+/// What `write_hold` writes is what the daemon honours: a hold written by
+/// this process reads back as this daemon's own and stays.
+#[test]
+fn a_written_hold_reads_back_as_this_daemon_and_stays() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    let me = Gateway::for_daemon();
+    assert!(
+        matches!(me.hold(), Hold::Mine),
+        "the daemon reads the hold as its own"
+    );
+    assert!(
+        crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold stays"
+    );
+}
+
+/// A daemon holds the singleton but its pid sidecar is torn (the daemon's own
+/// stamp can fail silently): the error names a running daemon, never a missing
+/// one, and no hold is written.
+#[test]
+fn write_hold_names_a_running_daemon_whose_pid_is_unreadable() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    fs::write(dir.join(super::super::PID_FILE), b"").expect("tear the sidecar");
+    let err = crate::gateway::write_hold().expect_err("a torn sidecar names no pid");
+    assert_eq!(
+        err.to_string(),
+        "a clauth daemon is running but its pid is unreadable"
+    );
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "no hold is written"
+    );
+}
+
+/// The written hold names the pid the sidecar stamps, not this process's own
+/// pid: overwrite the sidecar with a parked child's pid and read the JSON.
+#[test]
+fn a_written_hold_names_the_pid_the_sidecar_stamps() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    let mut child = parked_child();
+    fs::write(dir.join("clauthd.pid"), format!("{}\n", child.id())).expect("sidecar");
+    crate::gateway::write_hold().expect("write the hold");
+    let bytes = fs::read(crate::gateway::hold_path().expect("hold path")).expect("the hold");
+    let hold: crate::gateway::DaemonIdentity = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        hold.pid,
+        child.id(),
+        "the written hold names the sidecar pid"
+    );
+    assert_eq!(
+        hold.start.as_deref(),
+        process_start_time(child.id()).as_deref(),
+        "the written hold names that pid's start token"
+    );
+    drop(child.stdin.take());
+    child.wait().expect("reap");
+}
+
+/// A daemon whose own start token is unreadable never honours or removes a
+/// hold, and logs that cause once, never blaming another daemon.
+#[test]
+fn a_daemon_whose_own_start_token_is_unreadable_leaves_the_hold() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let hold_path = crate::gateway::hold_path().expect("hold path");
+    fs::write(
+        &hold_path,
+        serde_json::to_vec(&crate::gateway::DaemonIdentity {
+            pid: std::process::id(),
+            start: Some("any-token".to_string()),
+        })
+        .expect("json"),
+    )
+    .expect("hold");
+    let me = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: None,
+    }));
+    assert!(matches!(me.hold(), Hold::None), "never honours the hold");
+    assert!(matches!(me.hold(), Hold::None), "still never honours it");
+    assert!(hold_path.exists(), "never removes the hold");
+    let expected = format!(
+        "clauth daemon: cannot read this daemon's own start time; leaving the gateway hold {} in place",
+        hold_path.display()
+    );
+    assert_eq!(
+        lines.snapshot().iter().filter(|l| **l == expected).count(),
+        1,
+        "one log line naming the true cause: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines
+            .snapshot()
+            .iter()
+            .any(|l| l.contains("another daemon instance")),
+        "never blames another daemon"
+    );
+}
+
+/// Releasing a hold that is not there is fine, so a `start shunt` after a
+/// daemon restart (which already removed the hold) still succeeds.
+#[test]
+fn remove_hold_with_no_hold_is_fine() {
+    let _home = HomeSandbox::new();
+    crate::gateway::remove_hold().expect("absent is fine");
+}
+
+/// A hold that cannot be read logs once per change, not once per round.
+#[test]
+fn a_hold_read_error_is_logged_once_per_change() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let hold_path = crate::gateway::hold_path().expect("hold path");
+    fs::create_dir_all(&hold_path).expect("a directory at the hold path");
+    let me = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("any-token".to_string()),
+    }));
+    assert!(matches!(me.hold(), Hold::None));
+    assert!(matches!(me.hold(), Hold::None));
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|l| l.contains("cannot read") && l.contains(&hold_path.display().to_string()))
+            .count(),
+        1,
+        "one read-error line across two rounds: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A disabled record still reads `disabled` even with a hold naming this
+/// daemon: the record's flag wins over the hold.
+#[test]
+fn disabled_wins_over_a_hold_naming_this_daemon() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    let config = dir.join("shunt.toml");
+    fs::write(&config, "[server]\nbind = \"127.0.0.1:1\"\n").expect("config");
+    let mut record = GatewayRecord::new(config).expect("adoptable");
+    record.disabled = true;
+    GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    crate::gateway::write_hold().expect("write the hold");
+    let Intent::Idle(slot) = Gateway::for_daemon().intent() else {
+        panic!("a disabled record is idle");
+    };
+    assert_eq!(slot.state, GatewayState::Disabled, "{slot:?}");
 }

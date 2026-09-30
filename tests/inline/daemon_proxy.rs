@@ -1283,7 +1283,7 @@ fn the_proxy_memoizes_and_the_gateway_does_not() {
         .memoizes()
     );
     assert!(
-        !Gateway.memoizes(),
+        !Gateway::new().memoizes(),
         "the gateway never reads its memo back and must not hold the env file's values"
     );
 }

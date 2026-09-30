@@ -5280,6 +5280,7 @@ fn gateway_state_word(state: GatewayState) -> &'static str {
     match state {
         GatewayState::Absent => "absent",
         GatewayState::Disabled => "disabled",
+        GatewayState::Held => "held",
         GatewayState::NoConfig => "no_config",
         GatewayState::YamlRefused => "yaml_refused",
         GatewayState::Misconfigured => "misconfigured",
@@ -5310,7 +5311,10 @@ fn gateway_health(state: GatewayState) -> Health {
         | GatewayState::YamlRefused
         | GatewayState::BelowFloor
         | GatewayState::NoConfig => Health::Danger,
-        GatewayState::Absent | GatewayState::Disabled | GatewayState::Unobserved => Health::Idle,
+        GatewayState::Absent
+        | GatewayState::Disabled
+        | GatewayState::Held
+        | GatewayState::Unobserved => Health::Idle,
     }
 }
 

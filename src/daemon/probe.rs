@@ -693,7 +693,7 @@ fn stamp_pid() -> std::io::Result<()> {
 }
 
 /// The pid the running daemon stamped into the [`PID_FILE`] sidecar, when one is
-/// fully written. Informational only — its one caller reaches it past a true
+/// fully written. Informational only — its callers reach it past a true
 /// [`singleton_held`], and the header chip answers off [`daemon_health`], so
 /// presence is proven by the flock either way and a pid left behind by a dead
 /// daemon is never read as one being up.

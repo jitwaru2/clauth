@@ -21,6 +21,9 @@ mod status_json;
 mod tick;
 mod types;
 
+/// The running daemon's pid sidecar reader, shared by the gateway hold writer
+/// in `crate::gateway`.
+pub(crate) use probe::holder_pid;
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header chip's daemon presence/health probe
 /// (dual-scheduler dedup, #27).

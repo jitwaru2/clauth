@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -45,9 +46,9 @@ use super::log_rotate::{LOG_KEEP_BYTES, LOG_MAX_BYTES, rotate_log_if_large};
 use super::probe::{DaemonLock, REPLACE_WAIT, terminate_pid};
 use super::proxies::ProxySupervision;
 use crate::gateway::{
-    GatewayEnv, GatewayRecord, HEALTH_PROBE_TIMEOUT, Health, NotToml, VERSION_FLOOR,
-    check_version_floor, gateway_bind, gateway_cwd, gateway_env, gateway_shutdown_timeout,
-    probe_health,
+    DaemonIdentity, GatewayEnv, GatewayRecord, HEALTH_PROBE_TIMEOUT, Health, NotToml,
+    VERSION_FLOOR, check_version_floor, gateway_bind, gateway_cwd, gateway_env,
+    gateway_shutdown_timeout, probe_health,
 };
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
@@ -120,6 +121,9 @@ pub(crate) enum GatewayState {
     Absent,
     /// The record's `disabled` flag is on.
     Disabled,
+    /// The TUI wrote a hold naming this daemon: the gateway is held off until
+    /// the next daemon start.
+    Held,
     /// The adopted config is gone from disk.
     NoConfig,
     /// The record names a YAML config, which clauth cannot edit in place.
@@ -298,7 +302,7 @@ pub(crate) fn slot_or_record(published: Option<&GatewaySlot>) -> GatewaySlot {
 /// The slot with no supervisor to ask: the record's own verdict, or
 /// `unobserved` for a record the gateway would run on.
 pub(crate) fn unsupervised_slot() -> GatewaySlot {
-    match Gateway.intent() {
+    match Gateway::new().intent() {
         Intent::Idle(slot) => slot,
         Intent::Run(record) => GatewaySlot::for_record(GatewayState::Unobserved, &record),
         Intent::Unchanged => GatewaySlot::of(GatewayState::Unobserved),
@@ -1353,9 +1357,149 @@ fn gateway_marker_path() -> Result<PathBuf> {
 
 // ── the gateway kind ────────────────────────────────────────────────────────
 
-/// The shunt gateway kind.
+/// What a round found in the gateway hold file.
+enum Hold {
+    /// No hold, or this reader is not a daemon: nothing to do.
+    None,
+    /// The hold names this daemon: hold the gateway off.
+    Mine,
+    /// The hold names another instance or does not parse: removed, ignored.
+    Ignored,
+}
+
+/// A hold fault the daemon logs, so a standing fault is logged once per
+/// change, never once per round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Gateway;
+enum HoldFault {
+    /// The hold file could not be read.
+    Read,
+    /// A foreign hold could not be removed.
+    Remove,
+    /// This daemon's own start time could not be read, so no hold can be
+    /// judged against it.
+    OwnStart,
+}
+
+/// The shunt gateway kind. `me` is this daemon's own identity
+/// ([`DaemonIdentity`]), `None` where no daemon supervises (the single-shot
+/// record-only slot), so a hold is only ever honoured or removed by a live
+/// daemon.
+#[derive(Debug, Clone)]
+pub(crate) struct Gateway {
+    me: Option<DaemonIdentity>,
+    /// The last hold fault logged, so a standing fault raises one line per
+    /// change instead of one per round (the supervisor's slot-reason
+    /// precedent).
+    hold_fault: Arc<Mutex<Option<HoldFault>>>,
+}
+
+impl Gateway {
+    /// No daemon: the record-only reader consults no hold.
+    pub(crate) fn new() -> Self {
+        Gateway {
+            me: None,
+            hold_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// This daemon's own identity, learned once at start.
+    pub(crate) fn for_daemon() -> Self {
+        let pid = std::process::id();
+        Gateway {
+            me: Some(DaemonIdentity {
+                pid,
+                start: process_start_time(pid),
+            }),
+            hold_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A gateway over an injected identity, for the hold's identity edges.
+    #[cfg(test)]
+    pub(crate) fn for_test(me: Option<DaemonIdentity>) -> Self {
+        Gateway {
+            me,
+            hold_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Raise `message` when the hold fault changed since the last round; a
+    /// `None` fault (a clean round) clears the remembered fault.
+    fn note(&self, fault: Option<HoldFault>, message: String) {
+        let mut last = self
+            .hold_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last != fault {
+            if !message.is_empty() {
+                logline!("{message}");
+            }
+            *last = fault;
+        }
+    }
+
+    /// What the gateway hold file asks of this round.
+    fn hold(&self) -> Hold {
+        let Some(me) = &self.me else {
+            return Hold::None;
+        };
+        let path = match crate::gateway::hold_path() {
+            Ok(path) => path,
+            Err(e) => {
+                logline!("clauth daemon: cannot find the gateway hold path: {e:#}");
+                return Hold::None;
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(None, String::new());
+                return Hold::None;
+            }
+            Err(e) => {
+                self.note(
+                    Some(HoldFault::Read),
+                    format!("clauth daemon: cannot read {}: {e}", path.display()),
+                );
+                return Hold::None;
+            }
+        };
+        if me.start.is_none() {
+            // A hold exists but this daemon cannot be identified against it:
+            // leave it for a daemon that can, and name the true cause.
+            self.note(
+                Some(HoldFault::OwnStart),
+                format!(
+                    "clauth daemon: cannot read this daemon's own start time; leaving the gateway hold {} in place",
+                    path.display()
+                ),
+            );
+            return Hold::None;
+        }
+        if serde_json::from_slice::<DaemonIdentity>(&bytes).is_ok_and(|hold| me.is_named_by(&hold))
+        {
+            self.note(None, String::new());
+            return Hold::Mine;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                self.note(None, String::new());
+                logline!(
+                    "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+                    path.display()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(None, String::new());
+            }
+            Err(e) => self.note(
+                Some(HoldFault::Remove),
+                format!("clauth daemon: failed to remove {}: {e}", path.display()),
+            ),
+        }
+        Hold::Ignored
+    }
+}
 
 impl Supervised for Gateway {
     type Slot = GatewaySlot;
@@ -1372,6 +1516,7 @@ impl Supervised for Gateway {
     }
 
     fn intent(&self) -> Intent<GatewaySlot, GatewayRecord> {
+        let hold = self.hold();
         let record = match GatewayRecord::load() {
             Ok(Some(record)) => record,
             Ok(None) => return Intent::Idle(GatewaySlot::of(GatewayState::Absent)),
@@ -1390,6 +1535,9 @@ impl Supervised for Gateway {
         };
         if record.disabled {
             return Intent::Idle(GatewaySlot::for_record(GatewayState::Disabled, &record));
+        }
+        if matches!(hold, Hold::Mine) {
+            return Intent::Idle(GatewaySlot::for_record(GatewayState::Held, &record));
         }
         match record.config().try_exists() {
             Ok(true) => Intent::Run(record),
@@ -1472,7 +1620,10 @@ impl Supervised for Gateway {
     fn idle_stops_child(&self, slot: &GatewaySlot) -> bool {
         matches!(
             slot.state,
-            GatewayState::Absent | GatewayState::Disabled | GatewayState::NoConfig
+            GatewayState::Absent
+                | GatewayState::Disabled
+                | GatewayState::NoConfig
+                | GatewayState::Held
         )
     }
 
@@ -1681,7 +1832,7 @@ impl Supervised for Gateway {
 impl Supervisor<Gateway> {
     #[cfg(test)]
     pub(crate) fn new(handle: GatewayHandle) -> Self {
-        Self::build(Gateway, handle)
+        Self::build(Gateway::for_daemon(), handle)
     }
 }
 
@@ -1890,7 +2041,7 @@ pub(crate) fn start(
     handle: GatewayHandle,
     _singleton: &DaemonLock,
 ) -> Result<SupervisorThread<Gateway>> {
-    start_kind(Gateway, handle, "clauth-gateway")
+    start_kind(Gateway::for_daemon(), handle, "clauth-gateway")
 }
 
 /// End a supervisor on a shutdown request: stop the child within `deadline`,

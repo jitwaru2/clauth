@@ -5,7 +5,7 @@
 //!
 //! No function here spawns, signals or supervises a process other than the
 //! bounded children [`run_bounded`] runs (`shunt check`, and a clauth proxy's
-//! `manifest` for `crate::proxy`); the daemon and the Setup card call these.
+//! `manifest` for `crate::proxy`); the daemon and the Services card call these.
 //! Every edit of the user's config lands only after `shunt check` passed on
 //! a sibling copy run with the gateway's env file and stores over
 //! the calling process's own env; the supervisor must spawn with the same
@@ -13,7 +13,7 @@
 
 #![expect(
     dead_code,
-    reason = "T3b's Setup card is the caller of the take-over and edit API"
+    reason = "T3b's Services card is the caller of the take-over, edit and hold API"
 )]
 
 use std::collections::{BTreeMap, HashSet};
@@ -182,6 +182,71 @@ impl GatewayRecord {
 
 pub(crate) fn record_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join("gateway.toml"))
+}
+
+// ── the hold ────────────────────────────────────────────────────────────────
+
+/// The daemon instance a gateway hold names: the daemon's pid and that pid's
+/// process start time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DaemonIdentity {
+    pub(crate) pid: u32,
+    /// The process start time ([`crate::daemon::gateway::process_start_time`]);
+    /// `None` where it could not be read, which no identity match ever names.
+    pub(crate) start: Option<String>,
+}
+
+impl DaemonIdentity {
+    /// Whether a hold naming `other` names this same daemon instance. Identity
+    /// is pid AND start token, never the pid alone: a hold naming this pid
+    /// with another token (or no token) names another instance.
+    pub(crate) fn is_named_by(&self, other: &DaemonIdentity) -> bool {
+        self.start.is_some() && self.pid == other.pid && self.start == other.start
+    }
+}
+
+/// `~/.clauth/gateway-hold`: the TUI's transient "stop the gateway until the
+/// next daemon start". Holds the [`DaemonIdentity`] of the daemon it names.
+const HOLD_FILE: &str = "gateway-hold";
+
+pub(crate) fn hold_path() -> Result<PathBuf> {
+    Ok(clauth_dir()?.join(HOLD_FILE))
+}
+
+/// Write a hold naming the daemon that holds the singleton now. The TUI's
+/// transient "stop the gateway" writes it; that daemon honours it and any
+/// later daemon ignores and removes it, so a restart clears it by
+/// construction. Errors when no daemon holds the singleton, its pid sidecar is
+/// unreadable, or its start time cannot be read.
+pub(crate) fn write_hold() -> Result<()> {
+    // The sidecar is informational and never removed: a stale pid left by a
+    // dead daemon, or recycled onto an unrelated process, must not read as a
+    // daemon to name. Presence is the flock (`status_probe`'s precedent).
+    if !crate::daemon::singleton_held()? {
+        bail!("no daemon holds the clauth singleton");
+    }
+    let pid = crate::daemon::holder_pid()
+        .ok_or_else(|| anyhow!("a clauth daemon is running but its pid is unreadable"))?;
+    let start = crate::daemon::gateway::process_start_time(pid)
+        .ok_or_else(|| anyhow!("cannot read the start time of the daemon (pid {pid})"))?;
+    let identity = DaemonIdentity {
+        pid,
+        start: Some(start),
+    };
+    let path = hold_path()?;
+    atomic_write_600(&path, serde_json::to_vec(&identity)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Remove the hold; a missing one is fine (a release before a hold was ever
+/// written).
+pub(crate) fn remove_hold() -> Result<()> {
+    let path = hold_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 /// clauth edits the adopted config in place, so it must be TOML, and it is
