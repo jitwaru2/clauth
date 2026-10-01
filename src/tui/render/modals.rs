@@ -333,12 +333,17 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
             | ConfirmAction::DeleteLiveSession(_)
+            | ConfirmAction::AddAdminTable
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
-    // operator sees the exact add they are agreeing to, not a generic label.
+    // operator sees the exact add they are agreeing to, not a generic label;
+    // the shunt card's actions name their own verb too (adopt / move / add).
     let confirm_label = match &state.on_confirm {
         ConfirmAction::AddChainCandidate(name) => format!("add '{name}'"),
+        ConfirmAction::AdoptConfig(_) => "adopt".to_string(),
+        ConfirmAction::MoveStoresIn(_) => "move".to_string(),
+        ConfirmAction::AddAdminKey | ConfirmAction::AddAdminTable => "add".to_string(),
         _ => "confirm".to_string(),
     };
 

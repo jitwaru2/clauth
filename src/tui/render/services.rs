@@ -23,15 +23,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{
-    App, Check, HERDR_OPTIONS, Health, HerdrOption, InputState, ServicesFocus, escape_control,
-    herdr_config_writable, parse_herdr_tag_secs,
+    App, Check, HERDR_OPTIONS, Health, HerdrOption, InputState, ServiceFix, ServicesFocus,
+    ShuntFocus, escape_control, herdr_config_writable, parse_herdr_tag_secs,
 };
 use super::super::theme;
 use super::format::{middle_truncate, spinner_frame};
 use super::panes::{
     cycle_option, draw_scrollbar, draw_scrolled_lines, empty_state, head_cols, help_tooltip_lines,
     highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, section_box,
-    value_caret,
+    value_caret, wrap_words,
 };
 use crate::format::truncate;
 use crate::mcp::jobs::{self, JobPhase, RunningLiveness, StoredJob};
@@ -170,6 +170,9 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
     if app.services.fetching
         || app.services.herdr_probe.running
         || app.services.standalone_probe.running
+        || app.services.move_plan_probe.running
+        || app.services.pool_probe.running
+        || app.services.shunt_action.running
     {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
@@ -205,6 +208,14 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if check.label == "delegates" {
         draw_delegates_detail(frame, inner, app);
+        return;
+    }
+
+    // The shunt card renders its action section verbatim with per-line focus —
+    // the MOVE PLAN copy holds a literal `: ` that the shared `key: value`
+    // splitter would misread.
+    if check.label == "shunt" {
+        draw_shunt_detail(frame, inner, app, check);
         return;
     }
 
@@ -288,11 +299,271 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
 }
 
+/// The `shunt` detail: [`Check::detail`]'s field lines through the shared
+/// key:value splitter, then the action section (from `shunt_action_start` on)
+/// verbatim — the MOVE PLAN rows and the pool note are prose whose approved
+/// copy holds a literal `: `, so they never go through the splitter. The
+/// `enabled` row's tier-aware toggle glyph is drawn here off the cached record.
+///
+/// Descended, ↑↓ walks the card's actionable lines one at a time; the render
+/// reads the focused line from the key handler's state and re-settles it (the
+/// descend rule) when a resize or a card change pushed the held line out of
+/// view, or when focus is none while an actionable line is in view, drawing
+/// the caret + hover only while that stop is in view. It publishes the
+/// geometry the key handler walks over (each stop's rendered row, the pane
+/// height, `detail_max_scroll`).
+fn draw_shunt_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, check: &Check) {
+    let action_start = check.shunt_action_start.unwrap_or(check.detail.len());
+    let width = inner.width as usize;
+
+    // The key column is over the field lines only: the action section is
+    // verbatim, so it never contributes a `": "` key.
+    let key_w = check
+        .detail
+        .iter()
+        .take(action_start)
+        .filter(|line| !line.starts_with("  "))
+        .filter_map(|line| line.split_once(": ").map(|(k, _)| k.chars().count()))
+        .max()
+        .unwrap_or(0)
+        .min(18);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // The rendered line each actionable stop lands on, in `check.shunt_focus`
+    // order: a `refused`/`pool` sentence above a stop can wrap to several rows,
+    // so the in-view test is the rendered index, never the detail index.
+    let mut stop_rendered: Vec<usize> = Vec::with_capacity(check.shunt_focus.len());
+    let mut move_plan_line: Option<usize> = None;
+    for (idx, text) in check.detail.iter().enumerate() {
+        if idx < action_start {
+            lines.push(detail_line(text, key_w, width));
+            continue;
+        }
+        if let Some(focus) = check.shunt_focus.iter().find(|f| f.line() == idx) {
+            let start = lines.len();
+            lines.push(shunt_focus_line(focus, text, false, app));
+            stop_rendered.push(start);
+        } else {
+            if text == "MOVE PLAN" {
+                move_plan_line = Some(lines.len());
+            }
+            lines.extend(shunt_action_lines(text, width, false));
+        }
+    }
+
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
+    app.services.detail_max_scroll.set(max_scroll);
+    let scroll = app.services.detail_scroll.min(max_scroll);
+
+    // The focused actionable line. The render re-settles the key handler's
+    // identity (the descend rule — the first actionable line in view, else
+    // none) here, where the geometry is published, when a resize or a card
+    // change pushed the held line out of view, or when focus is none while a
+    // stop is in view; the caret, the footer and every acting key then see the
+    // re-settled line the same frame. The caret and the bold promotion show
+    // only while the detail pane itself holds focus; blurred (the list focused)
+    // the card keeps the line's hover tint and drops both.
+    let detail_focused = app.services.focus == ServicesFocus::Detail;
+    app.services
+        .re_settle_shunt_focus(&check.shunt_focus, &stop_rendered, scroll, viewport);
+    let focus_stop = app
+        .services
+        .shunt_focus
+        .get()
+        .and_then(|kind| check.shunt_focus.iter().position(|s| s.kind() == kind))
+        .filter(|&i| {
+            let rendered = stop_rendered[i];
+            rendered >= scroll as usize && rendered < scroll as usize + viewport
+        });
+
+    // The MOVE PLAN eyebrow underlines while the focus rests on its one
+    // actionable line (`f move stores in`) and the detail pane holds focus,
+    // the herdr OPTIONS section's rule; blurred, only the hover tint stays.
+    if let Some(idx) = move_plan_line {
+        let underlined = detail_focused
+            && focus_stop.is_some_and(|i| {
+                matches!(
+                    &check.shunt_focus[i],
+                    ShuntFocus::Fix {
+                        fix: ServiceFix::MoveStoresIn,
+                        ..
+                    }
+                )
+            });
+        let style = if underlined {
+            theme::label().underlined()
+        } else {
+            theme::label()
+        };
+        lines[idx] = Line::from(Span::styled("MOVE PLAN", style));
+    }
+
+    if let Some(idx) = focus_stop {
+        let focus = &check.shunt_focus[idx];
+        let line = shunt_focus_line(focus, &check.detail[focus.line()], detail_focused, app);
+        lines[stop_rendered[idx]] = highlight_row(line, width);
+    }
+
+    // Publish the geometry the key handler walks over (after the highlight
+    // borrows it), exactly like `detail_max_scroll`.
+    app.services.shunt_viewport.set(inner.height);
+    app.services.shunt_stop_rows.replace(stop_rendered);
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+}
+
+/// One actionable line on the shunt card: an `f  <verb>` fix line (the plugin
+/// detail's `problem_line` shape) or the `enabled` toggle row (its glyph via
+/// the shared [`toggle_value`]). While an action runs both are inert and render
+/// whole-faint (the disabled-row treatment), the renderer's `running` gate
+/// matching the key handler's.
+fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -> Line<'static> {
+    let inert = app.services.shunt_action.running;
+    match focus {
+        ShuntFocus::Fix { .. } => {
+            if inert {
+                Line::from(vec![
+                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled(text.to_string(), theme::faint()),
+                ])
+            } else {
+                problem_line(text, selected)
+            }
+        }
+        ShuntFocus::Enabled { .. } => {
+            let on = app
+                .services
+                .shunt_record
+                .as_ref()
+                .map(|r| !r.disabled)
+                .unwrap_or(false);
+            let (arrow, label) = if inert {
+                (
+                    Span::styled(if selected { "❯ " } else { "  " }, theme::faint()),
+                    Span::styled("enabled  ", theme::faint()),
+                )
+            } else if selected {
+                (
+                    Span::styled("❯ ", theme::accent().bold()),
+                    Span::styled("enabled  ", label_style(true)),
+                )
+            } else {
+                (
+                    Span::raw("  "),
+                    Span::styled("enabled  ", label_style(false)),
+                )
+            };
+            let mut spans = vec![arrow, label];
+            spans.extend(toggle_value(on, inert));
+            Line::from(spans)
+        }
+    }
+}
+
+/// The spans of one action-section line, before its walk gutter: the label key
+/// (`moves`/`stays`/`refused`/`codex`/`pool`/`admin`) in the field-label style
+/// and its value in its own tone. `moves`/`stays` middle-truncate their path
+/// and keep the `stays` reason whole (the contract's path rule). The `MOVE
+/// PLAN` eyebrow renders in the label style, underlined while a MOVE PLAN row
+/// holds the walk cursor.
+fn shunt_action_spans(text: &str, width: usize, move_plan_underlined: bool) -> Vec<Span<'static>> {
+    if text == "MOVE PLAN" {
+        let style = if move_plan_underlined {
+            theme::label().underlined()
+        } else {
+            theme::label()
+        };
+        return vec![Span::styled("MOVE PLAN", style)];
+    }
+    let Some((key, value)) = text.split_once("  ") else {
+        return vec![Span::styled(truncate(text, width), theme::body())];
+    };
+    let key_span = Span::styled(format!("{key}  "), theme::label());
+    match key {
+        "moves" => vec![
+            key_span,
+            Span::styled(
+                middle_truncate(value, width.saturating_sub(key.len() + 2)),
+                theme::body(),
+            ),
+        ],
+        "stays" => {
+            // `value` = `"<path>  <reason>"`; the reason is the approved
+            // sentence (single spaces only), so the LAST double space is the
+            // path/reason boundary. The path gives first — it middle-truncates
+            // to whatever the whole reason leaves, and the reason is cut only
+            // when the pane cannot hold it and a four-cell path floor.
+            let (path, reason) = value.rsplit_once("  ").unwrap_or((value, ""));
+            let after_key = width.saturating_sub(key.len() + 2 + 2);
+            let path_room = after_key.saturating_sub(reason.chars().count()).max(4);
+            let reason_room = after_key.saturating_sub(path_room);
+            vec![
+                key_span,
+                Span::styled(middle_truncate(path, path_room), theme::body()),
+                Span::raw("  "),
+                Span::styled(truncate(reason, reason_room), theme::body()),
+            ]
+        }
+        _ => vec![
+            key_span,
+            Span::styled(
+                truncate(value, width.saturating_sub(key.len() + 2)),
+                theme::body(),
+            ),
+        ],
+    }
+}
+
+/// One or more rendered lines for a read-only action line: `refused` and
+/// `pool` wrap their sentence within the pane (the tooltip's [`wrap_words`]
+/// shape) so the fix instruction is never cut; every other line renders as one
+/// row through [`shunt_action_spans`].
+fn shunt_action_lines(text: &str, width: usize, move_plan_underlined: bool) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
+    if let Some((key, value)) = text.split_once("  ")
+        && matches!(key, "refused" | "pool")
+    {
+        let wrap_w = width.saturating_sub(key.len() + 2).max(8);
+        let indent = " ".repeat(key.len() + 2);
+        return wrap_words(value, wrap_w)
+            .into_iter()
+            .enumerate()
+            .map(|(i, seg)| {
+                if i == 0 {
+                    Line::from(vec![
+                        Span::styled(format!("{key}  "), theme::label()),
+                        Span::styled(seg, theme::warning()),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(indent.clone(), Style::default()),
+                        Span::styled(seg, theme::warning()),
+                    ])
+                }
+            })
+            .collect();
+    }
+    vec![Line::from(shunt_action_spans(
+        text,
+        width,
+        move_plan_underlined,
+    ))]
+}
+
 /// The `Check::problems` index of a detail line, `None` for a plain line.
 fn problem_index(check: &Check, line: usize) -> Option<usize> {
     check.problems.iter().position(|p| p.line == line)
 }
-
 /// The `delegates` detail: the job list, capped with `+N more`, the closing
 /// steer line underneath. The delegates check's one `key: value` detail line
 /// (the rate-limit warning) rides above the list when it applies. No key
@@ -465,7 +736,7 @@ fn option_row(
                 spans.push(cycle_option(label, *active, selected));
             }
         }
-        HerdrOption::PaneTag => spans.push(toggle_value(settings.pane_tag, inert)),
+        HerdrOption::PaneTag => spans.extend(toggle_value(settings.pane_tag, inert)),
         HerdrOption::TagRefresh => match editing {
             Some(input) => {
                 let invalid = parse_herdr_tag_secs(input.trimmed()).is_none();
@@ -482,29 +753,52 @@ fn option_row(
                 theme::accent(),
             )),
         },
-        HerdrOption::BorderLabel => spans.push(toggle_value(settings.border_label, inert)),
-        HerdrOption::DelegateDot => spans.push(toggle_value(settings.delegate_dot, inert)),
-        HerdrOption::DelegateRowText => spans.push(toggle_value(settings.delegate_row_text, inert)),
+        HerdrOption::BorderLabel => spans.extend(toggle_value(settings.border_label, inert)),
+        HerdrOption::DelegateDot => spans.extend(toggle_value(settings.delegate_dot, inert)),
+        HerdrOption::DelegateRowText => {
+            spans.extend(toggle_value(settings.delegate_row_text, inert))
+        }
     }
     Line::from(spans)
 }
 
-/// A toggle row's value: the tier-dependent glyph, ACCENT when on, faint when
-/// off — and whole-faint on an inert row whatever its state.
-fn toggle_value(on: bool, inert: bool) -> Span<'static> {
-    let style = if inert || !on {
-        theme::faint()
-    } else {
-        theme::accent()
-    };
-    Span::styled(
-        if on {
-            theme::toggle_on()
-        } else {
-            theme::toggle_off()
-        },
-        style,
-    )
+/// A toggle row's value: the tier-dependent glyph painted per the contract —
+/// `full` `─●` (track `LINE`, knob `ACCENT`) / `○─` (knob `TEXT_DIM`, track
+/// `LINE`); `compatible` `[on]`/`[off]` (brackets `TEXT_DIM`, `on` `ACCENT`,
+/// `off` `TEXT_DIM`). An inert row paints the whole glyph faint whatever its
+/// state. One helper feeds the shunt `enabled` row and the herdr toggles, so
+/// both change together.
+fn toggle_value(on: bool, inert: bool) -> Vec<Span<'static>> {
+    if inert {
+        return vec![Span::styled(
+            if on {
+                theme::toggle_on()
+            } else {
+                theme::toggle_off()
+            },
+            theme::faint(),
+        )];
+    }
+    match (theme::tier(), on) {
+        (theme::Tier::Full, true) => vec![
+            Span::styled("─", theme::line()),
+            Span::styled("●", theme::accent()),
+        ],
+        (theme::Tier::Full, false) => vec![
+            Span::styled("○", theme::dim()),
+            Span::styled("─", theme::line()),
+        ],
+        (theme::Tier::Compatible, true) => vec![
+            Span::styled("[", theme::dim()),
+            Span::styled("on", theme::accent()),
+            Span::styled("]", theme::dim()),
+        ],
+        (theme::Tier::Compatible, false) => vec![
+            Span::styled("[", theme::dim()),
+            Span::styled("off", theme::dim()),
+            Span::styled("]", theme::dim()),
+        ],
+    }
 }
 
 /// Sub-line under the tag-refresh field while typing: the floor, DANGER when

@@ -90,6 +90,8 @@ fn plugin_check_with_problems() -> Check {
                 fix: ServiceFix::WireMcpServers,
             },
         ],
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
@@ -240,6 +242,30 @@ fn the_title_spinner_shows_while_a_services_probe_runs() {
         "the spinner while the standalone shunt probe runs:\n{}",
         rows[0]
     );
+    app.services.standalone_probe.running = false;
+    for (name, set) in [
+        ("move plan", set_move_plan_running as fn(&mut App)),
+        ("pool read", set_pool_running as fn(&mut App)),
+        ("shunt action", set_action_running as fn(&mut App)),
+    ] {
+        set(&mut app);
+        let (rows, _) = render(&app);
+        assert!(
+            rows[0].contains(&spun),
+            "the spinner while the {name} runs:\n{}",
+            rows[0]
+        );
+    }
+}
+
+fn set_move_plan_running(app: &mut App) {
+    app.services.move_plan_probe.running = true;
+}
+fn set_pool_running(app: &mut App) {
+    app.services.pool_probe.running = true;
+}
+fn set_action_running(app: &mut App) {
+    app.services.shunt_action.running = true;
 }
 
 /// The four service rows render as dot + label, in order, with no fix cue on
@@ -437,6 +463,46 @@ fn the_services_footer_hints_pin_each_focus_state() {
             ("?", "help"),
         ],
         "the herdr options detail advertises its own keys"
+    );
+}
+
+/// Q8/Q10: while a shunt action runs, the footer drops the `f`/`space`/`↵`
+/// hints on both the list (the first fix) and the detail (the focused line) —
+/// derived from the same `running` gate the handlers read.
+#[test]
+fn a_shunt_action_running_drops_the_footer_fix_hints() {
+    use crate::tui::app::ServicesFocus;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    );
+    app.services.shunt_action.running = true;
+
+    // List focus: the row's first fix drops its `f` hint while an action runs.
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        !hints.iter().any(|(k, _)| *k == "f"),
+        "no list `f` hint while a shunt action runs: {hints:?}"
+    );
+
+    // Detail focus: the focused `f add admin key` drops its hint too.
+    app.services.focus = ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(crate::tui::app::ShuntFocusLine::Admin));
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        !hints.iter().any(|(k, _)| *k == "f"),
+        "no detail `f` hint while a shunt action runs: {hints:?}"
     );
 }
 
@@ -664,6 +730,8 @@ fn the_plugin_detail_tones_the_mcp_and_install_values() {
             detail: detail.iter().map(|s| s.to_string()).collect(),
             fix: None,
             problems: Vec::new(),
+            shunt_focus: Vec::new(),
+            shunt_action_start: None,
         });
         let (rows, buf) = render(&app);
         let row_idx = rows
@@ -718,6 +786,8 @@ fn an_unadopted_shunt_state_reads_dim() {
     let readout = crate::tui::app::StandaloneShunt {
         found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
         unread_bind: None,
+        unread_config: None,
+        unread_env: false,
         answer: None,
     };
     let app = app_with(crate::tui::app::shunt_check(
@@ -751,6 +821,8 @@ fn an_unadopted_shunt_state_reads_dim() {
             "deep/".repeat(40)
         ))),
         unread_bind: None,
+        unread_config: None,
+        unread_env: false,
         answer: None,
     };
     let app = app_with(crate::tui::app::shunt_check(
@@ -1732,5 +1804,1185 @@ fn herdr_tag_refresh_editor_renders_the_edit_state() {
     assert!(
         screen.contains("min is 1 s"),
         "the range sub-line renders while typing:\n{screen}"
+    );
+}
+
+// ── shunt card render ────────────────────────────────────────────────────────
+
+fn shunt_record(
+    home: &crate::testutil::HomeSandbox,
+    disabled: bool,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = disabled;
+    record
+}
+
+fn shunt_card_app(
+    slot: crate::daemon::gateway::GatewaySlot,
+    supervised: bool,
+    record: Option<crate::gateway::GatewayRecord>,
+    admin_need: Option<crate::gateway::AdminNeed>,
+    move_plan: Option<crate::tui::app::MovePlanOutcome>,
+    pool: Option<crate::tui::app::PoolOutcome>,
+) -> App {
+    let card = crate::tui::app::shunt_card(
+        &slot,
+        supervised,
+        false,
+        None,
+        record.as_ref(),
+        admin_need,
+        move_plan.as_ref(),
+        pool.as_ref(),
+    );
+    let mut app = app_with(card);
+    app.services.shunt_record = record;
+    app
+}
+
+/// The action section renders verbatim: the MOVE PLAN rows and the pool note
+/// keep their literal `: ` (never split into a `key: value` column), and the
+/// admin and move fix lines sit directly under their groups.
+#[test]
+fn the_shunt_card_renders_the_action_section_verbatim() {
+    use crate::gateway::{KeptFile, StoreMovePlan};
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+
+    let plan = StoreMovePlan {
+        moved: vec![
+            crate::gateway::MovedFile {
+                from: "/standalone/a.json".into(),
+                to: "/clauth/a.json".into(),
+            },
+            crate::gateway::MovedFile {
+                from: "/standalone/b.json".into(),
+                to: "/clauth/b.json".into(),
+            },
+        ],
+        kept: vec![KeptFile::NoHome {
+            store: "SHUNT_XAI_AUTH_FILE",
+        }],
+    };
+    let app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(crate::tui::app::MovePlanOutcome::Plan(plan)),
+        Some(crate::tui::app::PoolOutcome::Providers(vec![
+            "codex".to_string(),
+            "antigravity".to_string(),
+        ])),
+    );
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    let screen = rows.join("\n");
+    for needle in [
+        "MOVE PLAN",
+        "moves  /standalone/a.json",
+        "moves  /standalone/b.json",
+        "f  add admin key",
+        "f  move stores in",
+        "codex  provider codex needs its own pool login",
+        "codex  provider antigravity needs its own pool login",
+    ] {
+        assert!(
+            detail.iter().any(|l| l == needle),
+            "`{needle}` renders verbatim:\n{screen}"
+        );
+    }
+    // The NoHome `: ` never becomes a key column: the rendered row keeps the
+    // colon (a `key: value` split would consume it into a two-space gap). The
+    // store key middle-truncates (the contract's path rule) and the reason
+    // stays whole.
+    assert!(
+        detail
+            .iter()
+            .any(|l| l == "stays  SHUNT_…H_FILE  no home to find it: set HOME in the env file"),
+        "the NoHome store key middle-truncates and its reason stays whole:\n{screen}"
+    );
+    assert!(
+        !detail.iter().any(|l| l == "no home to find it"),
+        "the NoHome reason is not split into a key: {detail:?}"
+    );
+}
+
+/// The `enabled` row renders the tier's toggle glyph, on and off, off the
+/// cached record.
+#[test]
+fn the_shunt_card_renders_the_enabled_toggle_on_and_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let on = shunt_record(&home, false);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Healthy);
+    slot.config = Some(on.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let app = shunt_card_app(slot.clone(), true, Some(on), None, None, None);
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&format!("enabled  {}", super::theme::toggle_on()))),
+        "on: {}",
+        rows.join("\n")
+    );
+
+    let off = shunt_record(&home, true);
+    slot.state = crate::daemon::gateway::GatewayState::Disabled;
+    slot.config = Some(off.config().display().to_string());
+    let app = shunt_card_app(slot, true, Some(off), None, None, None);
+    let (rows, _) = render(&app);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&format!("enabled  {}", super::theme::toggle_off()))),
+        "off: {}",
+        rows.join("\n")
+    );
+}
+
+/// The `pool` failure line renders as the one warn line in the note's place.
+#[test]
+fn the_shunt_card_renders_the_pool_failure_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, false);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::Neither),
+        None,
+        Some(crate::tui::app::PoolOutcome::Error(
+            "the gateway's pool response does not parse".to_string(),
+        )),
+    );
+    let (rows, _) = render(&app);
+    assert!(
+        detail_rows(&rows)
+            .iter()
+            .any(|l| l == "pool  the gateway's pool response does not parse"),
+        "{}",
+        rows.join("\n")
+    );
+}
+
+/// P6: the `pool` failure line's value renders in the warning tone, and the
+/// `refused` line matches it — an error line, not body prose.
+#[test]
+fn the_shunt_card_renders_the_pool_and_refused_lines_in_the_warning_tone() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, false);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::Neither),
+        None,
+        Some(crate::tui::app::PoolOutcome::Error(
+            "the gateway's pool response does not parse".to_string(),
+        )),
+    );
+    let (rows, buf) = render(&app);
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("pool  "))
+        .unwrap_or_else(|| panic!("no pool row:\n{}", rows.join("\n")));
+    let row = &rows[row_idx];
+    let value_col = row
+        .find("pool  ")
+        .map(|b| row[..b].chars().count() + "pool  ".chars().count())
+        .unwrap();
+    assert_eq!(
+        buf.content[row_idx * W as usize + value_col].fg,
+        super::theme::warning_color(),
+        "the pool value is warning-toned:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// The `refused` and `pool` sentences wrap within the pane instead of
+/// truncating, so the fix instruction is never cut.
+#[test]
+fn the_shunt_card_wraps_the_refused_and_pool_sentences() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        None,
+        Some(crate::tui::app::MovePlanOutcome::Refused(
+            "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string(),
+        )),
+        None,
+    );
+    let (rows, _) = render(&app);
+    let detail = detail_rows(&rows);
+    // The sentence wraps within the pane instead of truncating: no trailing
+    // ellipsis on the `refused` row, and the fix instruction survives whole to
+    // the last wrapped row.
+    assert!(
+        !detail
+            .iter()
+            .any(|l| l.starts_with("refused") && l.ends_with('…')),
+        "the refused sentence wraps instead of truncating:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        detail
+            .iter()
+            .any(|l| l.ends_with("then run the move again")),
+        "the fix instruction is never cut:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// Ruling 1's acceptance render: a refused plan with an admin step, scrolled to
+/// its last line on an 80x20 terminal and at the narrow stacked width the
+/// review measured (58x24), shows the refusal's last words. ↑↓ pages the card
+/// one line at a time (the render clamps the scroll), so the read-only tail
+/// below the last actionable line is reachable. The supervised field set makes
+/// the card overflow both viewports, so the scroll is what reaches the tail.
+#[test]
+fn the_refused_plans_last_line_is_reachable_at_80x20_and_58x24() {
+    use crate::tui::app::{MovePlanOutcome, ServicesFocus};
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    slot.reason = Some("port busy".to_string());
+    slot.pid = Some(4242);
+    slot.port = Some(3001);
+    slot.restarts = 2;
+    slot.last_exit = Some(crate::daemon::gateway::ExitReport {
+        code: Some(1),
+        signal: None,
+    });
+    let refusal = "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string();
+
+    for (w, h) in [(80u16, 20u16), (58u16, 24u16)] {
+        let mut app = shunt_card_app(
+            slot.clone(),
+            true,
+            Some(record.clone()),
+            Some(crate::gateway::AdminNeed::WriteKey),
+            Some(MovePlanOutcome::Refused(refusal.clone())),
+            None,
+        );
+        app.services.focus = ServicesFocus::Detail;
+        // The render clamps against `detail_max_scroll`; a huge value pins the
+        // card scrolled to its last line.
+        app.services.detail_scroll = u16::MAX;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::super::draw(f, &app)).unwrap();
+        let screen = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+        assert!(
+            screen.contains("move again"),
+            "the refusal's last words are reachable at {w}x{h}:\n{screen}"
+        );
+    }
+}
+
+/// While a shunt action runs, the `enabled` row and the shunt `f` lines render
+/// whole-faint (the disabled-row treatment) — inert, matching the key handlers
+/// that return early and the footer that drops their hints.
+#[test]
+fn the_shunt_action_renders_the_enabled_and_fix_rows_inert() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    );
+    app.services.shunt_action.running = true;
+    let (rows, buf) = render(&app);
+    let screen = rows.join("\n");
+
+    let enabled_row = rows
+        .iter()
+        .position(|r| r.contains("enabled  "))
+        .unwrap_or_else(|| panic!("no enabled row:\n{screen}"));
+    let col = rows[enabled_row]
+        .find("enabled")
+        .map(|b| rows[enabled_row][..b].chars().count())
+        .unwrap();
+    assert_eq!(
+        buf.content[enabled_row * W as usize + col].fg,
+        super::theme::text_faint_color(),
+        "the enabled row is inert (faint):\n{screen}"
+    );
+
+    let fix_row = rows
+        .iter()
+        .position(|r| r.contains("add admin key"))
+        .unwrap_or_else(|| panic!("no fix row:\n{screen}"));
+    let col = rows[fix_row]
+        .find("f")
+        .map(|b| rows[fix_row][..b].chars().count())
+        .unwrap();
+    assert_eq!(
+        buf.content[fix_row * W as usize + col].fg,
+        super::theme::text_faint_color(),
+        "the fix line is inert (faint):\n{screen}"
+    );
+}
+
+/// S11: the toggle paints its track, knob and brackets in the contract's
+/// separate colours — `full` track `LINE` + knob `ACCENT`/`TEXT_DIM`;
+/// `compatible` brackets `TEXT_DIM` + `on` `ACCENT` / `off` `TEXT_DIM`. The one
+/// helper feeds the shunt `enabled` row and the herdr toggles, so both change
+/// together. Both tiers are pinned under a `TierSandbox` (the tier is
+/// process-global, so a plant on either arm reds this test on any box).
+#[test]
+fn the_toggle_paints_its_parts_in_the_contract_colours() {
+    let home = crate::testutil::HomeSandbox::new();
+    let on = shunt_record(&home, false);
+    let off = shunt_record(&home, true);
+    for tier in [super::theme::Tier::Full, super::theme::Tier::Compatible] {
+        let _tier = crate::testutil::TierSandbox::new(tier);
+
+        for (record, enabled) in [(&on, true), (&off, false)] {
+            let mut slot = shunt_slot(if enabled {
+                crate::daemon::gateway::GatewayState::Healthy
+            } else {
+                crate::daemon::gateway::GatewayState::Disabled
+            });
+            slot.config = Some(record.config().display().to_string());
+            slot.binary = Some("shunt".to_string());
+            let app = shunt_card_app(slot, true, Some(record.clone()), None, None, None);
+            let (rows, buf) = render(&app);
+            let screen = rows.join("\n");
+            let row_idx = rows
+                .iter()
+                .position(|r| r.contains("enabled  "))
+                .unwrap_or_else(|| panic!("no enabled row:\n{screen}"));
+            let row = &rows[row_idx];
+            let base = row
+                .find("enabled")
+                .map(|b| row[..b].chars().count() + "enabled  ".chars().count())
+                .unwrap();
+            let fg = |col: usize| buf.content[row_idx * W as usize + col].fg;
+            match tier {
+                super::theme::Tier::Full => {
+                    if enabled {
+                        assert_eq!(
+                            fg(base),
+                            super::theme::line_color(),
+                            "track is LINE:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 1),
+                            super::theme::accent_color(),
+                            "on knob is ACCENT:\n{screen}"
+                        );
+                    } else {
+                        assert_eq!(
+                            fg(base),
+                            super::theme::text_dim_color(),
+                            "off knob is TEXT_DIM:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 1),
+                            super::theme::line_color(),
+                            "track is LINE:\n{screen}"
+                        );
+                    }
+                }
+                super::theme::Tier::Compatible => {
+                    if enabled {
+                        assert_eq!(
+                            fg(base),
+                            super::theme::text_dim_color(),
+                            "bracket is TEXT_DIM:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 1),
+                            super::theme::accent_color(),
+                            "on word is ACCENT:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 3),
+                            super::theme::text_dim_color(),
+                            "closing bracket is TEXT_DIM:\n{screen}"
+                        );
+                    } else {
+                        assert_eq!(
+                            fg(base),
+                            super::theme::text_dim_color(),
+                            "bracket is TEXT_DIM:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 1),
+                            super::theme::text_dim_color(),
+                            "off word is TEXT_DIM:\n{screen}"
+                        );
+                        assert_eq!(
+                            fg(base + 4),
+                            super::theme::text_dim_color(),
+                            "closing bracket is TEXT_DIM:\n{screen}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── shunt focus walk ────────────────────────────────────────────────────────
+
+/// The full frame at `w`×`h` (header + body + footer), drawn once so the
+/// render publishes the geometry the shunt key handler walks over.
+fn draw_frame(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::super::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// Which actionable line holds the caret in the shunt detail pane, as a
+/// canonical word — the equality pin for the ↓/↑ walks.
+fn caret_stop(rows: &[String]) -> Option<&'static str> {
+    let line = rows
+        .iter()
+        .filter_map(|r| r.split("││").nth(1))
+        .find(|d| d.contains('❯'))?;
+    let line = line.trim_matches('│').trim();
+    if line.contains("add admin key") {
+        Some("admin")
+    } else if line.contains("move stores in") {
+        Some("move")
+    } else if line.contains("adopt config") {
+        Some("adopt")
+    } else if line.contains("enabled") {
+        Some("enabled")
+    } else {
+        None
+    }
+}
+
+/// A supervised, disabled, adopted card whose standalone move plan moves three
+/// files, and whose admin key is owed — the 120x24 RIGHT-walk fixture (three
+/// actionable lines: `enabled`, `f  add admin key`, `f  move stores in`).
+fn adopted_three_file_card(
+    home: &crate::testutil::HomeSandbox,
+) -> (
+    crate::daemon::gateway::GatewaySlot,
+    crate::gateway::GatewayRecord,
+    crate::gateway::StoreMovePlan,
+) {
+    let record = shunt_record(home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    let plan = crate::gateway::StoreMovePlan {
+        moved: vec![
+            crate::gateway::MovedFile {
+                from: "/home/u/.shunt/accounts/claude/main.json".into(),
+                to: "/home/u/.clauth/shunt/accounts/claude/main.json".into(),
+            },
+            crate::gateway::MovedFile {
+                from: "/home/u/.shunt/xai-auth.json".into(),
+                to: "/home/u/.clauth/shunt/xai-auth.json".into(),
+            },
+            crate::gateway::MovedFile {
+                from: "/home/u/.shunt/grok.json".into(),
+                to: "/home/u/.clauth/shunt/grok.json".into(),
+            },
+        ],
+        kept: vec![],
+    };
+    (slot, record, plan)
+}
+
+/// ↓/↑ walk the shunt card's actionable lines, landing on each as it comes
+/// into view: on a card that fits its pane, descend → `enabled`, ↓ → the admin
+/// fix, ↓ → `move stores in`, ↓ → nothing (the card fits), ↑ → back to the
+/// admin fix. Pinned by equality on which line holds the caret after each
+/// press, on the full frame.
+#[test]
+fn down_up_walk_the_shunt_stops_on_a_fitting_card() {
+    use crate::tui::app::{MovePlanOutcome, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan)),
+        None,
+    );
+
+    // The first frame publishes the geometry; then Enter descends.
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("admin"));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+
+    // ↓ at the last stop on a fitting card moves nothing.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+
+    // ↑ mirrors the walk.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("admin"));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
+}
+
+/// On an 80x20 refused plan with an admin step, ↓ first moves focus to the
+/// admin fix, then scrolls one rendered line at a time through the MOVE PLAN
+/// and the wrapped refusal to its last words, focus staying on the admin fix
+/// while it is in view (at 80x20 it never leaves — the fix sits high enough
+/// that the whole scroll range keeps it visible).
+#[test]
+fn down_scrolls_the_refused_card_one_line_each_to_its_last_words() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+    slot.reason = Some("port busy".to_string());
+    slot.pid = Some(4242);
+    slot.port = Some(3001);
+    slot.restarts = 2;
+    slot.last_exit = Some(crate::daemon::gateway::ExitReport {
+        code: Some(1),
+        signal: None,
+    });
+    let refusal = "the standalone's home names no absolute directory, so clauth cannot tell where the codex CLI's own login (~/.codex/auth.json) sits; nothing was moved; set HOME to an absolute path in the env file, then run the move again".to_string();
+    let mut app = shunt_card_app(
+        slot,
+        true,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Refused(refusal)),
+        None,
+    );
+
+    let _ = draw_frame(&app, 80, 20);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(caret_stop(&draw_frame(&app, 80, 20)), Some("enabled"));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 80, 20)), Some("admin"));
+
+    let max = app.services.detail_max_scroll.get();
+    assert!(max > 0, "the refused card overflows 80x20");
+    // Each further ↓ scrolls exactly one rendered line; the caret stays on the
+    // admin fix the whole way (it never leaves the viewport here).
+    for _ in 0..max {
+        let before = app.services.detail_scroll;
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        assert_eq!(app.services.detail_scroll, before + 1, "one line per press");
+        assert_eq!(
+            caret_stop(&draw_frame(&app, 80, 20)),
+            Some("admin"),
+            "focus stays on the admin fix while in view"
+        );
+    }
+    let screen = draw_frame(&app, 80, 20).join("\n");
+    assert!(
+        screen.contains("move again"),
+        "the refusal's last words are reachable:\n{screen}"
+    );
+    // At the end, ↓ moves nothing.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(
+        app.services.detail_scroll, max,
+        "the scroll stays at the end"
+    );
+}
+
+/// `f` on the focused `move stores in` line — reachable only by walking, even
+/// while an admin fix is also owed — opens the move confirm.
+#[test]
+fn f_on_the_focused_move_line_opens_the_move_confirm() {
+    use crate::tui::app::{ConfirmAction, Modal, MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+    // `open_move_confirm` reads the cached plan.
+    app.services.move_plan = Some(MovePlanOutcome::Plan(plan));
+
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => assert!(
+            matches!(state.on_confirm, ConfirmAction::MoveStoresIn(_)),
+            "f on the focused move line opens the move confirm, got {:?}",
+            state.on_confirm
+        ),
+        other => panic!("expected the move confirm, got {other:?}"),
+    }
+}
+
+/// The shunt detail's `↑↓` hint is derived from what a press does: the house
+/// walk word (`row`) while a press would move focus, the scroll word (`scroll`)
+/// while it would only scroll, and no hint at all on a fitting one-stop card
+/// (audit N4). Pinned at the hint-list level.
+#[test]
+fn the_shunt_detail_hint_names_what_updown_does() {
+    use crate::tui::app::ServicesFocus;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let hints = |app: &App| super::super::footer::services_hints(app);
+
+    // Two stops (enabled + the admin fix): a press moves focus → `row`.
+    let mut app = shunt_card_app(
+        slot.clone(),
+        false,
+        Some(record.clone()),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    );
+    app.services.focus = ServicesFocus::Detail;
+    assert_eq!(hints(&app)[0], ("↑↓", "row"), "{:?}", hints(&app));
+
+    // One stop (the enabled row) on a card that overflows → `scroll`.
+    let mut app = shunt_card_app(slot, false, Some(record), None, None, None);
+    app.services.focus = ServicesFocus::Detail;
+    app.services.detail_max_scroll.set(3);
+    assert_eq!(hints(&app)[0], ("↑↓", "scroll"), "{:?}", hints(&app));
+
+    // One stop, fitting (max scroll 0): no `↑↓` at all.
+    app.services.detail_max_scroll.set(0);
+    app.services.detail_scroll = 0;
+    let h = hints(&app);
+    assert!(
+        h.iter().all(|(k, _)| *k != "↑↓"),
+        "a fitting one-stop card hides ↑↓: {h:?}"
+    );
+}
+
+/// A resize that pushes the focused `move stores in` line off screen re-settles
+/// focus to the first actionable line in view (the descend rule): the caret
+/// lands on `enabled`, the footer offers the re-settled `space/↵ toggle` and no
+/// move verb, `f` opens no confirm, `space` flips `enabled`, and the next `↓`
+/// walks from the re-settled line (landing on the admin fix, not skipping
+/// `enabled`'s successor).
+#[test]
+fn a_resize_pushing_focus_off_screen_resettles_to_the_first_line_in_view() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    // The record's config names an `[server.admin]` table, so the recompute
+    // after `space` re-derives the same `WriteKey` admin fix the fixture
+    // builds with (`f  add admin key`, not `f  add admin table`).
+    std::fs::write(record.config(), "[server]\n\n[server.admin]\n").unwrap();
+    // The record on disk (`disabled`), so `space` flips it for real.
+    crate::gateway::GatewayRecord::update(|s| {
+        *s = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+    // `open_move_confirm` reads the cached plan, so a buggy `f` would open it.
+    app.services.move_plan = Some(MovePlanOutcome::Plan(plan));
+
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+
+    // Resize to 120x14: the move line leaves the view, so focus re-settles to
+    // the first actionable line in view — `enabled`.
+    let _ = draw_frame(&app, 120, 14);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
+
+    // The footer offers the re-settled line's verb, never the off-screen one.
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.iter().any(|(k, v)| *k == "space/↵" && *v == "toggle"),
+        "the re-settled enabled row offers its toggle verb: {hints:?}"
+    );
+    assert!(
+        hints.iter().all(|(k, _)| *k != "f"),
+        "no `f` verb for the off-screen move line: {hints:?}"
+    );
+
+    // `f` opens no confirm: the re-settled `enabled` row has no fix.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        app.modals.is_empty(),
+        "no action on the off-screen move line: {:?}",
+        app.modals
+    );
+
+    // `space` flips the re-settled `enabled` row for real.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "space flips the re-settled enabled row"
+    );
+
+    // The recompute rebuilt the card (the move plan dropped); render once so
+    // the walk sees the fresh geometry, then ↓ walks from the re-settled line:
+    // `enabled` → the admin fix, never skipping `enabled`'s successor.
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("admin"));
+}
+
+/// A card change that pushes the focused `enabled` row — and every actionable
+/// line below it — off screen re-settles focus to none (the descend rule with
+/// no actionable line in view): `space` does not toggle and the footer offers
+/// no verb.
+#[test]
+fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    // The record on disk (`disabled`), so a buggy `space` would really flip it.
+    crate::gateway::GatewayRecord::update(|s| {
+        *s = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = shunt_card_app(
+        slot.clone(),
+        false,
+        Some(record.clone()),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+
+    let _ = draw_frame(&app, 120, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
+
+    // A worker landing adds a multi-line reason above `enabled`, pushing it
+    // and every stop below it out of view.
+    let mut grown = slot;
+    grown.reason = Some(
+        "the daemon could not start the gateway\nbecause the bind was already held\nby another process\nretrying later".to_string(),
+    );
+    app.services.checks = vec![crate::tui::app::shunt_card(
+        &grown,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(&MovePlanOutcome::Plan(plan)),
+        None,
+    )];
+
+    // The next render publishes the new geometry and re-settles focus to none
+    // (no actionable line is in view).
+    let _ = draw_frame(&app, 120, 14);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
+    assert_eq!(app.services.shunt_focus.get(), None);
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.iter().all(|(k, _)| *k != "f" && *k != "space/↵"),
+        "no verb offered with no focused line: {hints:?}"
+    );
+
+    // `space` does not toggle the off-screen `enabled` row.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "space must not toggle a row the user cannot see"
+    );
+}
+
+/// Re-descending keeps the held focus identity while its line is in view: walk
+/// to `move`, ascend, descend again — the caret is back on `move`, not reset to
+/// the first actionable line.
+#[test]
+fn redescending_keeps_the_held_focus_when_its_line_is_in_view() {
+    use crate::tui::app::{MovePlanOutcome, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan)),
+        None,
+    );
+
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+
+    // Ascend: the list takes focus, the identity survives.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List);
+
+    // Descend again: the held identity's line is in view, so it is kept.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+}
+
+/// Ascending out of the shunt detail keeps the card's focused-line highlight
+/// (the blurred-pane rule) but drops the detail caret and bold, so exactly one
+/// caret (the list's) is on screen; the identity survives the ascend.
+#[test]
+fn ascending_keeps_the_card_highlight_but_drops_the_detail_caret() {
+    use crate::tui::app::{MovePlanOutcome, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan)),
+        None,
+    );
+
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("admin"));
+
+    // Ascend: the list takes focus; the detail keeps the admin line's hover
+    // tint but draws no caret and no bold.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert_eq!(app.services.focus, ServicesFocus::List);
+    let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let screen = rows.join("\n");
+    assert_eq!(
+        screen.matches('❯').count(),
+        1,
+        "exactly one caret (the list's) after ascending:\n{screen}"
+    );
+    // The admin line still carries the hover tint (blurred-pane rule), pinned
+    // off the styled buffer.
+    let row_idx = rows
+        .iter()
+        .position(|r| r.contains("f  add admin key"))
+        .expect("the admin line renders");
+    let row = &rows[row_idx];
+    let byte = row.find("f  add").expect("the admin fix glyph");
+    let col = row[..byte].chars().count();
+    assert_eq!(
+        buf.content[row_idx * 120 + col].bg,
+        super::theme::bg_hover(),
+        "the blurred card keeps the focused line's highlight:\n{screen}"
+    );
+}
+
+/// A none focus re-settles when a change brings an actionable line back into
+/// view: every stop pushed off screen re-settles focus to none (the descend
+/// rule with no stop in view), and the frame that brings the stops back
+/// re-settles it again to the first stop in view — `enabled` — with the
+/// footer offering `space/↵ toggle`; `↓` then walks from the re-settled line
+/// to the admin fix, never skipping `enabled`'s successor.
+#[test]
+fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    crate::gateway::GatewayRecord::update(|s| {
+        *s = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = shunt_card_app(
+        slot.clone(),
+        false,
+        Some(record.clone()),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+
+    let _ = draw_frame(&app, 120, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
+
+    // A worker landing adds a multi-line reason above `enabled`, pushing every
+    // stop out of view: focus re-settles to none.
+    let mut grown = slot.clone();
+    grown.reason = Some(
+        "the daemon could not start the gateway\nbecause the bind was already held\nby another process\nretrying later".to_string(),
+    );
+    app.services.checks = vec![crate::tui::app::shunt_card(
+        &grown,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(&MovePlanOutcome::Plan(plan.clone())),
+        None,
+    )];
+    let _ = draw_frame(&app, 120, 14);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
+    assert_eq!(app.services.shunt_focus.get(), None);
+
+    // The reason clears (the worker landed): the stops come back into view and
+    // the none focus re-settles to the first stop in view — `enabled` — with
+    // the re-settled line's verb; ↓ then walks from the re-settled line.
+    app.services.checks = vec![crate::tui::app::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(&MovePlanOutcome::Plan(plan)),
+        None,
+    )];
+    let _ = draw_frame(&app, 120, 14);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.iter().any(|(k, v)| *k == "space/↵" && *v == "toggle"),
+        "the re-settled enabled row offers its toggle verb: {hints:?}"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("admin"));
+}
+
+/// From a none focus (with stops in view but no re-settle draw in between),
+/// `↓` lands on the first stop in view — never skipping it — and `↑` lands on
+/// the last stop in view. The re-settle usually fixes a none focus at the next
+/// draw; this pins the key handler's own no-skip rule on the same path.
+#[test]
+fn down_from_none_lands_on_the_first_stop_in_view() {
+    use crate::tui::app::{MovePlanOutcome, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let (slot, record, plan) = adopted_three_file_card(&home);
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        Some(MovePlanOutcome::Plan(plan)),
+        None,
+    );
+
+    let _ = draw_frame(&app, 120, 24);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
+
+    // Clear the focus with no draw in between: the next ↓ starts from none and
+    // lands on the first stop in view, never skipping it.
+    app.services.shunt_focus.set(None);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("enabled"));
+
+    // ↑ from none lands on the last stop in view.
+    app.services.shunt_focus.set(None);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 24)), Some("move"));
+}
+
+/// On a short pane, `↓` on the card's only stop scrolls it out the top: focus
+/// stays none while no stop is in view (round 4's rule), and the next frame
+/// with a stop in view re-settles focus to it — no key press.
+#[test]
+fn scrolling_past_the_last_stop_leaves_focus_none_until_a_stop_returns_to_view() {
+    use crate::tui::app::{PoolOutcome, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let record = shunt_record(&home, true);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let mut app = shunt_card_app(
+        slot,
+        false,
+        Some(record),
+        None,
+        None,
+        Some(PoolOutcome::Providers(vec![
+            "openai".to_string(),
+            "anthropic".to_string(),
+            "deepseek".to_string(),
+            "zai".to_string(),
+            "alibaba".to_string(),
+            "openrouter".to_string(),
+        ])),
+    );
+
+    let _ = draw_frame(&app, 120, 12);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 12)), Some("enabled"));
+    assert!(
+        app.services.detail_max_scroll.get() > 0,
+        "the card overflows 120x12"
+    );
+
+    // `↓` on the only stop scrolls one line at a time; once the enabled row
+    // scrolls out the top, focus is none (no stop in view).
+    let max = app.services.detail_max_scroll.get();
+    let mut saw_none = false;
+    for _ in 0..max {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        if caret_stop(&draw_frame(&app, 120, 12)).is_none() {
+            saw_none = true;
+            break;
+        }
+    }
+    assert!(saw_none, "focus leaves once the enabled row scrolls out");
+    assert_eq!(app.services.shunt_focus.get(), None);
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.iter().all(|(k, _)| *k != "space/↵" && *k != "f"),
+        "no verb offered with no stop in view: {hints:?}"
+    );
+
+    // The next frame with a stop in view (a taller pane) re-settles focus to
+    // it — no key press.
+    assert_eq!(caret_stop(&draw_frame(&app, 120, 16)), Some("enabled"));
+}
+
+/// A shunt card with no actionable line (the absent card with an unread bind)
+/// still scrolls one rendered line per ↑↓, and the footer's `↑↓ scroll` is
+/// then true (round 1 S14's behaviour, restored).
+#[test]
+fn a_stopless_card_still_scrolls_one_line_per_press() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(super::theme::Tier::Full);
+    let mut slot = shunt_slot(crate::daemon::gateway::GatewayState::Absent);
+    slot.reason = Some(
+        (0..10)
+            .map(|i| format!("parse error line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let standalone = crate::tui::app::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.yaml")),
+        unread_bind: Some(crate::tui::app::UnreadBind::Yaml),
+        unread_config: Some(crate::tui::app::UnreadConfig::Yaml),
+        unread_env: false,
+        answer: None,
+    };
+    let card = crate::tui::app::shunt_card(
+        &slot,
+        false,
+        false,
+        Some(&standalone),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(card.shunt_focus.is_empty(), "fixture: no actionable line");
+    let mut app = app_with(card);
+
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    let max = app.services.detail_max_scroll.get();
+    assert!(max > 0, "the stopless card overflows 80x14");
+
+    // The footer names ↑↓ scroll exactly while a press would scroll.
+    let hints = super::super::footer::services_hints(&app);
+    assert!(
+        hints.iter().any(|(k, v)| *k == "↑↓" && *v == "scroll"),
+        "the footer says ↑↓ scroll: {hints:?}"
+    );
+
+    // One line per press, clamped at either end.
+    for _ in 0..max {
+        let before = app.services.detail_scroll;
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+        assert_eq!(app.services.detail_scroll, before + 1, "one line per press");
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert_eq!(app.services.detail_scroll, max, "clamped at the end");
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    assert_eq!(
+        app.services.detail_scroll,
+        max - 1,
+        "↑ scrolls back one line"
     );
 }

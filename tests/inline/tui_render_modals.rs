@@ -668,3 +668,119 @@ fn the_usage_help_section_documents_the_note_key() {
         "an empty roster keeps n = new account, got {empty:?}"
     );
 }
+
+/// The shunt confirm buttons name their own verb (adopt / move / add), never
+/// the generic `confirm` — the `AddChainCandidate` named-button extension.
+#[test]
+fn the_shunt_confirm_buttons_name_their_verb() {
+    use crate::tui::app::{ConfirmAction, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let label = |action: ConfirmAction| -> String {
+        let state = ConfirmState {
+            message: "m".into(),
+            detail: None,
+            choice: false,
+            on_confirm: action,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+        crate::testutil::buffer_rows(term.backend().buffer()).join("\n")
+    };
+
+    for (action, verb) in [
+        (
+            ConfirmAction::AdoptConfig("/cfg/shunt.toml".into()),
+            "adopt",
+        ),
+        (
+            ConfirmAction::MoveStoresIn(crate::gateway::StoreMovePlan {
+                moved: Vec::new(),
+                kept: Vec::new(),
+            }),
+            "move",
+        ),
+        (ConfirmAction::AddAdminKey, "add"),
+        (ConfirmAction::AddAdminTable, "add"),
+    ] {
+        let screen = label(action);
+        assert!(
+            screen.contains(&format!(" {verb} ")),
+            "the `{verb}` button renders:\n{screen}"
+        );
+        assert!(
+            !screen.contains(" confirm "),
+            "the generic `confirm` label must not appear for the shunt actions:\n{screen}"
+        );
+    }
+}
+
+/// The `add admin table` confirm is destructive (DANGER) — the add restarts the
+/// gateway — while adopt / move / add-key stay neutral. Read off the rendered
+/// unfocused `add` button's fill, so a plant dropping `AddAdminTable` from the
+/// destructive set reds here (the label-only test above would not).
+#[test]
+fn the_add_admin_table_confirm_button_is_dangerous() {
+    use crate::tui::app::{ConfirmAction, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let render = |action: ConfirmAction| -> (String, ratatui::buffer::Buffer) {
+        let state = ConfirmState {
+            message: "m".into(),
+            detail: None,
+            choice: false,
+            on_confirm: action,
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (crate::testutil::buffer_rows(&buf).join("\n"), buf)
+    };
+
+    let (screen, buf) = render(ConfirmAction::AddAdminTable);
+    let stride = buf.area.width as usize;
+    let mut seen = None;
+    for y in 0..buf.area.height as usize {
+        for x in 0..stride {
+            let cell = &buf.content[y * stride + x];
+            if cell.symbol() == "a"
+                && buf.content.get(y * stride + x + 1).map(|c| c.symbol()) == Some("d")
+                && buf.content.get(y * stride + x + 2).map(|c| c.symbol()) == Some("d")
+            {
+                seen = Some(cell.fg);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        Some(crate::tui::theme::danger_color()),
+        "the add-admin-table confirm button is DANGER unfocused:\n{screen}"
+    );
+
+    // A neutral shunt confirm (adopt) stays dim.
+    let (screen, buf) = render(ConfirmAction::AdoptConfig("/cfg/shunt.toml".into()));
+    let stride = buf.area.width as usize;
+    let mut seen = None;
+    for y in 0..buf.area.height as usize {
+        for x in 0..stride {
+            let cell = &buf.content[y * stride + x];
+            if cell.symbol() == "a"
+                && buf.content.get(y * stride + x + 1).map(|c| c.symbol()) == Some("d")
+                && buf.content.get(y * stride + x + 2).map(|c| c.symbol()) == Some("o")
+                && buf.content.get(y * stride + x + 3).map(|c| c.symbol()) == Some("p")
+                && buf.content.get(y * stride + x + 4).map(|c| c.symbol()) == Some("t")
+            {
+                seen = Some(cell.fg);
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        Some(crate::tui::theme::text_dim_color()),
+        "the adopt confirm button is neutral (dim):\n{screen}"
+    );
+}

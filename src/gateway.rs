@@ -14,7 +14,7 @@
 
 #![expect(
     dead_code,
-    reason = "T3b's Services card is the caller of the take-over, edit and hold API"
+    reason = "`write_hold`/`remove_hold` are C5's `stop shunt` verb, not yet called; `GatewayEnv::get` and `CheckStderr::text` are surfaces no caller reaches yet"
 )]
 
 use std::collections::{BTreeMap, HashSet};
@@ -405,10 +405,7 @@ fn recorded_env_for_live_daemon() -> Result<Option<Vec<(OsString, OsString)>>> {
 pub(crate) fn inherited_env() -> Result<(Vec<(OsString, OsString)>, CodexHomeSource)> {
     match recorded_env_for_live_daemon()? {
         Some(pairs) => Ok((pairs, CodexHomeSource::DaemonRecord)),
-        None => Ok((
-            own_env(|key| std::env::var_os(key)),
-            CodexHomeSource::Inherited,
-        )),
+        None => Ok((own_env(inherited_var), CodexHomeSource::Inherited)),
     }
 }
 
@@ -424,8 +421,8 @@ fn recorded_pairs(record: &DaemonEnvRecord) -> Result<Vec<(OsString, OsString)>>
 
 /// This process's own env, restricted to [`INHERITED_KEYS`], with a clauth
 /// codex home scrubbed the way `start daemon` scrubs it. `var` is the env
-/// source, so a test drives the production fallback over hand-built pairs
-/// without reading the process's own env.
+/// source, so a test drives the production body over hand-built pairs without
+/// reading the process's own env.
 fn own_env(var: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, OsString)> {
     INHERITED_KEYS
         .iter()
@@ -439,6 +436,30 @@ fn own_env(var: impl Fn(&str) -> Option<OsString>) -> Vec<(OsString, OsString)> 
             Some((OsString::from(*key), value))
         })
         .collect()
+}
+
+/// The source [`inherited_env`] passes to [`own_env`] for the no-daemon
+/// fallback — the test-build fence lives HERE, never in [`own_env`]'s body.
+/// `HOME` and `USERPROFILE` are the homes every standalone store's default
+/// resolves under: in a test build they resolve from the sandbox home
+/// ([`crate::profile::home_dir`]), whose `HOME_OVERRIDE` panic covers the
+/// no-sandbox case process-wide (worker threads included), so a move/adopt
+/// test that forgets its `testutil::HomeSandbox` panics instead of planning
+/// and moving the operator's real `~/.shunt`. The non-test build reads the
+/// process env straight through.
+#[cfg(not(test))]
+fn inherited_var(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
+}
+
+#[cfg(test)]
+fn inherited_var(key: &str) -> Option<OsString> {
+    match key {
+        "HOME" | "USERPROFILE" => crate::profile::home_dir()
+            .ok()
+            .map(std::path::PathBuf::into_os_string),
+        _ => std::env::var_os(key),
+    }
 }
 
 /// An env value's bytes as the record stores them: raw on unix, UTF-16LE on
@@ -846,14 +867,29 @@ fn gateway_bind_in(
             let value = value
                 .into_string()
                 .map_err(|_| BindRefusal::NotAnAddress { source: BIND_ENV })?;
-            Some(
-                normalize_bind_value(&value)
-                    .ok_or(BindRefusal::QuotedEscape { source: BIND_ENV })?,
-            )
+            Some(read_bind_env(&value)?)
         }
         None => None,
     };
     resolve_bind(&text, env_bind.as_deref())
+}
+
+/// A `SHUNT_SERVER__BIND` value as shunt's figment layer hands it to
+/// [`resolve_bind`]: one plain pair of quotes unwrapped, a quoted value
+/// holding an escape refused rather than misread.
+pub(crate) fn read_bind_env(value: &str) -> Result<String, BindRefusal> {
+    normalize_bind_value(value).ok_or(BindRefusal::QuotedEscape { source: BIND_ENV })
+}
+
+/// The raw `SHUNT_SERVER__BIND` an adopt's probe reads ([`gateway_probe`] on
+/// a record with no env file): [`inherited_env`]'s, decoded lossily, so a
+/// value that does not decode still refuses as an address. Refuses as
+/// [`inherited_env`] does, with [`StoreMoveRefusal::DaemonEnvUnrecorded`].
+pub(crate) fn inherited_bind_env() -> Result<Option<String>> {
+    Ok(
+        spawned_env_value(&GatewayEnv::default(), BIND_ENV, inherited_env()?.0)
+            .map(|value| value.to_string_lossy().into_owned()),
+    )
 }
 
 /// The gateway's probe address, resolved from the inherited env the store plan

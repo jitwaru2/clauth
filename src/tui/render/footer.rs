@@ -9,9 +9,9 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServicesFocus, StatusFocus, Tab,
-    TokenView, build_action_menu, config_rows, fallback_hint, fix_verb, has_sub_focus,
-    herdr_config_writable, keyboard_owner,
+    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServiceFix, ServicesFocus,
+    ShuntFocus, StatusFocus, Tab, TokenView, build_action_menu, config_rows, fallback_hint,
+    fix_verb, has_sub_focus, herdr_config_writable, keyboard_owner,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -413,7 +413,9 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 hints.push(("↵", "detail"));
             }
             hints.push(("r", "refresh"));
-            if let Some(fix) = app.services.focused_fix() {
+            if let Some(fix) = app.services.focused_fix()
+                && !(app.services.shunt_action.running && shunt_fix(fix))
+            {
                 hints.push(("f", fix_verb(fix)));
             }
             hints.extend([("a", "actions"), ("?", "help")]);
@@ -423,12 +425,61 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// True for the four fixes an in-flight shunt action gates (a second shunt
+/// press starts nothing); the plugin and herdr fixes keep working, so their
+/// `f` hint stays while a shunt action runs.
+fn shunt_fix(fix: &ServiceFix) -> bool {
+    matches!(
+        fix,
+        ServiceFix::AdoptConfig(_)
+            | ServiceFix::MoveStoresIn
+            | ServiceFix::AddAdminKey
+            | ServiceFix::AddAdminTable
+    )
+}
+
 /// Services detail hints, row-aware: the herdr options rows name their own
 /// keys, the plugin detail walks its fixable problems, every other detail
 /// scrolls.
 fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let verb = app.services.focused_fix().map(fix_verb);
     let label = app.services.selected_check().map(|c| c.label);
+
+    // The shunt detail walks its actionable lines one at a time: `↑↓ row`
+    // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while
+    // a press would only scroll the read-only text, and no `↑↓` at all when
+    // neither applies (a fitting one-stop card, audit N4). `f`/`space/↵` act
+    // only on the focused line, and drop while an action runs or nothing holds
+    // focus — derived from the same gates the handlers read, never copied per
+    // branch.
+    if label == Some("shunt") {
+        let focus = app.services.focused_shunt_focus();
+        let stops = app
+            .services
+            .selected_check()
+            .map(|c| c.shunt_focus.len())
+            .unwrap_or(0);
+        let scroll = app
+            .services
+            .detail_scroll
+            .min(app.services.detail_max_scroll.get());
+        let mut hints = Vec::new();
+        if stops > 1 {
+            hints.push(("↑↓", "row"));
+        } else if scroll > 0 || scroll < app.services.detail_max_scroll.get() {
+            hints.push(("↑↓", "scroll"));
+        }
+        hints.push(("r", "refresh"));
+        if !app.services.shunt_action.running {
+            match focus {
+                Some(ShuntFocus::Fix { fix, .. }) => hints.push(("f", fix_verb(fix))),
+                Some(ShuntFocus::Enabled { .. }) => hints.push(("space/↵", "toggle")),
+                None => {}
+            }
+        }
+        hints.extend([("a", "actions"), ("?", "help")]);
+        return hints;
+    }
 
     if label != Some("herdr") {
         let walks_problems = label == Some("plugin")

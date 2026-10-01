@@ -3841,6 +3841,61 @@ fn the_env_record_reads_only_the_live_holders_record() {
     );
 }
 
+/// The bind env the Services card reads is the live daemon's recorded one,
+/// the env an adopt's probe reads, never this process's own; a record that
+/// names no bind reads as none, and a stale record refuses.
+#[test]
+fn the_card_reads_the_live_daemons_recorded_bind() {
+    let home = HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("stamp the holder pid");
+    let pid = std::process::id();
+    let start =
+        crate::daemon::gateway::process_start_time(pid).expect("the test process start time");
+    let record = |pid, env: Vec<(String, Vec<u8>)>| DaemonEnvRecord {
+        identity: DaemonIdentity {
+            pid,
+            start: Some(start.clone()),
+        },
+        env,
+    };
+
+    write_env_record(record(
+        pid,
+        vec![(
+            BIND_ENV.to_string(),
+            env_value_bytes(OsStr::new("127.0.0.1:4700")),
+        )],
+    ))
+    .expect("write");
+    assert_eq!(
+        inherited_bind_env().expect("a live record"),
+        Some("127.0.0.1:4700".to_string())
+    );
+
+    write_env_record(record(
+        pid,
+        vec![(
+            "CODEX_HOME".to_string(),
+            env_value_bytes(OsStr::new("/live")),
+        )],
+    ))
+    .expect("write");
+    assert_eq!(inherited_bind_env().expect("a live record"), None);
+
+    write_env_record(record(pid + 1, Vec::new())).expect("write");
+    assert_eq!(
+        inherited_bind_env()
+            .expect_err("a stale record refuses")
+            .to_string(),
+        "the running daemon recorded no environment; restart it, then look at the plan again"
+    );
+}
+
 /// A record naming this process while no daemon holds the singleton is not
 /// trusted: the reader falls back to the caller's own env, because presence is
 /// the lock, never a matching record alone.
@@ -3959,7 +4014,7 @@ fn the_daemon_env_capture_records_exactly_the_four_inherited_keys() {
 
 /// `own_env`'s injected source over hand-built pairs, last assignment wins on
 /// a key (the way the process env's lookup reads), so a test drives the
-/// production fallback without reading the process's own env.
+/// production body without reading the process's own env.
 fn env_source(pairs: &[(OsString, OsString)]) -> impl Fn(&str) -> Option<OsString> + '_ {
     move |key| {
         pairs
@@ -3971,7 +4026,8 @@ fn env_source(pairs: &[(OsString, OsString)]) -> impl Fn(&str) -> Option<OsStrin
 }
 
 /// The fallback scrubs a clauth codex home exactly as `start daemon` scrubs
-/// it, and keeps a directory the user owns.
+/// it, keeps a directory the user owns, and reads both homes (HOME and
+/// USERPROFILE) straight from the source — the shared body production runs.
 #[test]
 fn the_fallback_scrubs_a_clauth_codex_home_and_keeps_the_users_own() {
     let home = HomeSandbox::new();
@@ -3988,19 +4044,44 @@ fn the_fallback_scrubs_a_clauth_codex_home_and_keeps_the_users_own() {
         own_env(env_source(&[
             (OsString::from("CODEX_HOME"), clauth_codex.into_os_string()),
             (OsString::from("HOME"), home_env.clone()),
+            (OsString::from("USERPROFILE"), home_env.clone()),
         ])),
-        vec![(OsString::from("HOME"), home_env.clone())]
+        vec![
+            (OsString::from("HOME"), home_env.clone()),
+            (OsString::from("USERPROFILE"), home_env.clone()),
+        ]
     );
     assert_eq!(
         own_env(env_source(&[
             (OsString::from("CODEX_HOME"), own.clone().into_os_string()),
             (OsString::from("HOME"), home_env.clone()),
+            (OsString::from("USERPROFILE"), home_env.clone()),
         ])),
         vec![
             (OsString::from("CODEX_HOME"), own.into_os_string()),
-            (OsString::from("HOME"), home_env),
+            (OsString::from("HOME"), home_env.clone()),
+            (OsString::from("USERPROFILE"), home_env),
         ]
     );
+}
+
+/// The inherited-env fallback must fail loudly with no `HomeSandbox` held,
+/// instead of reading the operator's real `$HOME` and planning/moving the real
+/// `~/.shunt`. The fence is the source [`inherited_env`] passes
+/// (`inherited_var`), whose HOME/USERPROFILE resolve through
+/// `profile::home_dir` — which panics with no override held in every leg (the
+/// `HOME_OVERRIDE` guard is process-wide, so it also fires on a worker thread).
+/// The test holds `HOME_TEST_LOCK` (every `HomeSandbox` holds it for its whole
+/// lifetime) so the process-global override is empty for its duration: a
+/// sibling test's sandbox would otherwise make `home_dir` return that sandbox
+/// instead of panicking.
+#[test]
+#[should_panic(expected = "HomeSandbox")]
+fn the_inherited_env_fallback_panics_with_no_sandbox_held() {
+    let _serial = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    super::own_env(super::inherited_var);
 }
 
 /// Planning then moving an unchanged tree moves exactly the planned files.

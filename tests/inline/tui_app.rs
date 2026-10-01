@@ -237,7 +237,7 @@ fn the_delegates_detail_reads_the_store_in_banded_order() {
     done("d-fin-b-0", 4_000);
 
     let mut app = bare_app();
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
 
     let ids: Vec<String> = app
         .services
@@ -479,7 +479,7 @@ fn list_f_on_a_fresh_box_opens_the_install_confirm() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = super::Tab::Services;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     app.services.cursor = app
         .services
         .checks
@@ -521,7 +521,7 @@ fn the_delegates_detail_names_rate_limited_traffic() {
         state: AppState::default(),
         profiles: vec![profile],
     });
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     let check = app
         .services
         .checks
@@ -543,7 +543,7 @@ fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = super::Tab::Services;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     let check = app
         .services
         .checks
@@ -561,7 +561,7 @@ fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
     app.services.problem_cursor = 1;
     // Wire the server: the wire problem leaves, the install problem stays.
     crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert_eq!(
         app.services.problem_cursor, 0,
         "the cursor clamps onto the surviving problem"
@@ -580,7 +580,7 @@ fn enter_does_not_descend_into_the_delegates_detail() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.tab = super::Tab::Services;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     app.services.cursor = 1; // delegates is the second row, after shunt
     app.services.focus = super::ServicesFocus::List;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -696,6 +696,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
             &super::StandaloneShunt {
                 found: Some(found.clone()),
                 unread_bind: None,
+                unread_config: None,
+                unread_env: false,
                 answer: None,
             }
         ),
@@ -708,6 +710,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
     let both = super::StandaloneShunt {
         found: Some(found),
         unread_bind: None,
+        unread_config: None,
+        unread_env: false,
         answer: Some(("0.49.1".to_string(), addr)),
     };
     assert_eq!(
@@ -724,6 +728,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
             &super::StandaloneShunt {
                 found: None,
                 unread_bind: None,
+                unread_config: None,
+                unread_env: false,
                 answer: Some(("0.49.1\u{1b}[2J".to_string(), addr)),
             }
         ),
@@ -738,6 +744,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         &super::StandaloneShunt {
             found: None,
             unread_bind: None,
+            unread_config: None,
+            unread_env: false,
             answer: Some(("0.49.1: forged".to_string(), addr)),
         },
     );
@@ -751,6 +759,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         &super::StandaloneShunt {
             found: None,
             unread_bind: None,
+            unread_config: None,
+            unread_env: false,
             answer: Some(("0.49.1:".to_string(), addr)),
         },
     );
@@ -764,6 +774,8 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
             &super::StandaloneShunt {
                 found: Some(std::path::PathBuf::from("/w/\u{202e}x/shunt.toml")),
                 unread_bind: None,
+                unread_config: None,
+                unread_env: false,
                 answer: None,
             }
         ),
@@ -773,8 +785,16 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         ],
         "a found path is escaped too: a directory name can carry a bidi override",
     );
+    // A YAML or unreadable config is unread too, as the readout reports it:
+    // the bind line alone names it, never a second `config:` line.
     let unread = |reason: super::UnreadBind| super::StandaloneShunt {
         found: Some(std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml")),
+        unread_config: match reason {
+            super::UnreadBind::Yaml => Some(super::UnreadConfig::Yaml),
+            super::UnreadBind::Unreadable => Some(super::UnreadConfig::Unreadable),
+            super::UnreadBind::Unparsed | super::UnreadBind::Value(_) => None,
+        },
+        unread_env: false,
         unread_bind: Some(reason),
         answer: Some(("0.49.1".to_string(), addr)),
     };
@@ -807,9 +827,14 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         ),
     ] {
         assert_eq!(
-            detail(GatewayState::Absent, &unread(reason))[2],
-            shown,
-            "each reason's words, a raw value escaped"
+            detail(GatewayState::Absent, &unread(reason)),
+            vec![
+                "state: not adopted".to_string(),
+                "found: /home/u/.config/shunt/shunt.yaml".to_string(),
+                shown.to_string(),
+                "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+            ],
+            "each reason's words, a raw value escaped, and no second line"
         );
     }
     assert_eq!(
@@ -846,6 +871,8 @@ fn the_standalone_readout_probes_the_found_configs_bind() {
         super::StandaloneShunt {
             found: Some(config.clone()),
             unread_bind: None,
+            unread_config: None,
+            unread_env: false,
             answer: Some(("0.49.1".to_string(), stub)),
         },
         "the stub on the config's bind answers as a standalone shunt",
@@ -867,6 +894,8 @@ fn the_standalone_readout_probes_the_found_configs_bind() {
         super::StandaloneShunt {
             found: Some(config),
             unread_bind: None,
+            unread_config: None,
+            unread_env: false,
             answer: None,
         },
     );
@@ -878,7 +907,7 @@ fn the_standalone_readout_probes_the_found_configs_bind() {
 /// an unread bind: shunt's default IS its bind.
 #[test]
 fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
-    use super::UnreadBind;
+    use super::{UnreadBind, UnreadConfig};
     use std::cell::RefCell;
     let home = crate::testutil::HomeSandbox::new();
     let probed = RefCell::new(Vec::new());
@@ -886,25 +915,29 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
         probed.borrow_mut().push(addr);
         Ok(crate::gateway::Health::NotShunt { status: 404 })
     };
-    let readout =
-        |found: Option<std::path::PathBuf>, unread: Option<UnreadBind>| super::StandaloneShunt {
-            found,
-            unread_bind: unread,
-            answer: None,
-        };
+    let readout = |found: Option<std::path::PathBuf>,
+                   unread: Option<UnreadBind>,
+                   unread_config: Option<UnreadConfig>| super::StandaloneShunt {
+        found,
+        unread_bind: unread,
+        unread_config,
+        unread_env: false,
+        answer: None,
+    };
     assert_eq!(
         super::standalone_readout_from(Ok(None), None, silent),
-        readout(None, None),
+        readout(None, None, None),
     );
     assert_eq!(
         super::standalone_readout_from(Ok(None), Some("127.0.0.1:4100"), silent),
-        readout(None, None),
+        readout(None, None, None),
     );
     assert_eq!(
         super::standalone_readout_from(Ok(None), Some("nope"), silent),
         readout(
             None,
-            Some(UnreadBind::Value("SHUNT_SERVER__BIND=nope".to_string()))
+            Some(UnreadBind::Value("SHUNT_SERVER__BIND=nope".to_string())),
+            None,
         ),
         "a refused env override is named with its variable",
     );
@@ -913,12 +946,17 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
     let yaml_err = || Err(crate::gateway::YamlConfig { path: yaml.clone() }.into());
     assert_eq!(
         super::standalone_readout_from(yaml_err(), None, silent),
-        readout(Some(yaml.clone()), Some(UnreadBind::Yaml)),
+        readout(
+            Some(yaml.clone()),
+            Some(UnreadBind::Yaml),
+            Some(UnreadConfig::Yaml)
+        ),
     );
     assert_eq!(
         super::standalone_readout_from(yaml_err(), Some("127.0.0.1:4200"), silent),
-        readout(Some(yaml.clone()), None),
-        "the env override is read, so a YAML config's own bind does not matter",
+        readout(Some(yaml.clone()), None, Some(UnreadConfig::Yaml)),
+        "the env override is read, so a YAML config's own bind does not matter, \
+         but the config itself stays unread",
     );
 
     let config = home.home().join("shunt.toml");
@@ -958,7 +996,28 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
     std::fs::create_dir_all(&dir).unwrap();
     assert_eq!(
         super::standalone_readout_from(Ok(Some(dir.clone())), None, silent),
-        readout(Some(dir), Some(UnreadBind::Unreadable)),
+        readout(
+            Some(dir.clone()),
+            Some(UnreadBind::Unreadable),
+            Some(UnreadConfig::Unreadable)
+        ),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(Some(dir.clone())), Some("127.0.0.1:4300"), silent),
+        readout(Some(dir), None, Some(UnreadConfig::Unreadable)),
+        "an env bind moves the probe off an unreadable config, which stays unread",
+    );
+    // A TOML file that does not parse is still read: under an env bind the
+    // adopt's probe never parses it, so the adopt can succeed.
+    std::fs::write(&config, "[server\n").unwrap();
+    assert_eq!(
+        super::standalone_readout_from(Ok(Some(config.clone())), Some("127.0.0.1:4400"), silent),
+        readout(Some(config.clone()), None, None),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), Some("\"127.0.0.1:4500\""), silent),
+        readout(None, None, None),
+        "a quoted env value is unwrapped, as shunt's own env layer reads it",
     );
 
     let want: Vec<std::net::SocketAddr> = [
@@ -975,6 +1034,9 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
         "127.0.0.1:3001",
         "127.0.0.1:3001",
         "127.0.0.1:3001",
+        "127.0.0.1:4300",
+        "127.0.0.1:4400",
+        "127.0.0.1:4500",
     ]
     .iter()
     .map(|a| a.parse().unwrap())
@@ -1226,7 +1288,7 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
     std::fs::write(&status_path, b"{}").expect("feed");
     let mut app = bare_app();
     app.daemon_health = DaemonHealth::Fresh;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     let shunt = app
         .services
         .checks
@@ -1249,7 +1311,7 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
     .expect("record");
     let mut app = bare_app();
     app.daemon_health = DaemonHealth::Fresh;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     let shunt = app
         .services
         .checks
@@ -1263,6 +1325,10 @@ fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
             format!("config: {}", config.to_string_lossy()),
             "state: unobserved".to_string(),
             "the daemon runs the gateway".to_string(),
+            String::new(),
+            "enabled".to_string(),
+            "admin  no [server.admin] table".to_string(),
+            "f  add admin table".to_string(),
         ],
         "an unobserved record names the daemon as what would run the gateway"
     );
@@ -1333,7 +1399,7 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
     let mut app = bare_app();
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     let idx = app
         .services
         .checks
@@ -12705,7 +12771,7 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
     app.services.herdr = Some(None);
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         !app.services.checks.iter().any(|c| c.label == "herdr"),
         "a resolved-but-absent herdr must not render a row, got {:?}",
@@ -12721,7 +12787,12 @@ fn herdr_row_absent_when_herdr_does_not_resolve() {
 /// to 10 s for every running one to land.
 fn await_service_probes(app: &mut App) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.services.herdr_probe.running || app.services.standalone_probe.running {
+    while app.services.herdr_probe.running
+        || app.services.standalone_probe.running
+        || app.services.move_plan_probe.running
+        || app.services.pool_probe.running
+        || app.services.shunt_action.running
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "a Services probe did not land within 10 s"
@@ -12807,11 +12878,43 @@ fn r_during_a_running_probe_queues_one_follow_up_run() {
     app.services.standalone_probe.prober = Some(standalone_stub);
     app.services.herdr_probe.running = true;
     app.services.standalone_probe.running = true;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         !app.services.herdr_probe.rerun && !app.services.standalone_probe.rerun,
         "the refresh queues no follow-up"
     );
+}
+
+/// The standalone readout reads its bind from the env the adopt reads, which
+/// a daemon start or stop flips: a cached readout is probed again on the flip.
+#[test]
+fn a_daemon_flip_probes_the_standalone_shunt_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn stub() -> super::StandaloneShunt {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt::default()
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    RUNS.store(0, Ordering::SeqCst);
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.standalone_probe.prober = Some(stub);
+    app.services.standalone = Some(super::StandaloneShunt::default());
+    app.daemon_health = crate::daemon::DaemonHealth::Stale;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        !app.services.standalone_probe.running,
+        "a cached readout with no flip is not probed again"
+    );
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        app.services.standalone_probe.running,
+        "the daemon going away probes again"
+    );
+    await_service_probes(&mut app);
+    assert_eq!(RUNS.load(Ordering::SeqCst), 1);
 }
 
 /// A drain adopts the newest of the results that landed since the last one,
@@ -12822,6 +12925,8 @@ fn a_probe_drain_adopts_the_newest_result_and_skips_an_empty_one() {
     let readout = |version: &str| super::StandaloneShunt {
         found: None,
         unread_bind: None,
+        unread_config: None,
+        unread_env: false,
         answer: Some((version.to_string(), "127.0.0.1:3067".parse().unwrap())),
     };
     let mut app = bare_app();
@@ -12848,7 +12953,7 @@ fn a_probe_drain_adopts_the_newest_result_and_skips_an_empty_one() {
         app.services.checks.is_empty(),
         "a drain with nothing landed recomputes nothing"
     );
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         !app.services.checks.is_empty(),
         "fixture control: a recompute refills the rows"
@@ -12867,6 +12972,8 @@ fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
         super::StandaloneShunt {
             found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
             unread_bind: None,
+            unread_config: None,
+            unread_env: false,
             answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
         }
     }
@@ -12896,14 +13003,15 @@ fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
             "state: not adopted".to_string(),
             "found: /cfg/shunt.toml".to_string(),
             "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+            "f  adopt config".to_string(),
         ],
     );
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         !app.services.standalone_probe.running,
         "the per-tick refresh reuses the cached readout"
     );
-    super::recompute_services_checks(&mut app, true);
+    super::recompute_services_checks(&mut app, true, super::ShuntRefresh::Keep);
     assert!(app.services.standalone_probe.running, "`r` probes again");
     await_service_probes(&mut app);
     assert_eq!(RUNS.load(Ordering::SeqCst), 2, "one run per trigger");
@@ -12924,9 +13032,11 @@ fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
     app.services.standalone = Some(super::StandaloneShunt {
         found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
         unread_bind: Some(super::UnreadBind::Yaml),
+        unread_config: Some(super::UnreadConfig::Yaml),
+        unread_env: false,
         answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
     });
-    super::recompute_services_checks(&mut app, true);
+    super::recompute_services_checks(&mut app, true, super::ShuntRefresh::Keep);
     assert!(
         !app.services.standalone_probe.running,
         "an adopted gateway never probes for a standalone one"
@@ -13047,7 +13157,7 @@ fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
         "no herdr row before the probe lands"
     );
 
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     super::handle_key(
         &mut app,
         crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
@@ -13107,7 +13217,7 @@ fn r_re_probes_herdr_on_the_services_tab() {
         "tab entry probed once"
     );
 
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         !app.services.herdr_probe.running,
         "a recompute with a probe cached starts none"
@@ -13200,7 +13310,7 @@ fn a_modal_drops_the_herdr_landing_and_f_drops_it() {
     );
     assert_eq!(app.services.focus, super::ServicesFocus::List);
     app.modals.clear();
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert_eq!(
         app.services.cursor, parked,
         "the refresh after the modal closes does not land"
@@ -13268,7 +13378,7 @@ fn the_herdr_landing_is_the_draining_tick_or_never() {
         "a probe resolving with no herdr drops the intent"
     );
     app.services.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(
         app.services.checks.iter().any(|c| c.label == "herdr"),
         "fixture control: the herdr row renders"
@@ -13683,7 +13793,7 @@ fn herdr_options_app_with_config(path: &std::path::Path) -> App {
     };
     app.services.herdr = Some(Some(probe));
     app.services.focus = super::ServicesFocus::Detail;
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     app.services.cursor = app
         .services
         .checks
@@ -14004,7 +14114,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     // The probe resolves (its drain adopts it and recomputes): the herdr row
     // inserts and the pending landing selects it by label.
     app.services.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_services_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
     assert!(app.services.checks.iter().any(|c| c.label == "herdr"));
     assert_eq!(
         app.services.selected_check().map(|c| c.label),
@@ -14026,7 +14136,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let mut landed = bare_app();
     landed.services.land_on_herdr = true;
     landed.services.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_services_checks(&mut landed, false);
+    super::recompute_services_checks(&mut landed, false, super::ShuntRefresh::Keep);
     assert_eq!(
         landed.services.selected_check().map(|c| c.label),
         Some("herdr"),
@@ -14039,7 +14149,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     moved.tab = super::Tab::Services;
     moved.services.land_on_herdr = true;
     moved.services.herdr = Some(None);
-    super::recompute_services_checks(&mut moved, false);
+    super::recompute_services_checks(&mut moved, false, super::ShuntRefresh::Keep);
     assert!(
         moved.services.land_on_herdr,
         "fixture control: still pending"
@@ -14050,7 +14160,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
         "moving the cursor clears the pending landing"
     );
     moved.services.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_services_checks(&mut moved, false);
+    super::recompute_services_checks(&mut moved, false, super::ShuntRefresh::Keep);
     assert_ne!(
         moved.services.selected_check().map(|c| c.label),
         Some("herdr"),
@@ -14062,7 +14172,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     descended.tab = super::Tab::Services;
     descended.services.land_on_herdr = true;
     descended.services.herdr = Some(None);
-    super::recompute_services_checks(&mut descended, false);
+    super::recompute_services_checks(&mut descended, false, super::ShuntRefresh::Keep);
     super::handle_key(&mut descended, crate::testutil::key(super::KeyCode::Enter));
     assert!(
         !descended.services.land_on_herdr,
@@ -14075,7 +14185,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     left.tab = super::Tab::Services;
     left.services.land_on_herdr = true;
     left.services.herdr = Some(None);
-    super::recompute_services_checks(&mut left, false);
+    super::recompute_services_checks(&mut left, false, super::ShuntRefresh::Keep);
     super::switch_tab(&mut left, super::Tab::Overview);
     assert!(
         !left.services.land_on_herdr,
@@ -14083,7 +14193,7 @@ fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     );
 
     // `r` is still the only thing that probes the version.
-    super::recompute_services_checks(&mut app, true);
+    super::recompute_services_checks(&mut app, true, super::ShuntRefresh::Keep);
     assert!(
         app.services.cc_version.is_some(),
         "`r` runs the version probe"
@@ -16297,5 +16407,2030 @@ fn stepping_the_cursor_reloads_the_note() {
         app.note_text.as_deref(),
         Some("B note"),
         "a cursor step re-reads the note for the new selection"
+    );
+}
+
+// ── shunt card: the control surface ─────────────────────────────────────────
+
+use crate::daemon::gateway::{Answerer, GatewaySlot, GatewayState};
+
+fn shunt_slot(state: GatewayState) -> GatewaySlot {
+    GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    }
+}
+
+fn adopted_record(
+    home: &crate::testutil::HomeSandbox,
+    disabled: bool,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = disabled;
+    record
+}
+
+fn moved_file(from: &str, to: &str) -> crate::gateway::MovedFile {
+    crate::gateway::MovedFile {
+        from: std::path::PathBuf::from(from),
+        to: std::path::PathBuf::from(to),
+    }
+}
+
+/// `f adopt config` is offered only for a found TOML config: a YAML find keeps
+/// its `bind  not read (yaml)` line and offers nothing.
+#[test]
+fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let toml = super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: None,
+        unread_config: None,
+        unread_env: false,
+        answer: None,
+    };
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&toml),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        card.detail.last().map(String::as_str),
+        Some("f  adopt config"),
+        "a TOML find gets the adopt line: {:?}",
+        card.detail
+    );
+    assert!(
+        matches!(card.fix, Some(super::ServiceFix::AdoptConfig(_))),
+        "the list-focus fix is the adopt"
+    );
+    assert_eq!(card.shunt_focus.len(), 1, "one focusable: the adopt fix");
+
+    let yaml = super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.yaml")),
+        unread_bind: Some(super::UnreadBind::Yaml),
+        unread_config: Some(super::UnreadConfig::Yaml),
+        unread_env: false,
+        answer: None,
+    };
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&yaml),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(card.fix.is_none(), "a YAML find gets no adopt");
+    assert!(card.shunt_focus.is_empty());
+    assert!(
+        !card.detail.iter().any(|l| l.starts_with("f  ")),
+        "no fix line on a YAML find: {:?}",
+        card.detail
+    );
+
+    // Any unread bind — a YAML find, an unreadable or unparsed config, a
+    // refused value — offers no adopt, not just the YAML case: the adopt's
+    // probe would only ever fail. A refused value is the case whose config
+    // clauth did read.
+    let refused = super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: Some(super::UnreadBind::Value("${SHUNT_BIND}".to_string())),
+        unread_config: None,
+        unread_env: false,
+        answer: None,
+    };
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&refused),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        card.fix.is_none(),
+        "a refused bind gets no adopt: {:?}",
+        card.detail
+    );
+    assert!(
+        !card.detail.iter().any(|l| l.starts_with("f  ")),
+        "no fix line on a refused bind: {:?}",
+        card.detail
+    );
+}
+
+/// An env `SHUNT_SERVER__BIND` hides a YAML or unreadable find from the bind
+/// line, but the adopt would still fail on the config itself: the card offers
+/// no adopt and a `config: not read (…)` line says why. Built through the
+/// readout, so the producer and the card's gate are pinned together.
+#[test]
+fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
+    let home = crate::testutil::HomeSandbox::new();
+    let silent = |_| Ok(crate::gateway::Health::NotShunt { status: 404 });
+    let yaml = std::path::PathBuf::from("/cfg/shunt.yaml");
+    let dir = home.home().join("a-dir-not-a-file");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (what, standalone, want) in [
+        (
+            "a YAML find",
+            super::standalone_readout_from(
+                Err(crate::gateway::YamlConfig { path: yaml }.into()),
+                Some("127.0.0.1:4200"),
+                silent,
+            ),
+            vec![
+                "state: not adopted".to_string(),
+                "found: /cfg/shunt.yaml".to_string(),
+                "config: not read (yaml)".to_string(),
+            ],
+        ),
+        (
+            "an unreadable find",
+            super::standalone_readout_from(Ok(Some(dir.clone())), Some("127.0.0.1:4200"), silent),
+            vec![
+                "state: not adopted".to_string(),
+                format!("found: {}", dir.display()),
+                "config: not read (unreadable)".to_string(),
+            ],
+        ),
+        (
+            "a refused env bind over a YAML find",
+            super::standalone_readout_from(
+                Err(crate::gateway::YamlConfig {
+                    path: std::path::PathBuf::from("/cfg/shunt.yaml"),
+                }
+                .into()),
+                Some("nope"),
+                silent,
+            ),
+            vec![
+                "state: not adopted".to_string(),
+                "found: /cfg/shunt.yaml".to_string(),
+                "bind: not read (SHUNT_SERVER__BIND=nope)".to_string(),
+                "config: not read (yaml)".to_string(),
+            ],
+        ),
+    ] {
+        assert_eq!(
+            super::shunt_check(&shunt_slot(GatewayState::Absent), false, Some(&standalone)).detail,
+            want,
+            "{what}: the config line names what the bind line does not",
+        );
+        let card = super::shunt_card(
+            &shunt_slot(GatewayState::Absent),
+            false,
+            false,
+            Some(&standalone),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            card.fix.is_none(),
+            "{what} gets no adopt: {:?}",
+            card.detail
+        );
+        assert!(card.shunt_focus.is_empty(), "{what}: nothing to focus");
+        assert!(
+            !card.detail.iter().any(|l| l.starts_with("f  ")),
+            "{what}: no fix line: {:?}",
+            card.detail
+        );
+    }
+}
+
+/// A `shunt.toml` that links onto a YAML file reads as TOML, but the adopt
+/// resolves the link and refuses the YAML target: the readout reads it as
+/// the YAML it is, so the card offers no adopt.
+#[cfg(unix)]
+#[test]
+fn a_toml_name_linked_onto_yaml_reads_as_yaml() {
+    let home = crate::testutil::HomeSandbox::new();
+    let silent = |_| Ok(crate::gateway::Health::NotShunt { status: 404 });
+    let target = home.home().join("real.yaml");
+    std::fs::write(&target, "server:\n  bind: 127.0.0.1:4600\n").unwrap();
+    let link = home.home().join("shunt.toml");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let standalone = super::standalone_readout_from(Ok(Some(link.clone())), None, silent);
+    assert_eq!(
+        (standalone.unread_bind.clone(), standalone.unread_config),
+        (
+            Some(super::UnreadBind::Yaml),
+            Some(super::UnreadConfig::Yaml)
+        ),
+    );
+    let with_env =
+        super::standalone_readout_from(Ok(Some(link.clone())), Some("127.0.0.1:4200"), silent);
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&with_env),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        card.detail,
+        vec![
+            "state: not adopted".to_string(),
+            format!("found: {}", link.display()),
+            "config: not read (yaml)".to_string(),
+        ],
+    );
+    assert!(card.fix.is_none(), "no adopt for a link onto YAML");
+}
+
+/// A daemon holding the singleton with no env record leaves the bind its
+/// adopt would read unknown: the readout probes the config's own bind, the
+/// card says why in the approved copy, and offers no adopt. A read env bind
+/// moves the probe, as before.
+#[test]
+fn an_unrecorded_daemon_env_offers_no_adopt() {
+    use std::cell::RefCell;
+    let home = crate::testutil::HomeSandbox::new();
+    let probed = RefCell::new(Vec::new());
+    let silent = |addr| {
+        probed.borrow_mut().push(addr);
+        Ok(crate::gateway::Health::NotShunt { status: 404 })
+    };
+    let config = home.home().join("shunt.toml");
+    std::fs::write(&config, "[server]\nbind = \"127.0.0.1:4900\"\n").unwrap();
+    let read = super::standalone_readout_with(
+        Ok(Some(config.clone())),
+        Ok(Some("127.0.0.1:4800".to_string())),
+        silent,
+    );
+    assert!(!read.unread_env, "a read env is not unread");
+    let standalone = super::standalone_readout_with(
+        Ok(Some(config.clone())),
+        Err(anyhow::anyhow!(
+            "the running daemon recorded no environment"
+        )),
+        silent,
+    );
+    assert_eq!(
+        *probed.borrow(),
+        vec![
+            "127.0.0.1:4800".parse::<std::net::SocketAddr>().unwrap(),
+            "127.0.0.1:4900".parse().unwrap(),
+        ],
+        "the env bind when read, else the config's own"
+    );
+    assert_eq!(
+        standalone,
+        super::StandaloneShunt {
+            found: Some(config.clone()),
+            unread_bind: None,
+            unread_config: None,
+            unread_env: true,
+            answer: None,
+        }
+    );
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&standalone),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        card.detail,
+        vec![
+            "state: not adopted".to_string(),
+            format!("found: {}", config.display()),
+            "the running daemon recorded no environment; restart it".to_string(),
+        ],
+    );
+    assert!(card.fix.is_none(), "no adopt while the env is unknown");
+    assert!(card.shunt_focus.is_empty());
+}
+
+/// The card's action section for an adopted record: a blank line, the `enabled`
+/// row, the admin fix (by need), the pool note, then the MOVE PLAN.
+#[test]
+fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, false);
+    let mut slot = shunt_slot(GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    slot.version = Some("0.49.1".to_string());
+
+    // No admin step owed, no pool note, no move due: fields, blank, enabled.
+    let card = super::shunt_card(&slot, true, false, None, Some(&record), None, None, None);
+    assert_eq!(
+        card.detail,
+        vec![
+            "binary: shunt".to_string(),
+            format!("config: {}", record.config().display()),
+            "version: 0.49.1".to_string(),
+            "state: healthy".to_string(),
+            "restarts: 0".to_string(),
+            String::new(),
+            "enabled".to_string(),
+        ],
+        "the adopted-healthy card"
+    );
+    assert!(
+        matches!(
+            card.shunt_focus.first(),
+            Some(super::ShuntFocus::Enabled { .. })
+        ),
+        "the enabled row walks first"
+    );
+
+    // A write-key need offers `add admin key`; a table need offers `add admin
+    // table`; Neither offers nothing.
+    let key_card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    );
+    assert!(
+        key_card.detail.iter().any(|l| l == "f  add admin key"),
+        "a write-key need names the key fix: {:?}",
+        key_card.detail
+    );
+    let table_card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::AdminTable),
+        None,
+        None,
+    );
+    assert!(
+        table_card.detail.iter().any(|l| l == "f  add admin table"),
+        "a table need names the table fix: {:?}",
+        table_card.detail
+    );
+    let neither_card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::Neither),
+        None,
+        None,
+    );
+    assert!(
+        !neither_card
+            .detail
+            .iter()
+            .any(|l| l.starts_with("f  add admin")),
+        "no admin verb when the config already carries clauth's key"
+    );
+
+    // The pool note: one line per provider; a failure is one `pool` warn line.
+    let two = super::PoolOutcome::Providers(vec!["codex".to_string(), "antigravity".to_string()]);
+    let card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        None,
+        Some(&two),
+    );
+    assert!(
+        card.detail
+            .iter()
+            .any(|l| l == "codex  provider codex needs its own pool login")
+            && card
+                .detail
+                .iter()
+                .any(|l| l == "codex  provider antigravity needs its own pool login"),
+        "one note line per provider: {:?}",
+        card.detail
+    );
+    let err = super::PoolOutcome::Error("no gateway admin token".to_string());
+    let card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        None,
+        Some(&err),
+    );
+    assert!(
+        card.detail
+            .iter()
+            .any(|l| l == "pool  no gateway admin token"),
+        "a failed read is one `pool` line: {:?}",
+        card.detail
+    );
+}
+
+/// Every MOVE PLAN line shape: the `moves` source path, each `stays` reason,
+/// the `NoHome` row, and the `refused` line — all in the rendered two-space
+/// prose form, never a `key: value` split.
+#[test]
+fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
+    use crate::gateway::{KeptFile, KeptReason, StoreMovePlan};
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+
+    let plan = StoreMovePlan {
+        moved: vec![
+            moved_file("/standalone/a.json", "/clauth/a.json"),
+            moved_file("/standalone/b.json", "/clauth/b.json"),
+        ],
+        kept: vec![
+            KeptFile::At {
+                path: "/standalone/c.json".into(),
+                reason: KeptReason::LeftBehind,
+            },
+            KeptFile::At {
+                path: "/standalone/d.json".into(),
+                reason: KeptReason::CodexLogin,
+            },
+            KeptFile::At {
+                path: "/standalone/e.json".into(),
+                reason: KeptReason::ClauthOwned,
+            },
+            KeptFile::At {
+                path: "/standalone/f.json".into(),
+                reason: KeptReason::HardLink,
+            },
+            KeptFile::At {
+                path: "/standalone/g.json".into(),
+                reason: KeptReason::LinkCountUnreadable,
+            },
+            KeptFile::At {
+                path: "/standalone/h.json".into(),
+                reason: KeptReason::DuplicateSource,
+            },
+            KeptFile::NoHome {
+                store: "SHUNT_XAI_AUTH_FILE",
+            },
+        ],
+    };
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Disabled),
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan)),
+        None,
+    );
+    let start = card.shunt_action_start.unwrap();
+    assert_eq!(
+        &card.detail[start..],
+        vec![
+            String::new(),
+            "enabled".to_string(),
+            String::new(),
+            "MOVE PLAN".to_string(),
+            "moves  /standalone/a.json".to_string(),
+            "moves  /standalone/b.json".to_string(),
+            "stays  /standalone/c.json  not an account file".to_string(),
+            "stays  /standalone/d.json  the codex CLI's own login".to_string(),
+            "stays  /standalone/e.json  already clauth's".to_string(),
+            "stays  /standalone/f.json  linked under another name".to_string(),
+            "stays  /standalone/g.json  link count unreadable".to_string(),
+            "stays  /standalone/h.json  named twice".to_string(),
+            "stays  SHUNT_XAI_AUTH_FILE  no home to find it: set HOME in the env file".to_string(),
+            "f  move stores in".to_string(),
+        ],
+        "every MOVE PLAN line shape, verbatim"
+    );
+    assert!(
+        card.shunt_focus.iter().any(|f| matches!(
+            f,
+            super::ShuntFocus::Fix {
+                fix: super::ServiceFix::MoveStoresIn,
+                ..
+            }
+        )),
+        "the move fix walks"
+    );
+
+    // A refused plan shows the refusal, no move fix.
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Disabled),
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Refused(
+            "the stores changed since the plan was shown; look at the plan again".to_string(),
+        )),
+        None,
+    );
+    let start = card.shunt_action_start.unwrap();
+    assert_eq!(
+        &card.detail[start..],
+        vec![
+            String::new(),
+            "enabled".to_string(),
+            String::new(),
+            "MOVE PLAN".to_string(),
+            "refused  the stores changed since the plan was shown; look at the plan again"
+                .to_string(),
+        ],
+        "the refusal line, no move offered"
+    );
+    assert!(
+        !card.shunt_focus.iter().any(|f| matches!(
+            f,
+            super::ShuntFocus::Fix {
+                fix: super::ServiceFix::MoveStoresIn,
+                ..
+            }
+        )),
+        "a refused plan offers no move"
+    );
+
+    // A kept-only plan (0 moves, no refusal) shows no MOVE PLAN at all.
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Disabled),
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Nothing),
+        None,
+    );
+    assert!(
+        !card.detail.iter().any(|l| l == "MOVE PLAN"),
+        "a kept-only plan shows no MOVE PLAN: {:?}",
+        card.detail
+    );
+}
+
+/// The held state reads what it means, not the feed's bare `held` word; the
+/// other state words stay the `status.json` spelling.
+#[test]
+fn the_held_state_reads_stopped_until_the_daemon_restarts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Held),
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(
+        card.detail
+            .iter()
+            .any(|l| l == "state: stopped until the daemon restarts"),
+        "the held card names the meaning: {:?}",
+        card.detail
+    );
+
+    let mut foreign = shunt_slot(GatewayState::Foreign);
+    foreign.answerer = Some(Answerer::Shunt);
+    let card = super::shunt_card(&foreign, true, false, None, None, None, None, None);
+    assert!(card.detail.iter().any(|l| l == "state: foreign"));
+    assert!(card.detail.iter().any(|l| l == "answerer: shunt"));
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::BelowFloor),
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(card.detail.iter().any(|l| l == "state: below_floor"));
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::YamlRefused),
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(card.detail.iter().any(|l| l == "state: yaml_refused"));
+}
+
+// ── shunt card actions: the engine and the toast ────────────────────────────
+
+/// A config with a bind the caller controls, for the adopt/move probe.
+fn adopt_config(home: &crate::testutil::HomeSandbox, bind: u16) -> std::path::PathBuf {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, format!("[server]\nbind = \"127.0.0.1:{bind}\"\n")).unwrap();
+    config
+}
+
+/// A closed loopback port: bind then drop, the `a_closed_port_reads_as_silent`
+/// shape, so the action probe reads silent deterministically.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr.port()
+}
+
+/// Serve one `/health` answer (a shunt-shaped JSON body) on a fresh loopback
+/// port, returning the addr and the thread that stops after one request. The
+/// move's orphan-refusal probe makes exactly one `GET /health`.
+fn serve_health_once(body: &'static str) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        if let Some(stream) = listener.incoming().next() {
+            let mut stream = stream.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    (addr, handle)
+}
+
+/// Adopting a config with nothing to move (no standalone stores) writes the
+/// record enabled, so the daemon starts the gateway at once.
+#[test]
+fn adopting_with_nothing_to_move_leaves_the_gateway_enabled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = adopt_config(&home, closed_port());
+    let outcome = super::run_adopt(&config);
+    assert!(
+        matches!(outcome, super::ShuntActionOutcome::Adopted { .. }),
+        "{outcome:?}"
+    );
+    let record = crate::gateway::GatewayRecord::load().unwrap().unwrap();
+    assert!(!record.disabled, "nothing to move adopts enabled");
+}
+
+/// Adopting a config with a file to move writes the record disabled, so the
+/// daemon never starts the gateway on empty stores until the move lands.
+#[test]
+fn adopting_with_a_file_to_move_leaves_the_gateway_disabled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("main.json"), "{}").unwrap();
+    let config = adopt_config(&home, closed_port());
+    let outcome = super::run_adopt(&config);
+    assert!(
+        matches!(outcome, super::ShuntActionOutcome::Adopted { .. }),
+        "{outcome:?}"
+    );
+    let record = crate::gateway::GatewayRecord::load().unwrap().unwrap();
+    assert!(record.disabled, "a file to move adopts disabled");
+}
+
+/// A standalone shunt answering at the adopt probe refuses the adopt: nothing
+/// is written, and the outcome carries the warning copy.
+#[test]
+fn adopting_into_a_standalone_shunt_that_answers_writes_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, _handle) = crate::testutil::serve_endpoints(1, |path, _i| {
+        assert_eq!(path, "/health");
+        (200, r#"{"status":"ok","version":"0.49.1"}"#.to_string())
+    });
+    let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+    let config = adopt_config(&home, port);
+    let outcome = super::run_adopt(&config);
+    match outcome {
+        super::ShuntActionOutcome::AdoptRefused { version, addr } => {
+            assert_eq!(version, "0.49.1");
+            assert_eq!(addr.port(), port);
+        }
+        other => panic!("expected an answering refusal, got {other:?}"),
+    }
+    assert!(
+        crate::gateway::GatewayRecord::load().unwrap().is_none(),
+        "nothing is written when a standalone answers"
+    );
+}
+
+/// A store move over a silent probe moves the stores and leaves the record
+/// enabled, so the daemon starts the gateway.
+#[test]
+fn a_successful_move_leaves_the_record_enabled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("main.json"), "{}").unwrap();
+
+    let mut record =
+        crate::gateway::GatewayRecord::new(adopt_config(&home, closed_port())).unwrap();
+    record.disabled = true;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let confirmed = crate::gateway::plan_standalone_stores(&record).unwrap();
+    assert_eq!(confirmed.moved.len(), 1, "fixture: one store file moves");
+
+    let outcome = super::run_move(&record, &confirmed);
+    match outcome {
+        super::ShuntActionOutcome::Moved { n } => assert_eq!(n, 1),
+        other => panic!("expected a move, got {other:?}"),
+    }
+    let record = crate::gateway::GatewayRecord::load().unwrap().unwrap();
+    assert!(!record.disabled, "a successful move enables the gateway");
+}
+
+/// A move that refuses (the stores changed since the plan was shown) leaves
+/// the record disabled.
+#[test]
+fn a_refused_move_leaves_the_record_disabled() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("main.json"), "{}").unwrap();
+
+    let mut record =
+        crate::gateway::GatewayRecord::new(adopt_config(&home, closed_port())).unwrap();
+    record.disabled = true;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let confirmed = crate::gateway::plan_standalone_stores(&record).unwrap();
+
+    // The stores change after the plan is shown: the move re-plans and refuses.
+    std::fs::write(store.join("extra.json"), "{}").unwrap();
+
+    let outcome = super::run_move(&record, &confirmed);
+    match outcome {
+        super::ShuntActionOutcome::MoveFailed { error } => {
+            assert_eq!(
+                error, "the stores changed since the plan was shown; look at the plan again",
+                "the PlanChanged refusal"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let record = crate::gateway::GatewayRecord::load().unwrap().unwrap();
+    assert!(
+        record.disabled,
+        "a refused move leaves the gateway disabled"
+    );
+}
+
+/// `space` on the focused `enabled` row flips `disabled` on disk at once, no
+/// confirm.
+#[test]
+fn space_on_the_enabled_row_flips_disabled_on_disk() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    // Descend into the shunt detail and park on the enabled row (the first
+    // actionable line).
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::Enabled));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        !crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "space flips disabled off"
+    );
+
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "and back on"
+    );
+}
+
+/// One shunt-card action's outcome maps to the approved toast: adopted,
+/// answering, moved, admin added, and each failure.
+#[test]
+fn the_shunt_action_toasts_follow_the_outcome() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let bodies = |app: &App| {
+        app.toasts
+            .iter()
+            .map(|t| t.body.clone())
+            .collect::<Vec<_>>()
+    };
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::Adopted {
+            path: "/cfg/shunt.toml".to_string(),
+        },
+    );
+    assert!(
+        bodies(&app).iter().any(|b| b == "adopted /cfg/shunt.toml"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::AdoptRefused {
+            version: "0.49.1".to_string(),
+            addr: "127.0.0.1:3001".parse().unwrap(),
+        },
+    );
+    assert!(
+        bodies(&app)
+            .iter()
+            .any(|b| b == "shunt 0.49.1 answers on 127.0.0.1:3001\nstop it, then adopt again"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(&mut app, super::ShuntActionOutcome::Moved { n: 3 });
+    assert!(
+        bodies(&app)
+            .iter()
+            .any(|b| b == "moved 3 account files into clauth"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(&mut app, super::ShuntActionOutcome::AdminAdded);
+    assert!(
+        bodies(&app).iter().any(|b| b == "added clauth's admin key"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::AdoptFailed {
+            error: "boom".to_string(),
+        },
+    );
+    assert!(
+        bodies(&app).iter().any(|b| b == "adopt failed\nboom"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::MoveFailed {
+            error: "boom".to_string(),
+        },
+    );
+    assert!(
+        bodies(&app).iter().any(|b| b == "move failed\nboom"),
+        "{:?}",
+        bodies(&app)
+    );
+    app.toasts.clear();
+
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::AdminFailed {
+            error: "boom".to_string(),
+        },
+    );
+    assert!(
+        bodies(&app).iter().any(|b| b == "admin key failed\nboom"),
+        "{:?}",
+        bodies(&app)
+    );
+}
+
+/// The admin confirm hands the job to the action worker: the engine's
+/// `add_admin_write_key`/`add_admin_table` reach the config behind the stub
+/// `shunt check`, and the outcome lands as the admin-added toast.
+#[cfg(unix)]
+#[test]
+fn the_admin_action_reaches_the_engine_and_toasts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+
+    let mut app = bare_app();
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    app.services
+        .shunt_action
+        .start(super::ShuntActionJob::AddAdminTable {
+            record: record.clone(),
+        });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.shunt_action.running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the admin action did not land"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_service_probes(&mut app);
+    }
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body == "added clauth's admin key"),
+        "the admin-added toast: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("id = \"clauth\""),
+        "the engine wrote clauth's key:\n{text}"
+    );
+}
+
+/// Each shunt confirm carries its approved two lines and hands the matching
+/// `ConfirmAction` to the worker on confirm.
+#[test]
+fn the_shunt_confirms_carry_the_approved_copy() {
+    use crate::gateway::{KeptFile, KeptReason, StoreMovePlan};
+    use crate::tui::app::{ConfirmAction, Modal};
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+
+    // adopt.
+    let toml = super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: None,
+        unread_config: None,
+        unread_env: false,
+        answer: None,
+    };
+    let card = super::shunt_card(
+        &shunt_slot(GatewayState::Absent),
+        false,
+        false,
+        Some(&toml),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(state.message, "adopt /cfg/shunt.toml?");
+            assert_eq!(
+                state.detail.as_deref(),
+                Some("clauth runs shunt on this config and edits it in place.")
+            );
+            assert!(matches!(state.on_confirm, ConfirmAction::AdoptConfig(_)));
+        }
+        other => panic!("expected the adopt confirm, got {other:?}"),
+    }
+
+    // move with K > 0: the second line names the count.
+    let plan = StoreMovePlan {
+        moved: vec![
+            moved_file("/s/a.json", "/c/a.json"),
+            moved_file("/s/b.json", "/c/b.json"),
+        ],
+        kept: vec![
+            KeptFile::At {
+                path: "/s/k.json".into(),
+                reason: KeptReason::LeftBehind,
+            },
+            KeptFile::At {
+                path: "/s/l.json".into(),
+                reason: KeptReason::HardLink,
+            },
+        ],
+    };
+    let mut slot = shunt_slot(GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    let card = super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(state.message, "move 2 account files into clauth?");
+            assert_eq!(
+                state.detail.as_deref(),
+                Some("2 stay behind, listed on the card.")
+            );
+            assert!(matches!(state.on_confirm, ConfirmAction::MoveStoresIn(_)));
+        }
+        other => panic!("expected the move confirm, got {other:?}"),
+    }
+
+    // move with K = 0: the second line is absent.
+    let plan = StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    let card = super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(state.message, "move 1 account file into clauth?");
+            assert_eq!(state.detail, None, "K = 0 drops the stay-behind line");
+            assert!(matches!(state.on_confirm, ConfirmAction::MoveStoresIn(_)));
+        }
+        other => panic!("expected the move confirm, got {other:?}"),
+    }
+
+    // admin key.
+    let card = super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(state.message, "add clauth's admin key to this config?");
+            assert_eq!(
+                state.detail.as_deref(),
+                Some("clauth needs it to manage pool accounts and read their usage.")
+            );
+            assert!(matches!(state.on_confirm, ConfirmAction::AddAdminKey));
+        }
+        other => panic!("expected the admin-key confirm, got {other:?}"),
+    }
+
+    // admin table.
+    let card = super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::AdminTable),
+        None,
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(
+                state.message,
+                "add a [server.admin] table with clauth's key?"
+            );
+            assert_eq!(
+                state.detail.as_deref(),
+                Some("the gateway restarts once to load it.")
+            );
+            assert!(matches!(state.on_confirm, ConfirmAction::AddAdminTable));
+        }
+        other => panic!("expected the admin-table confirm, got {other:?}"),
+    }
+}
+
+// ── round 2: off matrix, stale caches, coverage plants P1-P7 ────────────────
+
+/// P1: a MOVE PLAN shows only while the managed gateway is off — a supervised
+/// healthy enabled gateway with a plan shows none.
+#[test]
+fn a_running_gateway_shows_no_move_plan() {
+    use crate::gateway::StoreMovePlan;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, false);
+    let mut slot = shunt_slot(GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let plan = StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    let card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan)),
+        None,
+    );
+    assert!(
+        !card.detail.iter().any(|l| l == "MOVE PLAN"),
+        "a running gateway hides MOVE PLAN: {:?}",
+        card.detail
+    );
+
+    // The same plan shows once the slot is a no-child state (disabled).
+    let disabled = shunt_slot(GatewayState::Disabled);
+    let plan = StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    let card = super::shunt_card(
+        &disabled,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan)),
+        None,
+    );
+    assert!(
+        card.detail.iter().any(|l| l == "MOVE PLAN"),
+        "a disabled gateway shows MOVE PLAN: {:?}",
+        card.detail
+    );
+}
+
+/// P2: the move confirm counts N and K separately (the stay-behind line is
+/// K, not N).
+#[test]
+fn the_move_confirm_counts_n_and_k_separately() {
+    use crate::gateway::{KeptFile, KeptReason, StoreMovePlan};
+    use crate::tui::app::Modal;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    let plan = StoreMovePlan {
+        moved: vec![
+            moved_file("/s/a.json", "/c/a.json"),
+            moved_file("/s/b.json", "/c/b.json"),
+        ],
+        kept: vec![KeptFile::At {
+            path: "/s/k.json".into(),
+            reason: KeptReason::LeftBehind,
+        }],
+    };
+    let mut slot = shunt_slot(GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    let card = super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan.clone())),
+        None,
+    );
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![card];
+    app.services.cursor = 0;
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    super::apply_service_fix(&mut app);
+    match app.modals.last() {
+        Some(Modal::Confirm(state)) => {
+            assert_eq!(state.message, "move 2 account files into clauth?");
+            assert_eq!(
+                state.detail.as_deref(),
+                Some("1 stays behind, listed on the card.")
+            );
+        }
+        other => panic!("expected the move confirm, got {other:?}"),
+    }
+}
+
+/// P3: a landed move drops the stale plan cache, so the next confirm counts a
+/// fresh plan.
+#[test]
+fn a_landed_move_drops_the_stale_plan() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    app.services.shunt_record = Some(record.clone());
+    let stale = crate::gateway::StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(stale));
+    fn stub(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        super::ShuntActionOutcome::Moved { n: 1 }
+    }
+    app.services.shunt_action.prober = Some(stub);
+    app.services
+        .shunt_action
+        .start(super::ShuntActionJob::AddAdminKey { record });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.shunt_action.running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move action did not land"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_service_probes(&mut app);
+    }
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.move_plan.is_none(),
+        "a landed move drops the stale plan: {:?}",
+        app.services.move_plan
+    );
+}
+
+/// P4: the pool read runs only when no admin step is owed (the config already
+/// carries clauth's admin key).
+#[test]
+fn the_pool_read_requires_an_admin_step_of_neither() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static POOL_RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn pool_stub() -> super::PoolOutcome {
+        POOL_RUNS.fetch_add(1, Ordering::SeqCst);
+        super::PoolOutcome::Providers(Vec::new())
+    }
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, false);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status_path = dir.join("status.json");
+    let feed = serde_json::json!({
+        "gateway": { "state": "healthy", "floor": "0.48.0", "restarts": 0 }
+    });
+    std::fs::write(&status_path, serde_json::to_vec(&feed).expect("serialize")).expect("write");
+
+    POOL_RUNS.store(0, Ordering::SeqCst);
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    app.services.pool_probe.prober = Some(pool_stub);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert_eq!(
+        app.services.admin_need,
+        Some(crate::gateway::AdminNeed::AdminTable),
+        "fixture: the config has no [server.admin] table"
+    );
+    // The worker-start decision is the deterministic signal, not a spawned
+    // thread's counter: an owed admin step must never start the pool worker.
+    assert!(
+        !app.services.pool_probe.running,
+        "no pool read while an admin step is owed"
+    );
+    super::drain_service_probes(&mut app);
+    assert_eq!(
+        POOL_RUNS.load(Ordering::SeqCst),
+        0,
+        "the pool stub never ran while an admin step is owed"
+    );
+    assert!(
+        app.services.pool.is_none(),
+        "no cached pool read while an admin step is owed"
+    );
+}
+
+/// P5/P7: the key action runs the key edit (the engine's `add_admin_write_key`),
+/// never the table edit — on a config needing the key, the table edit would
+/// refuse `Needs(WriteKey)`.
+#[cfg(unix)]
+#[test]
+fn the_key_action_runs_the_key_edit() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server.admin]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+
+    let outcome = super::run_shunt_action(super::ShuntActionJob::AddAdminKey { record });
+    match outcome {
+        super::ShuntActionOutcome::AdminAdded => {}
+        other => panic!("the key action adds the key, got {other:?}"),
+    }
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("id = \"clauth\""),
+        "the engine wrote clauth's key:\n{text}"
+    );
+}
+
+/// P5: the `add admin key` confirm dispatches the key JOB, never the table
+/// job (the table edit would refuse `Needs(WriteKey)` on a key-needed config).
+#[test]
+fn the_key_confirm_dispatches_the_key_job() {
+    use crate::tui::app::{ConfirmAction, ShuntActionJob, ShuntActionOutcome};
+    use std::sync::Mutex;
+    static CAPTURED: Mutex<Option<ShuntActionJob>> = Mutex::new(None);
+    fn capture(job: ShuntActionJob) -> ShuntActionOutcome {
+        *CAPTURED.lock().unwrap() = Some(job);
+        ShuntActionOutcome::AdminAdded
+    }
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    *CAPTURED.lock().unwrap() = None;
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.shunt_record = Some(record.clone());
+    app.services.shunt_action.prober = Some(capture);
+    super::run_confirm_action(&mut app, ConfirmAction::AddAdminKey);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.shunt_action.running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the key action did not land"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_service_probes(&mut app);
+    }
+    super::drain_service_probes(&mut app);
+    let job = CAPTURED
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the key confirm dispatched a job");
+    assert!(
+        matches!(job, ShuntActionJob::AddAdminKey { .. }),
+        "the key confirm dispatches the key job, got {job:?}"
+    );
+}
+
+/// Every string from outside clauth's own code on the card escapes control and
+/// bidi characters: a provider name carrying U+202E and a control byte renders
+/// as its visible `\u{…}` form.
+#[test]
+fn the_shunt_card_escapes_control_and_bidi_in_a_provider_name() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, false);
+    let mut slot = shunt_slot(GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let provider = "a\u{202e}b\u{07}c";
+    let card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        None,
+        Some(&super::PoolOutcome::Providers(vec![provider.to_string()])),
+    );
+    assert!(
+        card.detail
+            .iter()
+            .any(|l| l == "codex  provider a\\u{202e}b\\u{7}c needs its own pool login"),
+        "the provider name renders escaped: {:?}",
+        card.detail
+    );
+}
+
+// ── round 3: card keys, off, the daemon-health restart ──────────────────────
+
+/// Q3 + ruling 2: a dead daemon reads the card OFF even over a slot that still
+/// looks healthy (a stale feed's gateway may answer), so MOVE PLAN shows and
+/// the move's own probe — not the feed's freshness — refuses the orphan.
+#[test]
+fn a_dead_daemon_reads_the_card_off_over_a_stale_healthy_slot() {
+    use crate::gateway::StoreMovePlan;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, false);
+    let mut slot = shunt_slot(GatewayState::Healthy);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let plan = StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    let card = super::shunt_card(
+        &slot,
+        true,
+        /*daemon_absent=*/ true,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan)),
+        None,
+    );
+    assert!(
+        card.detail.iter().any(|l| l == "MOVE PLAN"),
+        "a dead daemon reads off (MOVE PLAN) over a stale healthy slot: {:?}",
+        card.detail
+    );
+}
+
+/// Ruling 2: the move's own `/health` probe refuses an orphaned gateway still
+/// answering after its daemon died — `move failed` + the approved
+/// `shunt <version> answers on <bind>` toast, the card having shown MOVE PLAN.
+#[test]
+fn the_move_refuses_an_orphaned_gateway_still_answering() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (addr, serve) = serve_health_once(r#"{"version":"0.49.1"}"#);
+    let config = adopt_config(&home, addr.port());
+    let record = crate::gateway::GatewayRecord::new(config).unwrap();
+    let confirmed = crate::gateway::StoreMovePlan {
+        moved: vec![],
+        kept: vec![],
+    };
+    let outcome = super::run_move(&record, &confirmed);
+    match outcome {
+        super::ShuntActionOutcome::MoveFailed { error } => {
+            assert_eq!(
+                error,
+                format!("shunt 0.49.1 answers on {addr}"),
+                "the orphan refusal"
+            );
+        }
+        other => panic!("expected the orphan refusal, got {other:?}"),
+    }
+    serve.join().unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::MoveFailed {
+            error: format!("shunt 0.49.1 answers on {addr}"),
+        },
+    );
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.kind == super::ToastKind::Danger
+                && t.body == format!("move failed\nshunt 0.49.1 answers on {addr}")
+        }),
+        "the move-failed toast: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// Q1: a FAILED action (not just a success) drops the stale plan cache and
+/// re-runs the plan worker, so the next confirm counts a fresh plan.
+#[test]
+fn a_failed_action_replans() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    app.services.shunt_record = Some(record.clone());
+    let stale = crate::gateway::StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(stale));
+    fn stub(_job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+        super::ShuntActionOutcome::MoveFailed {
+            error: "boom".to_string(),
+        }
+    }
+    app.services.shunt_action.prober = Some(stub);
+    app.services
+        .shunt_action
+        .start(super::ShuntActionJob::AddAdminKey { record });
+    await_service_probes(&mut app);
+    assert!(
+        app.services.move_plan.is_none(),
+        "a failed action drops the stale plan: {:?}",
+        app.services.move_plan
+    );
+}
+
+/// Q2: entering the tab re-runs the plan and pool workers (drops their caches)
+/// so a card left stale by an action elsewhere reads fresh on re-entry.
+#[test]
+fn entering_the_tab_replans() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Overview;
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    let stale = crate::gateway::StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(stale));
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.move_plan.is_none(),
+        "tab entry drops the stale plan: {:?}",
+        app.services.move_plan
+    );
+}
+
+/// R2-5: a daemon start or stop (the chip's health changing) restarts the plan
+/// worker, so `the running daemon recorded no environment; restart it, then
+/// look at the plan again` clears without `r`.
+#[test]
+fn a_daemon_health_change_replans() {
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    let stale = crate::gateway::StoreMovePlan {
+        moved: vec![moved_file("/s/a.json", "/c/a.json")],
+        kept: vec![],
+    };
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(stale));
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        app.services.move_plan.is_some(),
+        "fixture: Keep keeps the stale plan"
+    );
+    // The daemon starts: the health flips, and the plan's env source with it.
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        app.services.move_plan.is_none(),
+        "a daemon health change drops the stale plan: {:?}",
+        app.services.move_plan
+    );
+}
+
+/// `↵` mirrors `space` on the focused `enabled` row, toggling `disabled` on
+/// disk at once (the herdr options' `space/↵` precedent).
+#[test]
+fn enter_toggles_the_enabled_row() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::Enabled));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(
+        !crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "enter flips disabled off"
+    );
+}
+
+/// A failed `enabled` write toasts the house `save failed` + the error. The
+/// failure is the state flock (`~/.clauth/.lock` is a directory, which no
+/// uid — root included — can open read+write), so the record still loads
+/// (the card keeps its `enabled` row) while the toggle's write path fails,
+/// and the test holds under root too. No 0500 to restore on panic.
+#[cfg(unix)]
+#[test]
+fn a_failed_toggle_toasts_save_failed() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let config = adopt_config(&home, closed_port());
+    let record = crate::gateway::GatewayRecord::new(config).unwrap();
+    let dir = crate::profile::clauth_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        crate::gateway::record_path().unwrap(),
+        toml::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    // A directory at the state-lock path: the record loads, the toggle's
+    // `GatewayRecord::update` cannot open the lock file.
+    std::fs::create_dir(dir.join(".lock")).unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::Enabled));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == super::ToastKind::Danger && t.body.starts_with("save failed\n")),
+        "a failed toggle toasts `save failed`: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// The `add admin key` action's landing, without the real `shunt check`: writes
+/// the write-keys entry clauth's recompute reads back as `Neither`, so the
+/// card rebuild drops the admin fix line exactly as a successful action would.
+fn admin_landing_prober(job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+    let super::ShuntActionJob::AddAdminKey { record } = job else {
+        panic!("the admin landing expects the add-admin-key job");
+    };
+    let token = crate::gateway::admin_token_path().unwrap();
+    let key_ref = format!("${{file:{}}}", token.to_str().unwrap());
+    std::fs::write(
+        record.config(),
+        format!(
+            "[server]\n\n[server.admin]\nwrite_keys = [{{ id = \"clauth\", key = \"{key_ref}\" }}]\n"
+        ),
+    )
+    .unwrap();
+    super::ShuntActionOutcome::AdminAdded
+}
+
+/// The `move stores in` action's landing: the drain's `Restart` drops the
+/// move-plan cache, which removes the MOVE PLAN section from the card — the
+/// same recompute path a real landed move drives.
+fn move_landing_prober(job: super::ShuntActionJob) -> super::ShuntActionOutcome {
+    let super::ShuntActionJob::Move { confirmed, .. } = job else {
+        panic!("the move landing expects the move job");
+    };
+    super::ShuntActionOutcome::Moved {
+        n: confirmed.moved.len(),
+    }
+}
+
+/// The rendered footer row of a full frame at `w`×`h`. The single draw both
+/// re-settles the shunt focus (in the body pass) and renders the footer off
+/// the re-settled identity, so this is the frame the user sees.
+fn footer_row(app: &App, w: u16, h: u16) -> String {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+        .last()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The common path the review derived: a successful `add admin key` removes its
+/// own line, so the drain's recompute rebuilds the card with only `enabled`
+/// and the none focus re-settles to `enabled` — the footer shows
+/// `space/↵ toggle`, no `f` verb.
+#[test]
+fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|s| {
+        *s = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut slot = shunt_slot(GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        Some(crate::gateway::AdminNeed::WriteKey),
+        None,
+        None,
+    )];
+    app.services.shunt_record = Some(record.clone());
+    app.services.shunt_action.prober = Some(admin_landing_prober);
+
+    // Descend onto `enabled`, walk to the admin fix, then confirm it.
+    let _ = footer_row(&app, 120, 24);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        app.services
+            .focused_fix()
+            .is_some_and(|f| matches!(f, super::ServiceFix::AddAdminKey)),
+        "the walk lands on the admin fix"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    super::join_test_workers();
+    super::drain_service_probes(&mut app);
+
+    // The drain's recompute rebuilt the card without the admin line (focus
+    // none); the next frame re-settles the none focus to `enabled` and the
+    // footer offers the re-settled line's verb.
+    assert_eq!(app.services.shunt_focus.get(), None);
+    let footer = footer_row(&app, 120, 24);
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(super::ShuntFocusLine::Enabled)
+    );
+    assert!(
+        footer.contains("space/↵ toggle"),
+        "the footer offers the re-settled enabled row's verb: {footer}"
+    );
+}
+
+/// The common path's move twin: a landed `move stores in` removes the MOVE PLAN
+/// (its own line), so the drain's recompute rebuilds the card with only
+/// `enabled` and the none focus re-settles to `enabled`.
+#[test]
+fn a_landed_move_re_settles_focus_to_the_enabled_row() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let record = adopted_record(&home, true);
+    crate::gateway::GatewayRecord::update(|s| {
+        *s = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut slot = shunt_slot(GatewayState::Disabled);
+    slot.config = Some(record.config().display().to_string());
+    slot.binary = Some("shunt".to_string());
+    let plan = crate::gateway::StoreMovePlan {
+        moved: vec![moved_file(
+            "/home/u/.shunt/accounts/main.json",
+            "/home/u/.clauth/shunt/main.json",
+        )],
+        kept: vec![],
+    };
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.checks = vec![super::shunt_card(
+        &slot,
+        false,
+        false,
+        None,
+        Some(&record),
+        None,
+        Some(&super::MovePlanOutcome::Plan(plan.clone())),
+        None,
+    )];
+    app.services.shunt_record = Some(record.clone());
+    app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
+    app.services.shunt_action.prober = Some(move_landing_prober);
+
+    // Descend onto `enabled`, walk to the move fix, then confirm it.
+    let _ = footer_row(&app, 120, 24);
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    assert!(
+        app.services
+            .focused_fix()
+            .is_some_and(|f| matches!(f, super::ServiceFix::MoveStoresIn)),
+        "the walk lands on the move fix"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+
+    super::join_test_workers();
+    super::drain_service_probes(&mut app);
+
+    // The drain's recompute rebuilt the card without the MOVE PLAN (focus
+    // none); the next frame re-settles the none focus to `enabled` and the
+    // footer offers the re-settled line's verb.
+    assert_eq!(app.services.shunt_focus.get(), None);
+    let footer = footer_row(&app, 120, 24);
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(super::ShuntFocusLine::Enabled)
+    );
+    assert!(
+        footer.contains("space/↵ toggle"),
+        "the footer offers the re-settled enabled row's verb: {footer}"
+    );
+}
+
+/// `MovedEnableFailed`: the stores moved, so `moved <N> …` still shows, then
+/// the house `save failed` toast follows (the owner's F14 composition).
+#[test]
+fn a_moved_then_failed_enable_toasts_both() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::MovedEnableFailed {
+            n: 1,
+            error: "boom".to_string(),
+        },
+    );
+    let bodies: Vec<_> = app
+        .toasts
+        .iter()
+        .map(|t| (t.kind, t.body.clone()))
+        .collect();
+    assert_eq!(
+        bodies,
+        vec![
+            (
+                super::ToastKind::Success,
+                "moved 1 account file into clauth".to_string()
+            ),
+            (super::ToastKind::Danger, "save failed\nboom".to_string()),
+        ],
+        "the move-then-failed-enable toast pair"
+    );
+}
+
+/// Q9 end-to-end: `run_move` whose move lands but whose record write then
+/// fails reads `MovedEnableFailed` (not `MoveFailed`). The fixture is the
+/// review's, root-proof: a pre-created, writable `~/.clauth/shunt/accounts/
+/// claude/` takes the moved file, then a directory at the record's own path
+/// (`gateway.toml`) fails the `disabled = false` record write for any uid —
+/// the move lands, the enable write fails.
+#[cfg(unix)]
+#[test]
+fn a_landed_move_whose_record_write_fails_reads_moved_then_save_failed() {
+    let home = crate::testutil::HomeSandbox::new();
+    // The standalone store the plan will move.
+    let src = home.home().join(".shunt").join("accounts").join("claude");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("main.json"), "claude-main").unwrap();
+    // A record on a silent bind, written to disk, `disabled` so the move is due.
+    let config = adopt_config(&home, closed_port());
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = true;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let plan = crate::gateway::plan_standalone_stores(&record).expect("plan");
+    assert!(!plan.moved.is_empty(), "fixture: the plan moves a file");
+
+    // Pre-create the destination subtree (writable) so the move lands, then
+    // make the record's own write fail root-proof: a directory at the record
+    // path (`gateway.toml`) fails `GatewayRecord::update`'s `load` with EISDIR
+    // for any uid (root included), while the moved file (under
+    // `~/.clauth/shunt/`) still lands. No 0500 to restore on panic.
+    let clauth = home.home().join(".clauth");
+    std::fs::create_dir_all(clauth.join("shunt").join("accounts").join("claude")).unwrap();
+    let record_file = crate::gateway::record_path().unwrap();
+    std::fs::remove_file(&record_file).unwrap();
+    std::fs::create_dir(&record_file).unwrap();
+
+    let outcome = super::run_move(&record, &plan);
+    match outcome {
+        super::ShuntActionOutcome::MovedEnableFailed { n, .. } => {
+            assert_eq!(n, plan.moved.len(), "the move landed");
+        }
+        other => panic!("expected MovedEnableFailed, got {other:?}"),
+    }
+    // The moved file really landed before the record write failed.
+    assert_eq!(
+        std::fs::read_to_string(
+            clauth
+                .join("shunt")
+                .join("accounts")
+                .join("claude")
+                .join("main.json")
+        )
+        .unwrap(),
+        "claude-main",
+        "the credential moved before the enable write"
+    );
+}
+
+/// Q11: a `MoveFailed` error carrying control/bidi chars renders escaped in
+/// the toast (an untrusted `Display`), like the card's provider names.
+#[test]
+fn the_move_failed_toast_escapes_control_and_bidi() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::MoveFailed {
+            error: "a\u{202e}b\u{07}c".to_string(),
+        },
+    );
+    assert!(
+        app.toasts.iter().any(|t| {
+            t.kind == super::ToastKind::Danger && t.body == "move failed\na\\u{202e}b\\u{7}c"
+        }),
+        "the move-failed toast escapes control/bidi: {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
 }

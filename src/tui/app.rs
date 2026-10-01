@@ -873,6 +873,20 @@ pub(crate) enum ConfirmAction {
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
+    /// Services tab: adopt a found standalone shunt config (TOML only), running
+    /// the probe and store plan off the UI thread.
+    AdoptConfig(std::path::PathBuf),
+    /// Services tab: move a stopped standalone's account stores in. The plan
+    /// the confirm counted rides here, so the move runs exactly what the card
+    /// showed (never the cache re-read at yes); the move re-plans and refuses
+    /// `PlanChanged` on any drift.
+    MoveStoresIn(crate::gateway::StoreMovePlan),
+    /// Services tab: add clauth's admin write key to the adopted config's
+    /// existing `[server.admin]` table.
+    AddAdminKey,
+    /// Services tab: add a `[server.admin]` table carrying clauth's key (the
+    /// gateway restarts once to register its admin routes).
+    AddAdminTable,
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1633,10 +1647,18 @@ pub(crate) enum ServiceFix {
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
     InstallPlugin,
+    /// Adopt a found standalone shunt config. `PathBuf` = the discovered TOML.
+    AdoptConfig(std::path::PathBuf),
+    /// Move a stopped standalone's account stores into clauth's managed stores.
+    MoveStoresIn,
+    /// Add clauth's admin write key to the adopted config's `[server.admin]`.
+    AddAdminKey,
+    /// Add a `[server.admin]` table carrying clauth's key.
+    AddAdminTable,
 }
 
-/// One focusable fix problem inside a service row's detail. When the detail pane
-/// is descended, ↑↓ walks these problems and `f` applies the focused one; the
+/// One focusable line inside a service row's detail. When the detail pane is
+/// descended, ↑↓ walks these problems and `f` applies the focused one; the
 /// footer's `f <verb>` and the dim `f  <verb>` detail line follow the focus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Problem {
@@ -1645,9 +1667,78 @@ pub(crate) struct Problem {
     pub(crate) fix: ServiceFix,
 }
 
+/// One actionable line on the `shunt` card: a fix (`f  <verb>`) or the
+/// `enabled` toggle row. Descended, ↑↓ pages the card one line at a time; an
+/// actionable line takes focus as it scrolls into view, read-only rows never
+/// do, and `f`/`space`/`↵` act only on the focused one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShuntFocus {
+    /// An `f  <verb>` line at this detail index.
+    Fix { line: usize, fix: ServiceFix },
+    /// The `enabled` toggle row at this detail index.
+    Enabled { line: usize },
+}
+
+impl ShuntFocus {
+    /// The detail-line index the focusable sits on.
+    pub(crate) fn line(&self) -> usize {
+        match self {
+            ShuntFocus::Fix { line, .. } | ShuntFocus::Enabled { line } => *line,
+        }
+    }
+
+    /// The fix this line applies, `None` on the `enabled` row.
+    pub(crate) fn fix(&self) -> Option<&ServiceFix> {
+        match self {
+            ShuntFocus::Fix { fix, .. } => Some(fix),
+            ShuntFocus::Enabled { .. } => None,
+        }
+    }
+
+    /// The line's kind, the identity focus keeps across a resize or recompute.
+    pub(crate) fn kind(&self) -> ShuntFocusLine {
+        match self {
+            ShuntFocus::Enabled { .. } => ShuntFocusLine::Enabled,
+            ShuntFocus::Fix {
+                fix: ServiceFix::AdoptConfig(_),
+                ..
+            } => ShuntFocusLine::Adopt,
+            ShuntFocus::Fix {
+                fix: ServiceFix::MoveStoresIn,
+                ..
+            } => ShuntFocusLine::Move,
+            ShuntFocus::Fix {
+                fix: ServiceFix::AddAdminKey | ServiceFix::AddAdminTable,
+                ..
+            } => ShuntFocusLine::Admin,
+            // No other fix line appears on the shunt card.
+            ShuntFocus::Fix { .. } => unreachable!("no other fix appears on the shunt card"),
+        }
+    }
+}
+
+/// The identity of the shunt card's focused actionable line, by its kind. The
+/// key handler owns it; the render reads it and re-settles it (the descend
+/// rule) when a resize or a card change pushed the held line out of view. A
+/// resize or a card change keeps focus on the same line while that kind still
+/// exists, so the line index ([`ShuntFocus::line`]) is deliberately not part
+/// of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntFocusLine {
+    /// The `enabled` toggle row.
+    Enabled,
+    /// The `f  adopt config` line on the absent card.
+    Adopt,
+    /// The `f  add admin key` / `f  add admin table` line.
+    Admin,
+    /// The `f  move stores in` line.
+    Move,
+}
+
 /// A computed service row. `fix` is the list-focus `f` (the first fixable
 /// problem); `problems` is the detail-pane focus walk (empty on rows whose
-/// detail has no per-problem focus).
+/// detail has no per-problem focus); `shunt_focus` is the `shunt` card's own
+/// focus walk (a mix of fix lines and the `enabled` row).
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) label: &'static str,
@@ -1658,6 +1749,15 @@ pub(crate) struct Check {
     pub(crate) detail: Vec<String>,
     pub(crate) fix: Option<ServiceFix>,
     pub(crate) problems: Vec<Problem>,
+    /// The `shunt` detail's actionable lines (the fix lines and the `enabled`
+    /// row), in card order. Empty elsewhere.
+    pub(crate) shunt_focus: Vec<ShuntFocus>,
+    /// On the `shunt` card, the detail index where its action section begins
+    /// (the blank line before the `enabled` row, or the first `f  adopt
+    /// config` line on an absent card). Lines at/after it render verbatim with
+    /// per-line focus, instead of the shared `key: value` splitter — the MOVE
+    /// PLAN copy holds a literal `: `. `None` elsewhere.
+    pub(crate) shunt_action_start: Option<usize>,
 }
 
 /// The one verb per fix, used identically in the detail's dim `f  <verb>` line
@@ -1668,6 +1768,10 @@ pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
         ServiceFix::WireMcpServers => "wire mcp server",
         ServiceFix::InstallPlugin => "install plugin",
         ServiceFix::HealHerdrConfig(_) => "heal herdr config",
+        ServiceFix::AdoptConfig(_) => "adopt config",
+        ServiceFix::MoveStoresIn => "move stores in",
+        ServiceFix::AddAdminKey => "add admin key",
+        ServiceFix::AddAdminTable => "add admin table",
     }
 }
 
@@ -1746,6 +1850,147 @@ impl<T: Default + Send + 'static> ProbeWorker<T> {
     }
 }
 
+/// The cached standalone-store move plan, computed on a worker (the plan
+/// spawns `ps`/`powershell` on macOS/Windows).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum MovePlanOutcome {
+    /// A plan that moves at least one file — the MOVE PLAN section shows.
+    Plan(crate::gateway::StoreMovePlan),
+    /// The plan refused: the refusal's `Display`, ready to render as
+    /// `refused  <…>`.
+    Refused(String),
+    /// A plan that moves nothing and does not refuse — no MOVE PLAN section.
+    Nothing,
+    /// No record, or the record/plan could not be read — no MOVE PLAN section.
+    #[default]
+    Unavailable,
+}
+
+/// The cached codex-pool read, computed on a worker (the pool read blocks up
+/// to ~24 s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PoolOutcome {
+    /// The providers needing their own pool login, in gateway order.
+    Providers(Vec<String>),
+    /// The read failed: the error's `Display`, the approved `pool  <error>`
+    /// sentence.
+    Error(String),
+}
+
+impl Default for PoolOutcome {
+    /// A panicked pool read shows no note and no error.
+    fn default() -> Self {
+        PoolOutcome::Providers(Vec::new())
+    }
+}
+
+/// One confirmed shunt-card action, handed to the action worker so the slow
+/// call never holds a frame.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntActionJob {
+    Adopt {
+        found: std::path::PathBuf,
+    },
+    Move {
+        record: crate::gateway::GatewayRecord,
+        confirmed: crate::gateway::StoreMovePlan,
+    },
+    AddAdminKey {
+        record: crate::gateway::GatewayRecord,
+    },
+    AddAdminTable {
+        record: crate::gateway::GatewayRecord,
+    },
+}
+
+/// The result of one shunt-card action, drained on the tick into a toast and a
+/// recompute.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ShuntActionOutcome {
+    Adopted {
+        path: String,
+    },
+    /// A standalone shunt answered at the adopt probe: nothing written.
+    AdoptRefused {
+        version: String,
+        addr: std::net::SocketAddr,
+    },
+    AdoptFailed {
+        error: String,
+    },
+    Moved {
+        n: usize,
+    },
+    /// The stores moved, but writing the record's `disabled = false` failed:
+    /// the success toast still shows, then the house `save failed` toast.
+    MovedEnableFailed {
+        n: usize,
+        error: String,
+    },
+    MoveFailed {
+        error: String,
+    },
+    AdminAdded,
+    AdminFailed {
+        error: String,
+    },
+    /// The worker panicked, or no action was started: no toast, just a
+    /// recompute so the card reads the record's real state.
+    #[default]
+    NoOp,
+}
+
+/// The one-shot worker behind the shunt card's confirmed actions: at most one
+/// action runs at a time, its result landing through the tick's drain. The
+/// same `prober` seam as [`ProbeWorker`] — `None` under test unless a stub is
+/// installed — and `running` is the gate that makes a second press of any
+/// shunt-card action start nothing.
+#[derive(Debug)]
+pub(crate) struct ShuntActionWorker {
+    pub(crate) prober: Option<fn(ShuntActionJob) -> ShuntActionOutcome>,
+    pub(crate) running: bool,
+    pub(crate) tx: std::sync::mpsc::Sender<ShuntActionOutcome>,
+    rx: std::sync::mpsc::Receiver<ShuntActionOutcome>,
+}
+
+impl ShuntActionWorker {
+    fn new(prober: fn(ShuntActionJob) -> ShuntActionOutcome) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            prober: (!cfg!(test)).then_some(prober),
+            running: false,
+            tx,
+            rx,
+        }
+    }
+
+    /// Start a job unless one is in flight; a prober that panics lands as the
+    /// `NoOp` default, so `running` never sticks.
+    fn start(&mut self, job: ShuntActionJob) {
+        let Some(prober) = self.prober else {
+            return;
+        };
+        if self.running {
+            return;
+        }
+        self.running = true;
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send(catch_unwind(AssertUnwindSafe(|| prober(job))).unwrap_or_default());
+        });
+    }
+
+    /// The newest result that landed since the last drain, if any.
+    fn drain(&mut self) -> Option<ShuntActionOutcome> {
+        let mut landed = None;
+        while let Ok(result) = self.rx.try_recv() {
+            landed = Some(result);
+            self.running = false;
+        }
+        landed
+    }
+}
+
 /// UI-thread-only state for the Services tab. Recomputed synchronously on tab
 /// focus and on `r` (the reads are local FS/`PATH`; `claude --version` is one
 /// cached subprocess gated by [`ServicesState::cc_version`]); the herdr and
@@ -1791,6 +2036,46 @@ pub(crate) struct ServicesState {
     pub(crate) standalone: Option<StandaloneShunt>,
     /// The worker running [`standalone_probe`].
     pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
+    /// The gateway record on disk, read once per recompute (a cheap local
+    /// read). `None` = no record, or one that cannot load. Every shunt-card
+    /// action and the `enabled` row read this, never the file per frame.
+    pub(crate) shunt_record: Option<crate::gateway::GatewayRecord>,
+    /// The cached standalone-store move plan (`None` = not yet planned). The
+    /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
+    /// on tab entry, on `r`, and after any shunt-card action lands.
+    pub(crate) move_plan: Option<MovePlanOutcome>,
+    /// The worker running [`move_plan_probe`].
+    pub(crate) move_plan_probe: ProbeWorker<MovePlanOutcome>,
+    /// The adopted config's admin need, read on the recompute (a local read +
+    /// parse, the herdr config re-read's shape). `None` = no record, or an
+    /// unreadable config (no verb offered).
+    pub(crate) admin_need: Option<crate::gateway::AdminNeed>,
+    /// The cached codex-pool read (`None` = not read, or not due). The read
+    /// runs on a worker while the slot is `healthy` and `admin_need` is
+    /// `Neither`, and can block up to ~24 s.
+    pub(crate) pool: Option<PoolOutcome>,
+    /// The worker running [`pool_probe`].
+    pub(crate) pool_probe: ProbeWorker<PoolOutcome>,
+    /// The worker running one confirmed shunt-card action at a time.
+    pub(crate) shunt_action: ShuntActionWorker,
+    /// The `shunt` detail's focused actionable line, by its kind. Owned by the
+    /// key handler and the recompute; the render reads it to draw the caret,
+    /// and re-settles it (the descend rule) where it publishes the geometry
+    /// when a resize or a card change pushed the held line out of view.
+    pub(crate) shunt_focus: std::cell::Cell<Option<ShuntFocusLine>>,
+    /// The rendered line index of each [`Check::shunt_focus`] stop (parallel to
+    /// that list), published by the last render so the key handler can tell
+    /// which stops are in view. A stop's rendered row is what the in-view test
+    /// measures: a wrapped read-only sentence above a stop can shift it down.
+    pub(crate) shunt_stop_rows: std::cell::RefCell<Vec<usize>>,
+    /// The last rendered shunt pane height, published by the render the way
+    /// [`ServicesState::detail_max_scroll`] is — the key handler's viewport.
+    pub(crate) shunt_viewport: std::cell::Cell<u16>,
+    /// The daemon health the last recompute ran with, so a daemon start or stop
+    /// (the header chip's health changing) can restart the plan/pool workers:
+    /// the plan's env source is the running daemon's record, else this
+    /// process's own env, so a presence flip invalidates the cached plan.
+    last_daemon_health: Option<crate::daemon::DaemonHealth>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
@@ -1851,6 +2136,17 @@ impl Default for ServicesState {
             herdr_probe: ProbeWorker::new(crate::herdr::probe),
             standalone: None,
             standalone_probe: ProbeWorker::new(standalone_probe),
+            shunt_record: None,
+            move_plan: None,
+            move_plan_probe: ProbeWorker::new(move_plan_probe),
+            admin_need: None,
+            pool: None,
+            pool_probe: ProbeWorker::new(pool_probe),
+            shunt_action: ShuntActionWorker::new(run_shunt_action),
+            shunt_focus: std::cell::Cell::new(None),
+            shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
+            shunt_viewport: std::cell::Cell::new(0),
+            last_daemon_health: None,
             delegates: Vec::new(),
             problem_cursor: 0,
             herdr_options_cursor: 0,
@@ -1878,8 +2174,9 @@ impl ServicesState {
     }
 
     /// The fix `f` applies this frame: the list-focus fix, or — on the plugin
-    /// detail, whose problems walk — the focused problem's fix. The footer's
-    /// `f <verb>` and the dim `f  <verb>` detail line follow this.
+    /// detail, whose problems walk, and the shunt detail, whose focusable
+    /// lines walk — the focused problem's fix. The footer's `f <verb>` and the
+    /// dim `f  <verb>` detail line follow this.
     pub(crate) fn focused_fix(&self) -> Option<&ServiceFix> {
         match self.focus {
             ServicesFocus::List => self.selected_fix(),
@@ -1887,11 +2184,66 @@ impl ServicesState {
                 let check = self.selected_check()?;
                 if check.label == "plugin" {
                     check.problems.get(self.problem_cursor).map(|p| &p.fix)
+                } else if check.label == "shunt" {
+                    self.focused_shunt_focus().and_then(ShuntFocus::fix)
                 } else {
                     self.selected_fix()
                 }
             }
         }
+    }
+
+    /// The shunt detail's focused actionable line, resolved by the focus
+    /// identity the key handler owns and gated by the one in-view predicate
+    /// every acting key and the footer consult: the resolved stop holds only
+    /// while its rendered row is on screen (the geometry the last render
+    /// published). A resize or a card change that pushes the focused line out
+    /// of view re-settles focus to the first actionable line in view (the
+    /// descend rule) where the render publishes the geometry, so this only
+    /// reads `None` when no actionable line is in view.
+    pub(crate) fn focused_shunt_focus(&self) -> Option<&ShuntFocus> {
+        let kind = self.shunt_focus.get()?;
+        let stops = &self.selected_check()?.shunt_focus;
+        let i = stops.iter().position(|s| s.kind() == kind)?;
+        let rows = self.shunt_stop_rows.borrow();
+        if rows.len() != stops.len() {
+            // No geometry published for this card yet (a key before the first
+            // frame, or a unit test that skips the render): with nothing to
+            // measure, the by-kind identity is the answer. The in-view gate
+            // only applies over a published geometry.
+            return Some(&stops[i]);
+        }
+        let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
+        shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+    }
+
+    /// The descend rule applied where the geometry is published: the render
+    /// calls this over the freshly rendered rows so a resize or a card change
+    /// re-settles focus to the first actionable line in view, else none. A
+    /// held line pushed out of view re-settles regardless of pane focus; a
+    /// focus that is none re-settles only while the detail pane holds focus —
+    /// with the list focused, ascend keeps the identity and a none focus is
+    /// the key handler's own state, never settled here.
+    pub(crate) fn re_settle_shunt_focus(
+        &self,
+        stops: &[ShuntFocus],
+        rows: &[usize],
+        scroll: u16,
+        viewport: usize,
+    ) {
+        if let Some(kind) = self.shunt_focus.get() {
+            if stops
+                .iter()
+                .position(|s| s.kind() == kind)
+                .is_some_and(|i| shunt_in_view(scroll, viewport, rows[i]))
+            {
+                return;
+            }
+        } else if self.focus != ServicesFocus::Detail {
+            return;
+        }
+        self.shunt_focus
+            .set(shunt_first_in_view(stops, rows, scroll, viewport));
     }
 }
 
@@ -2916,7 +3268,7 @@ impl App {
             self.tab = Tab::Services;
             // Land on the herdr row by label once its probe resolves.
             self.services.land_on_herdr = true;
-            recompute_services_checks(&mut self, false);
+            recompute_services_checks(&mut self, false, ShuntRefresh::Keep);
             {
                 let mut cfg = self.config();
                 cfg.state.herdr.first_landing_done = true;
@@ -3857,7 +4209,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             // Service checks re-run synchronously; `r` also re-probes `claude --version`.
             if app.tab == Tab::Services {
-                recompute_services_checks(app, true);
+                recompute_services_checks(app, true, ShuntRefresh::Keep);
                 app.toast(ToastKind::Info, "re-running service checks");
                 return;
             }
@@ -4127,8 +4479,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
             // Config tab clears its drafts; `switch_tab` matches the
             // destination, so the clear runs on entry, not on exit.
             app.services.herdr_tag_draft = None;
-            // Recompute on focus; the cached `claude --version` is not re-probed.
-            recompute_services_checks(app, false);
+            // Recompute on focus; the cached `claude --version` is not
+            // re-probed, but the shunt plan and pool read re-run so a card
+            // left stale by an action elsewhere reads fresh on re-entry.
+            recompute_services_checks(app, false, ShuntRefresh::Restart);
         }
     }
 }
@@ -4358,6 +4712,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     {
                         app.services.focus = ServicesFocus::Detail;
                         app.services.detail_scroll = 0;
+                        settle_shunt_focus(app);
                     }
                 }
                 KeyCode::Char('f') => {
@@ -4378,6 +4733,8 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     .is_some_and(|c| !c.problems.is_empty())
             {
                 handle_plugin_problems_key(app, key);
+            } else if label == Some("shunt") {
+                handle_shunt_detail_key(app, key);
             } else {
                 match key.code {
                     KeyCode::Up => {
@@ -4420,13 +4777,233 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Apply the focused fix. `WireMcpServers` opens a confirm modal; a diverged
+/// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
+/// as it scrolls into view, one line at a time through the read-only text),
+/// `f` applies the focused fix, `space`/`↵` flip the focused `enabled` row.
+/// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
+/// render reads it and re-settles it (the descend rule) when a resize or a
+/// card change pushed the held line out of view. Only the shunt detail routes
+/// here; the herdr options and plugin problems keep their own walks, every
+/// other detail keeps the scroll-only keymap.
+fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up => shunt_step(app, false),
+        KeyCode::Down => shunt_step(app, true),
+        KeyCode::Char('f') => apply_service_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if matches!(
+                app.services.focused_shunt_focus(),
+                Some(ShuntFocus::Enabled { .. })
+            ) {
+                toggle_shunt_enabled(app);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One `↑`/`↓` on the shunt card, over the geometry the last render published
+/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_viewport`] +
+/// [`ServicesState::detail_max_scroll`]): move focus to the next/previous
+/// actionable line in card order, scrolling one rendered line at a time only
+/// while that target is out of view, and never past either end. Read-only rows
+/// never take focus; with no further actionable line a press scrolls (while
+/// there is text to scroll) and focus stays on its line while that line is in
+/// view.
+fn shunt_step(app: &mut App, down: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    if stops.is_empty() {
+        // A card with no actionable line still scrolls one rendered line per
+        // ↑↓ (round 1 S14's behaviour): the read-only detail scrolls, and the
+        // footer's `↑↓ scroll` is true exactly while this does something.
+        let max = app.services.detail_max_scroll.get();
+        app.services.detail_scroll = if down {
+            app.services.detail_scroll.saturating_add(1).min(max)
+        } else {
+            app.services.detail_scroll.min(max).saturating_sub(1)
+        };
+        return;
+    }
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    if rows.len() != stops.len() {
+        // The render has not published this card's geometry yet (nothing drawn
+        // to walk over).
+        return;
+    }
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let max_scroll = app.services.detail_max_scroll.get();
+    let mut scroll = app.services.detail_scroll.min(max_scroll);
+
+    // Reconcile only a held identity that left the view (a resize can move it
+    // out): the descend rule — the first actionable line in view — settles it,
+    // and the step below walks from there. A none focus is NOT reconciled
+    // here: `↓`/`↑` from none start from the target rule itself (the first
+    // stop at/after the top of the view going down, the last before the bottom
+    // going up), so the first visible line is never skipped.
+    let focus = app.services.shunt_focus.get().and_then(|kind| {
+        stops
+            .iter()
+            .position(|s| s.kind() == kind)
+            .filter(|&i| shunt_in_view(scroll, viewport, rows[i]))
+            .map(|i| stops[i].kind())
+    });
+    let cur = focus.and_then(|kind| stops.iter().position(|s| s.kind() == kind));
+
+    // The target stop: the one after/before the focused line, or (with no
+    // focus) the first at/after the top of the view going down, the last
+    // before the bottom of the view going up.
+    let target = if down {
+        match cur {
+            Some(cur) => (cur + 1 < stops.len()).then_some(cur + 1),
+            None => (0..stops.len()).find(|&i| rows[i] >= scroll as usize),
+        }
+    } else {
+        match cur {
+            Some(cur) => (cur > 0).then_some(cur - 1),
+            None => (0..stops.len())
+                .rev()
+                .find(|&i| rows[i] < scroll as usize + viewport),
+        }
+    };
+
+    // The current focus kept while its line is still in view after a scroll.
+    let keep_focus = |scroll: u16| {
+        focus.filter(|&kind| {
+            stops
+                .iter()
+                .position(|s| s.kind() == kind)
+                .is_some_and(|i| shunt_in_view(scroll, viewport, rows[i]))
+        })
+    };
+
+    match target {
+        Some(t) if shunt_in_view(scroll, viewport, rows[t]) => {
+            app.services.shunt_focus.set(Some(stops[t].kind()));
+        }
+        Some(_) => {
+            // The target is out of view: scroll one line toward it, then take
+            // it if that brought it into view, else keep the current focus
+            // while its line is still visible.
+            if down {
+                scroll = scroll.saturating_add(1).min(max_scroll);
+            } else {
+                scroll = scroll.saturating_sub(1);
+            }
+            let target_taken = target
+                .filter(|&t| shunt_in_view(scroll, viewport, rows[t]))
+                .map(|t| stops[t].kind());
+            app.services
+                .shunt_focus
+                .set(target_taken.or_else(|| keep_focus(scroll)));
+        }
+        None => {
+            // No further actionable line: scroll one line while there is text
+            // to scroll in this direction; at either end, nothing.
+            if down {
+                scroll = scroll.saturating_add(1).min(max_scroll);
+            } else {
+                scroll = scroll.saturating_sub(1);
+            }
+            app.services.shunt_focus.set(keep_focus(scroll));
+        }
+    }
+    app.services.detail_scroll = scroll;
+}
+
+/// Whether a rendered row is inside the current viewport.
+fn shunt_in_view(scroll: u16, viewport: usize, r: usize) -> bool {
+    r >= scroll as usize && r < scroll as usize + viewport
+}
+
+/// The shunt card's descend rule: the first actionable line in view, else
+/// none.
+fn shunt_first_in_view(
+    stops: &[ShuntFocus],
+    rows: &[usize],
+    scroll: u16,
+    viewport: usize,
+) -> Option<ShuntFocusLine> {
+    stops
+        .iter()
+        .zip(rows)
+        .find(|(_, r)| shunt_in_view(scroll, viewport, **r))
+        .map(|(s, _)| s.kind())
+}
+
+/// The shunt card's descend rule applied on descend: focus keeps its held
+/// identity while that line is in view, else it becomes the first actionable
+/// line in view (else none). Re-descending after an ascend therefore restores
+/// the walk position instead of resetting to the top of the card.
+fn settle_shunt_focus(app: &mut App) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let scroll = app
+        .services
+        .detail_scroll
+        .min(app.services.detail_max_scroll.get());
+    let held = app.services.shunt_focus.get().and_then(|kind| {
+        stops
+            .iter()
+            .position(|s| s.kind() == kind)
+            .filter(|&i| i < rows.len() && shunt_in_view(scroll, viewport, rows[i]))
+            .map(|i| stops[i].kind())
+    });
+    app.services
+        .shunt_focus
+        .set(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
+}
+
+/// Flip the record's `disabled` flag at once, reading and writing the value
+/// ON DISK inside [`crate::gateway::GatewayRecord::update`] (under the state
+/// flock), never the cached record. A failed write toasts the house
+/// `save failed` + the error. The recompute below reloads the record from
+/// disk and re-plans, so the row flips on the same frame.
+fn toggle_shunt_enabled(app: &mut App) {
+    if app.services.shunt_action.running {
+        return;
+    }
+    match crate::gateway::GatewayRecord::update(|slot| {
+        if let Some(held) = slot.as_mut() {
+            held.disabled = !held.disabled;
+        }
+        Ok(())
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&e.to_string())),
+            );
+        }
+    }
+    recompute_services_checks(app, false, ShuntRefresh::Restart);
+}
+
+/// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
 /// active profile's repair lives on the divergence resolver's own `d` prompt,
-/// never on this tab.
+/// never on this tab. Only the four shunt fixes are gated by an in-flight shunt
+/// action — a second shunt press starts nothing, while the plugin and herdr
+/// fixes keep working.
 fn apply_service_fix(app: &mut App) {
     let Some(fix) = app.services.focused_fix().cloned() else {
         return;
     };
+    if app.services.shunt_action.running
+        && matches!(
+            fix,
+            ServiceFix::AdoptConfig(_)
+                | ServiceFix::MoveStoresIn
+                | ServiceFix::AddAdminKey
+                | ServiceFix::AddAdminTable
+        )
+    {
+        return;
+    }
     match fix {
         ServiceFix::WireMcpServers => {
             app.disarm_quit();
@@ -4463,7 +5040,70 @@ fn apply_service_fix(app: &mut App) {
                 on_confirm: ConfirmAction::InstallPlugin,
             }));
         }
+        ServiceFix::AdoptConfig(path) => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("adopt {}?", escape_control(&path.to_string_lossy())),
+                detail: Some("clauth runs shunt on this config and edits it in place.".to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::AdoptConfig(path),
+            }));
+        }
+        ServiceFix::MoveStoresIn => open_move_confirm(app),
+        ServiceFix::AddAdminKey => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "add clauth's admin key to this config?".to_string(),
+                detail: Some(
+                    "clauth needs it to manage pool accounts and read their usage.".to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::AddAdminKey,
+            }));
+        }
+        ServiceFix::AddAdminTable => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "add a [server.admin] table with clauth's key?".to_string(),
+                detail: Some("the gateway restarts once to load it.".to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::AddAdminTable,
+            }));
+        }
     }
+}
+
+/// The move confirm: the two counts off the plan the card showed, carried in
+/// the confirm action so the move runs exactly that plan. The `<K> stay
+/// behind` line is absent at K = 0, and both lines take the singular at 1.
+fn open_move_confirm(app: &mut App) {
+    let plan = match &app.services.move_plan {
+        Some(MovePlanOutcome::Plan(plan)) => plan.clone(),
+        _ => return,
+    };
+    let n = plan.moved.len();
+    let k = plan.kept.len();
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("move {n} {} into clauth?", account_files_word(n)),
+        detail: (k > 0).then(|| format!("{k} {} behind, listed on the card.", stays_word(k))),
+        choice: false,
+        on_confirm: ConfirmAction::MoveStoresIn(plan),
+    }));
+}
+
+/// The `account files`/`account file` noun, singular at 1 (the owner's copy).
+fn account_files_word(n: usize) -> &'static str {
+    if n == 1 {
+        "account file"
+    } else {
+        "account files"
+    }
+}
+
+/// The `stay`/`stays` verb, singular at 1 (the owner's copy).
+fn stays_word(k: usize) -> &'static str {
+    if k == 1 { "stays" } else { "stay" }
 }
 
 /// The herdr detail's options keymap: ↑↓ walks the six rows (wrapping), space
@@ -4862,7 +5502,19 @@ pub(crate) fn herdr_check(
         detail,
         fix: fixed,
         problems,
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
+}
+
+/// Whether a recompute re-runs the shunt card's plan and pool workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShuntRefresh {
+    /// Cheap recompute: start a worker only when its cache is empty.
+    Keep,
+    /// Drop the plan/pool caches and restart their workers (respecting their
+    /// gates), so "until it lands the card shows nothing for the plan" holds.
+    Restart,
 }
 
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
@@ -4870,11 +5522,28 @@ pub(crate) fn herdr_check(
 /// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
 /// `claude --version` and the `clauth mcp` boot probe run only when
 /// `refresh_version` is set. Synchronous, except the herdr probe, which it
-/// starts on a worker when none is cached or on `r`.
-fn recompute_services_checks(app: &mut App, refresh_version: bool) {
+/// starts on a worker when none is cached or on `r`, and the shunt plan/pool
+/// workers, which [`ShuntRefresh::Restart`] re-runs on tab entry and after a
+/// shunt action lands.
+fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntRefresh) {
     use crate::plugin_probe as probe;
 
     app.services.error = None;
+
+    // A daemon start or stop flips the plan's env source (the running daemon's
+    // record vs this process's own env), so the cached plan is invalid the
+    // moment the chip's health changes: restart the plan/pool workers exactly
+    // as `Restart` does. The first recompute just records the value.
+    let daemon_flipped = app
+        .services
+        .last_daemon_health
+        .is_some_and(|last| last != app.daemon_health);
+    app.services.last_daemon_health = Some(app.daemon_health);
+    let shunt = if daemon_flipped {
+        ShuntRefresh::Restart
+    } else {
+        shunt
+    };
 
     // CC version is cached; only `r` probes. Construction and a tab switch
     // leave it unprobed rather than spawning `claude --version` synchronously
@@ -4919,28 +5588,70 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
 
-    // shunt row — read-only gateway status: the daemon's feed when one is
-    // fresh, else the record-only verdict. The "the daemon runs the gateway"
-    // note names the daemon only for a record the gateway WOULD run on with no
-    // daemon to run it (the `unobserved` verdict) — never for absent/disabled/
-    // no_config, where no gateway would run at all. With no gateway adopted,
-    // the standalone probe says what shunt would load and what answers.
+    // shunt row — the gateway's control surface: the daemon's feed when one is
+    // fresh, else the record-only verdict. With no gateway adopted, the
+    // standalone probe says what shunt would load and what answers. The record
+    // and the admin need are cheap local reads on the recompute; the store
+    // move plan and the codex pool read run on workers.
     let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
     if gateway_slot.state == GatewayState::Absent {
-        if refresh_version {
+        // The readout's bind comes from the env the adopt reads, which a
+        // daemon start or stop flips.
+        if refresh_version || daemon_flipped {
             app.services.standalone_probe.restart();
         } else if app.services.standalone.is_none() {
             app.services.standalone_probe.start();
         }
     }
-    let mut shunt = shunt_check(
+    app.services.shunt_record = crate::gateway::GatewayRecord::load().ok().flatten();
+    app.services.admin_need = app
+        .services
+        .shunt_record
+        .as_ref()
+        .and_then(|record| crate::gateway::admin_need(record.config()).ok());
+
+    // The store move plan: on a worker, on tab entry, on `r`, and after any
+    // action lands (the outcome drain passes [`ShuntRefresh::Restart`], which
+    // drops the cache so the card shows nothing until the fresh plan lands).
+    if shunt == ShuntRefresh::Restart {
+        app.services.move_plan = None;
+        app.services.pool = None;
+    }
+    if app.services.shunt_record.is_some() {
+        if refresh_version || shunt == ShuntRefresh::Restart {
+            app.services.move_plan_probe.restart();
+        } else if app.services.move_plan.is_none() {
+            app.services.move_plan_probe.start();
+        }
+    } else {
+        app.services.move_plan = None;
+    }
+
+    // The codex pool note: on a worker, gated on the slot being `healthy` with
+    // no admin step owed. Re-probed on tab entry, `r`, and whenever the slot
+    // turns healthy (the recompute re-reads the slot each tick).
+    let pool_due = gateway_slot.state == GatewayState::Healthy
+        && app.services.admin_need == Some(crate::gateway::AdminNeed::Neither);
+    if pool_due {
+        if refresh_version || shunt == ShuntRefresh::Restart {
+            app.services.pool_probe.restart();
+        } else if app.services.pool.is_none() {
+            app.services.pool_probe.start();
+        }
+    } else {
+        app.services.pool = None;
+    }
+
+    let shunt = shunt_card(
         &gateway_slot,
         gateway_supervised,
+        app.daemon_health == crate::daemon::DaemonHealth::Absent,
         app.services.standalone.as_ref(),
+        app.services.shunt_record.as_ref(),
+        app.services.admin_need,
+        app.services.move_plan.as_ref(),
+        app.services.pool.as_ref(),
     );
-    if !gateway_supervised && gateway_slot.state == GatewayState::Unobserved {
-        shunt.detail.push("the daemon runs the gateway".to_string());
-    }
     checks.push(shunt);
 
     // The delegates detail names the profiles whose delegate traffic is
@@ -5029,6 +5740,19 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
             app.services.cursor = app.services.row_count().saturating_sub(1);
         }
     }
+
+    // A card change keeps the shunt focus by identity while the kind still
+    // exists (a landed action can drop the line that held it); the render
+    // re-settles it (the descend rule) on the next frame when a change pushed
+    // the line out of view, over the freshly rendered geometry.
+    if let Some(kind) = app.services.shunt_focus.get()
+        && !app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == kind))
+    {
+        app.services.shunt_focus.set(None);
+    }
 }
 
 /// Adopt every finished Services probe and recompute once, so a row appears
@@ -5038,7 +5762,15 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 fn drain_service_probes(app: &mut App) {
     let herdr = app.services.herdr_probe.drain();
     let standalone = app.services.standalone_probe.drain();
-    if herdr.is_none() && standalone.is_none() {
+    let move_plan = app.services.move_plan_probe.drain();
+    let pool = app.services.pool_probe.drain();
+    let action = app.services.shunt_action.drain();
+    if herdr.is_none()
+        && standalone.is_none()
+        && move_plan.is_none()
+        && pool.is_none()
+        && action.is_none()
+    {
         return;
     }
     let herdr_landed = herdr.is_some();
@@ -5048,9 +5780,90 @@ fn drain_service_probes(app: &mut App) {
     if let Some(readout) = standalone {
         app.services.standalone = Some(readout);
     }
-    recompute_services_checks(app, false);
+    if let Some(plan) = move_plan {
+        app.services.move_plan = Some(plan);
+    }
+    if let Some(readout) = pool {
+        app.services.pool = Some(readout);
+    }
+    let action_landed = action.is_some();
+    if let Some(outcome) = action {
+        handle_shunt_action_outcome(app, outcome);
+    }
+    // After a shunt action lands (success OR failure) the plan and pool caches
+    // are dropped and their workers restarted, so the next confirm counts a
+    // fresh plan — never the stale one a failed move left behind.
+    recompute_services_checks(
+        app,
+        false,
+        if action_landed {
+            ShuntRefresh::Restart
+        } else {
+            ShuntRefresh::Keep
+        },
+    );
     if herdr_landed {
         app.services.land_on_herdr = false;
+    }
+}
+
+/// One shunt-card action's result: the toast, every error `Display` escaped
+/// (it can interpolate an untrusted path), the moved count singular at 1. The
+/// plan/pool caches are dropped by the drain's recompute (which restarts their
+/// workers after any action).
+fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
+    match outcome {
+        ShuntActionOutcome::Adopted { path } => {
+            app.toast(ToastKind::Success, format!("adopted {path}"));
+        }
+        ShuntActionOutcome::AdoptRefused { version, addr } => {
+            app.toast(
+                ToastKind::Warning,
+                format!("shunt {version} answers on {addr}\nstop it, then adopt again"),
+            );
+        }
+        ShuntActionOutcome::AdoptFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("adopt failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::Moved { n } => {
+            app.toast(
+                ToastKind::Success,
+                format!("moved {n} {} into clauth", account_files_word(n)),
+            );
+        }
+        ShuntActionOutcome::MovedEnableFailed { n, error } => {
+            // The stores moved, so the success toast still shows; the record
+            // write failed, so the house `save failed` toast follows it.
+            app.toast(
+                ToastKind::Success,
+                format!("moved {n} {} into clauth", account_files_word(n)),
+            );
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::MoveFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("move failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::AdminAdded => {
+            // The one toast for both admin steps (the orchestrator's reading,
+            // flagged in the report).
+            app.toast(ToastKind::Success, "added clauth's admin key");
+        }
+        ShuntActionOutcome::AdminFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("admin key failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::NoOp => {}
     }
 }
 
@@ -5080,6 +5893,8 @@ pub(crate) fn delegates_check(
         detail,
         fix: None,
         problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
@@ -5093,6 +5908,13 @@ pub(crate) struct StandaloneShunt {
     /// Why clauth could not read the bind shunt would listen on; `None` when
     /// it read one, or when no config and no env override set one.
     pub(crate) unread_bind: Option<UnreadBind>,
+    /// Why the found config itself could not be read, whatever set the bind:
+    /// an env bind hides this from `unread_bind`, and the adopt offer still
+    /// needs it.
+    pub(crate) unread_config: Option<UnreadConfig>,
+    /// The running daemon holds the singleton but recorded no env, so the
+    /// bind its adopt would read is unknown and the card offers no adopt.
+    pub(crate) unread_env: bool,
     /// The version a shunt-shaped `/health` answer reported, and the address
     /// that answered; `None` when nothing shunt-shaped answered.
     pub(crate) answer: Option<(String, std::net::SocketAddr)>,
@@ -5125,6 +5947,34 @@ impl UnreadBind {
     }
 }
 
+/// Why clauth could not read a found config at all. An adopt of it can only
+/// fail, so the card offers none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadConfig {
+    /// The config is YAML, which clauth does not parse.
+    Yaml,
+    /// The config file could not be read.
+    Unreadable,
+}
+
+impl UnreadConfig {
+    fn label(self) -> &'static str {
+        match self {
+            UnreadConfig::Yaml => "yaml",
+            UnreadConfig::Unreadable => "unreadable",
+        }
+    }
+}
+
+impl From<UnreadConfig> for UnreadBind {
+    fn from(unread: UnreadConfig) -> Self {
+        match unread {
+            UnreadConfig::Yaml => UnreadBind::Yaml,
+            UnreadConfig::Unreadable => UnreadBind::Unreadable,
+        }
+    }
+}
+
 /// The standalone readout from a discovery result, the `SHUNT_SERVER__BIND`
 /// value and one `/health` probe: of the bind clauth reads off the found TOML
 /// config and the env, else of shunt's default. A bind clauth cannot read
@@ -5137,22 +5987,39 @@ pub(crate) fn standalone_readout_from(
 ) -> StandaloneShunt {
     let (found, config_text, unread_config) = match discovered {
         Ok(Some(path)) => match std::fs::read_to_string(&path) {
-            Ok(text) => (Some(path), text, None),
-            Err(_) => (Some(path), String::new(), Some(UnreadBind::Unreadable)),
+            // The adopt's own first step: a TOML name linked onto a YAML file
+            // reads here but refuses there, at its resolved target.
+            Ok(text) => match crate::gateway::GatewayRecord::new(path.clone()) {
+                Ok(_) => (Some(path), text, None),
+                Err(e) if e.is::<crate::gateway::NotToml>() => {
+                    (Some(path), String::new(), Some(UnreadConfig::Yaml))
+                }
+                Err(_) => (Some(path), String::new(), Some(UnreadConfig::Unreadable)),
+            },
+            Err(_) => (Some(path), String::new(), Some(UnreadConfig::Unreadable)),
         },
         Ok(None) => (None, String::new(), None),
         Err(e) => match e.downcast_ref::<crate::gateway::YamlConfig>() {
             Some(yaml) => (
                 Some(yaml.path.clone()),
                 String::new(),
-                Some(UnreadBind::Yaml),
+                Some(UnreadConfig::Yaml),
             ),
             None => (None, String::new(), None),
         },
     };
-    let (addr, unread_bind) = match crate::gateway::resolve_bind(&config_text, env_bind) {
+    let resolved = match env_bind.map(crate::gateway::read_bind_env).transpose() {
+        Ok(env) => crate::gateway::resolve_bind(&config_text, env.as_deref()),
+        Err(refusal) => Err(refusal.into()),
+    };
+    let (addr, unread_bind) = match resolved {
         // An env override is the bind shunt uses whatever the config says.
-        Ok(bind) => (bind.probe, unread_config.filter(|_| env_bind.is_none())),
+        Ok(bind) => (
+            bind.probe,
+            unread_config
+                .filter(|_| env_bind.is_none())
+                .map(UnreadBind::from),
+        ),
         Err(e) => {
             let reason = match env_bind {
                 Some(value) => UnreadBind::Value(format!("{}={value}", crate::gateway::BIND_ENV)),
@@ -5172,27 +6039,49 @@ pub(crate) fn standalone_readout_from(
     StandaloneShunt {
         found,
         unread_bind,
+        unread_config,
+        unread_env: false,
         answer,
     }
 }
 
-/// [`standalone_readout_from`] over this process's cwd and env: the Services
-/// worker's prober.
+/// [`standalone_readout_from`] over the bind env the adopt reads
+/// ([`crate::gateway::inherited_bind_env`]): a refused one leaves the bind
+/// unknown, so the readout probes the config's own bind and marks
+/// `unread_env`. Every refusal that reader returns is `DaemonEnvUnrecorded`.
+pub(crate) fn standalone_readout_with(
+    discovered: anyhow::Result<Option<std::path::PathBuf>>,
+    env_bind: anyhow::Result<Option<String>>,
+    probe: impl Fn(std::net::SocketAddr) -> anyhow::Result<crate::gateway::Health>,
+) -> StandaloneShunt {
+    let mut readout = standalone_readout_from(
+        discovered,
+        env_bind.as_ref().ok().and_then(Option::as_deref),
+        probe,
+    );
+    readout.unread_env = env_bind.is_err();
+    readout
+}
+
+/// The readout over this process's cwd and the adopt's bind env: the
+/// Services worker's prober.
 fn standalone_probe() -> StandaloneShunt {
-    standalone_readout_from(
+    standalone_readout_with(
         crate::gateway::discover_config(),
-        std::env::var(crate::gateway::BIND_ENV).ok().as_deref(),
+        crate::gateway::inherited_bind_env(),
         crate::gateway::probe_health,
     )
 }
 
 /// The `shunt` row: the managed gateway's status dot + readout, from the slot
 /// `gateway_slot` resolves (the daemon's feed, or the record-only verdict).
-/// Read-only — no actions — so no fix and no problems. Pure over the slot plus
-/// the `supervised` flag (whether the slot came from a fresh daemon's feed) so
-/// the verdict logic unit-tests without touching `status.json`. With no
-/// gateway adopted (`absent`) the state reads `not adopted` and the
-/// `standalone` readout, once probed, names what runs without clauth.
+/// The FIELD lines only — the action section (the `enabled` row, the admin
+/// fix, the codex pool note and the MOVE PLAN) is appended by [`shunt_card`],
+/// which also fills the focus walk. Pure over the slot plus the `supervised`
+/// flag (whether the slot came from a fresh daemon's feed) so the verdict
+/// logic unit-tests without touching `status.json`. With no gateway adopted
+/// (`absent`) the state reads `not adopted` and the `standalone` readout, once
+/// probed, names what runs without clauth.
 pub(crate) fn shunt_check(
     slot: &crate::daemon::gateway::GatewaySlot,
     supervised: bool,
@@ -5217,11 +6106,23 @@ pub(crate) fn shunt_check(
                 escape_control(&path.to_string_lossy())
             ));
         }
-        if let Some(unread) = standalone.and_then(|s| s.unread_bind.as_ref()) {
+        if standalone.is_some_and(|s| s.unread_env) {
+            detail.push("the running daemon recorded no environment; restart it".to_string());
+        }
+        let unread_bind = standalone.and_then(|s| s.unread_bind.as_ref());
+        if let Some(unread) = unread_bind {
             detail.push(format!(
                 "bind: not read ({})",
                 escape_control(&unread.label())
             ));
+        }
+        // An env bind, read or refused, hides the config's own reason from
+        // the bind line; this line names it, since the card offers no adopt.
+        if let Some(unread) = standalone
+            .and_then(|s| s.unread_config)
+            .filter(|unread| unread_bind != Some(&UnreadBind::from(*unread)))
+        {
+            detail.push(format!("config: not read ({})", unread.label()));
         }
         if let Some((version, addr)) = standalone.and_then(|s| s.answer.as_ref()) {
             // A `:` in the version, followed by a space of its own or the one
@@ -5232,6 +6133,10 @@ pub(crate) fn shunt_check(
                 escape_control(version).replace(':', "\\u{3a}")
             ));
         }
+    } else if slot.state == GatewayState::Held {
+        // `held` is the feed's word; the card states what it means: the
+        // daemon holds the gateway off until its next start.
+        detail.push("state: stopped until the daemon restarts".to_string());
     } else {
         detail.push(format!("state: {}", gateway_state_word(slot.state)));
     }
@@ -5279,10 +6184,13 @@ pub(crate) fn shunt_check(
         detail,
         fix: None,
         problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
-/// The gateway state's word — the same spelling `status.json` publishes.
+/// The gateway state's word — the same spelling `status.json` publishes,
+/// except `held`, which the card renders as its meaning (see [`shunt_check`]).
 fn gateway_state_word(state: GatewayState) -> &'static str {
     match state {
         GatewayState::Absent => "absent",
@@ -5322,6 +6230,402 @@ fn gateway_health(state: GatewayState) -> Health {
         | GatewayState::Disabled
         | GatewayState::Held
         | GatewayState::Unobserved => Health::Idle,
+    }
+}
+
+/// The full `shunt` card: [`shunt_check`]'s field lines, then the action
+/// section — the blank line, the `enabled` toggle row, the admin fix (its
+/// explanation line above it), the codex pool note (or `pool` error), and the
+/// MOVE PLAN section. Fills the card's [`Check::shunt_focus`] (the fix lines
+/// and the `enabled` row, the only actionable lines) and its list-focus
+/// [`Check::fix`].
+///
+/// `daemon_absent` is the header chip's no-daemon liveness (the same
+/// [`crate::daemon::DaemonHealth::Absent`] the `[ daemon ]` chip reads):
+/// alongside `record.disabled` and the slot states whose supervisor holds no
+/// child, it is what "off" is derived from, never the feed's freshness.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shunt_card(
+    slot: &crate::daemon::gateway::GatewaySlot,
+    supervised: bool,
+    daemon_absent: bool,
+    standalone: Option<&StandaloneShunt>,
+    record: Option<&crate::gateway::GatewayRecord>,
+    admin_need: Option<crate::gateway::AdminNeed>,
+    move_plan: Option<&MovePlanOutcome>,
+    pool: Option<&PoolOutcome>,
+) -> Check {
+    let mut check = shunt_check(slot, supervised, standalone);
+
+    // The "the daemon runs the gateway" note names the daemon only for a
+    // record the gateway WOULD run on with no daemon to run it (the
+    // `unobserved` verdict) — never for absent/disabled/no_config, where no
+    // gateway would run at all. It rides the field lines, before the action
+    // section, so the focus indices below stay true.
+    if !supervised && slot.state == GatewayState::Unobserved {
+        check.detail.push("the daemon runs the gateway".to_string());
+    }
+
+    if slot.state == GatewayState::Absent {
+        // `f  adopt config` sits directly under the absent card's lines, and
+        // only a readable TOML find whose bind clauth READ gets it: a YAML or
+        // unreadable find, an unreadable bind, or a daemon env clauth cannot
+        // read offers nothing, since the adopt would only ever fail.
+        let toml = standalone.and_then(|s| {
+            if s.unread_bind.is_none() && s.unread_config.is_none() && !s.unread_env {
+                s.found.as_ref()
+            } else {
+                None
+            }
+        });
+        if let Some(path) = toml {
+            check.shunt_action_start = Some(check.detail.len());
+            let line = check.detail.len();
+            check
+                .detail
+                .push(fix_line(&ServiceFix::AdoptConfig(path.clone())));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AdoptConfig(path.clone()),
+            });
+            check.fix = Some(ServiceFix::AdoptConfig(path.clone()));
+        }
+        return check;
+    }
+
+    let Some(record) = record else {
+        return check;
+    };
+
+    // `off` = the managed gateway cannot be answering on its bind: the record
+    // is `disabled`, no daemon holds the singleton, or the published slot is
+    // one in which the supervisor holds no child. That set, derived from
+    // `src/daemon/gateway.rs` at source: `idle_stops_child` names `absent`/
+    // `disabled`/`no_config`/`held`; the Idle intents `yaml_refused` and
+    // `misconfigured` publish only from the no-child path (a running child
+    // keeps its live slot, never `misconfigured`), and `binary_missing`,
+    // `below_floor` and `restarting` publish only after the child is gone
+    // (a spawn miss, a refused-and-held stop, the exit backoff). A `foreign`
+    // slot is never off (someone answers); a stale feed reads as unknown (a
+    // wedged daemon's gateway may still answer), so no MOVE PLAN.
+    let off = record.disabled
+        || daemon_absent
+        || matches!(
+            slot.state,
+            GatewayState::Disabled
+                | GatewayState::Held
+                | GatewayState::NoConfig
+                | GatewayState::YamlRefused
+                | GatewayState::Misconfigured
+                | GatewayState::BinaryMissing
+                | GatewayState::BelowFloor
+                | GatewayState::Restarting
+        );
+
+    check.shunt_action_start = Some(check.detail.len());
+    check.detail.push(String::new());
+
+    // `enabled` toggle row.
+    let line = check.detail.len();
+    check.detail.push("enabled".to_string());
+    check.shunt_focus.push(ShuntFocus::Enabled { line });
+
+    // The admin fix, its explanation line directly above the `f` line.
+    match admin_need {
+        Some(crate::gateway::AdminNeed::WriteKey) => {
+            check
+                .detail
+                .push("admin  clauth's key is not in [server.admin]".to_string());
+            let line = check.detail.len();
+            check.detail.push(fix_line(&ServiceFix::AddAdminKey));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AddAdminKey,
+            });
+        }
+        Some(crate::gateway::AdminNeed::AdminTable) => {
+            check
+                .detail
+                .push("admin  no [server.admin] table".to_string());
+            let line = check.detail.len();
+            check.detail.push(fix_line(&ServiceFix::AddAdminTable));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AddAdminTable,
+            });
+        }
+        Some(crate::gateway::AdminNeed::Neither) | None => {}
+    }
+
+    // The codex pool note, or the `pool` error in its place. Every provider
+    // name escapes control/bidi characters. These lines are short (and the
+    // `pool` error wraps), so they are not walk stops.
+    match pool {
+        Some(PoolOutcome::Providers(providers)) => {
+            for provider in providers {
+                check.detail.push(format!(
+                    "codex  provider {} needs its own pool login",
+                    escape_control(provider)
+                ));
+            }
+        }
+        Some(PoolOutcome::Error(error)) => {
+            check
+                .detail
+                .push(format!("pool  {}", escape_control(error)));
+        }
+        None => {}
+    }
+
+    // The MOVE PLAN section, only while a move is due (off, and the plan moves
+    // ≥1 file or refuses). A blank line precedes it (the herdr OPTIONS /
+    // Config-band spacing rule).
+    if off {
+        match move_plan {
+            Some(MovePlanOutcome::Plan(plan)) => {
+                check.detail.push(String::new());
+                check.detail.push("MOVE PLAN".to_string());
+                for file in &plan.moved {
+                    check
+                        .detail
+                        .push(format!("moves  {}", prose_path(&file.from)));
+                }
+                for kept in &plan.kept {
+                    check.detail.push(kept_line(kept));
+                }
+                let line = check.detail.len();
+                check.detail.push(fix_line(&ServiceFix::MoveStoresIn));
+                check.shunt_focus.push(ShuntFocus::Fix {
+                    line,
+                    fix: ServiceFix::MoveStoresIn,
+                });
+            }
+            Some(MovePlanOutcome::Refused(reason)) => {
+                check.detail.push(String::new());
+                check.detail.push("MOVE PLAN".to_string());
+                check
+                    .detail
+                    .push(format!("refused  {}", escape_control(reason)));
+            }
+            _ => {}
+        }
+    }
+
+    // The list-focus `f` is the card's first fix, never the `enabled` row.
+    check.fix = check.shunt_focus.iter().find_map(ShuntFocus::fix).cloned();
+    check
+}
+
+/// A path rendered inside a verbatim card line (a MOVE PLAN row): control and
+/// bidi characters spelled as their visible escape, everything else verbatim —
+/// the verbatim renderer never splits on `: `, so a Windows `C:` or a `: ` in
+/// the path passes through untouched.
+fn prose_path(path: &std::path::Path) -> String {
+    escape_control(&path.to_string_lossy())
+}
+
+/// One MOVE PLAN `stays`/`NoHome` row, in its rendered two-space form.
+fn kept_line(kept: &crate::gateway::KeptFile) -> String {
+    match kept {
+        crate::gateway::KeptFile::At { path, reason } => {
+            format!("stays  {}  {}", prose_path(path), kept_reason_word(*reason))
+        }
+        crate::gateway::KeptFile::NoHome { store } => {
+            format!("stays  {store}  no home to find it: set HOME in the env file")
+        }
+    }
+}
+
+/// The approved reason word for each [`crate::gateway::KeptReason`].
+fn kept_reason_word(reason: crate::gateway::KeptReason) -> &'static str {
+    match reason {
+        crate::gateway::KeptReason::LeftBehind => "not an account file",
+        crate::gateway::KeptReason::CodexLogin => "the codex CLI's own login",
+        crate::gateway::KeptReason::ClauthOwned => "already clauth's",
+        crate::gateway::KeptReason::HardLink => "linked under another name",
+        crate::gateway::KeptReason::LinkCountUnreadable => "link count unreadable",
+        crate::gateway::KeptReason::DuplicateSource => "named twice",
+    }
+}
+
+/// The move-plan worker's prober: reload the record and plan its store move.
+fn move_plan_probe() -> MovePlanOutcome {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return MovePlanOutcome::Unavailable;
+    };
+    match crate::gateway::plan_standalone_stores(&record) {
+        Ok(plan) if !plan.moved.is_empty() => MovePlanOutcome::Plan(plan),
+        Ok(_) => MovePlanOutcome::Nothing,
+        Err(e) => MovePlanOutcome::Refused(e.to_string()),
+    }
+}
+
+/// The pool worker's prober: reload the record and ask the gateway which
+/// `chatgpt_oauth` providers have no pool login.
+fn pool_probe() -> PoolOutcome {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return PoolOutcome::Providers(Vec::new());
+    };
+    match crate::gateway::chatgpt_oauth_providers_needing_login(&record) {
+        Ok(providers) => PoolOutcome::Providers(providers),
+        Err(e) => PoolOutcome::Error(e.to_string()),
+    }
+}
+
+/// The production action prober: run one confirmed shunt-card action to
+/// completion. The slow calls — the `/health` probe, the store plan, `shunt
+/// check` — never hold a frame here.
+fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
+    match job {
+        ShuntActionJob::Adopt { found } => run_adopt(&found),
+        ShuntActionJob::Move { record, confirmed } => run_move(&record, &confirmed),
+        ShuntActionJob::AddAdminKey { record } => {
+            run_admin_edit(&record, crate::gateway::AdminNeed::WriteKey)
+        }
+        ShuntActionJob::AddAdminTable { record } => {
+            run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable)
+        }
+    }
+}
+
+/// Adopt `found`: probe the candidate, plan its stores, and write the record
+/// (`disabled` while a move is due, enabled when nothing moves).
+fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
+    use crate::gateway::Health;
+    let candidate = match crate::gateway::GatewayRecord::new(found.to_path_buf()) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return ShuntActionOutcome::AdoptFailed {
+                error: e.to_string(),
+            };
+        }
+    };
+    let addr = match crate::gateway::gateway_probe(&candidate) {
+        Ok(addr) => addr,
+        Err(e) => {
+            return ShuntActionOutcome::AdoptFailed {
+                error: e.to_string(),
+            };
+        }
+    };
+    match crate::gateway::probe_health(addr) {
+        // A standalone shunt answers: refuse the adopt, write nothing.
+        Ok(Health::Shunt { version }) => {
+            return ShuntActionOutcome::AdoptRefused {
+                version: escape_control(&version),
+                addr,
+            };
+        }
+        Ok(Health::Silent(_) | Health::NotShunt { .. }) | Err(_) => {}
+    }
+    // The record stays `disabled` until the move lands: a plan with a file to
+    // move (or a refusal) leaves the gateway off so the daemon never starts it
+    // on empty stores; a plan with nothing to move adopts enabled.
+    let disabled = match crate::gateway::plan_standalone_stores(&candidate) {
+        Ok(plan) => !plan.moved.is_empty(),
+        Err(_) => true,
+    };
+    let mut record = candidate;
+    record.disabled = disabled;
+    let result = crate::gateway::GatewayRecord::update(|slot| {
+        if slot.is_some() {
+            // Another surface adopted a config meanwhile.
+            anyhow::bail!("a gateway is already adopted");
+        }
+        *slot = Some(record.clone());
+        Ok(())
+    });
+    match result {
+        Ok(()) => ShuntActionOutcome::Adopted {
+            path: escape_control(&found.to_string_lossy()),
+        },
+        Err(e) => ShuntActionOutcome::AdoptFailed {
+            error: e.to_string(),
+        },
+    }
+}
+
+/// Move a stopped standalone's stores in behind a fresh silent proof, then the
+/// record lands `disabled = false` so the daemon starts the gateway.
+fn run_move(
+    record: &crate::gateway::GatewayRecord,
+    confirmed: &crate::gateway::StoreMovePlan,
+) -> ShuntActionOutcome {
+    use crate::gateway::Health;
+    let addr = match crate::gateway::gateway_probe(record) {
+        Ok(addr) => addr,
+        Err(e) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: e.to_string(),
+            };
+        }
+    };
+    let proof = match crate::gateway::probe_health(addr) {
+        Ok(Health::Silent(proof)) => proof,
+        // A shunt answering is the orchestrator's composition of the adopt
+        // warning copy under the `move failed` head (flagged in the report).
+        Ok(Health::Shunt { version }) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: format!("shunt {} answers on {addr}", escape_control(&version)),
+            };
+        }
+        Ok(Health::NotShunt { status }) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: format!("something other than shunt answers on {addr} (status {status})"),
+            };
+        }
+        Err(e) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: e.to_string(),
+            };
+        }
+    };
+    match crate::gateway::move_standalone_stores(record, proof, confirmed) {
+        Ok(moved) => {
+            let disabled_off = crate::gateway::GatewayRecord::update(|slot| {
+                if let Some(held) = slot.as_mut() {
+                    held.disabled = false;
+                }
+                Ok(())
+            });
+            match disabled_off {
+                Ok(()) => ShuntActionOutcome::Moved {
+                    n: moved.moved.len(),
+                },
+                // The stores moved, so `moved <N> …` still shows; the record
+                // write failed, so the `save failed` toast follows it.
+                Err(e) => ShuntActionOutcome::MovedEnableFailed {
+                    n: moved.moved.len(),
+                    error: e.to_string(),
+                },
+            }
+        }
+        Err(e) => ShuntActionOutcome::MoveFailed {
+            error: e.to_string(),
+        },
+    }
+}
+
+/// Add clauth's admin write key (or a whole `[server.admin]` table) behind the
+/// engine's own `shunt check` gate.
+fn run_admin_edit(
+    record: &crate::gateway::GatewayRecord,
+    step: crate::gateway::AdminNeed,
+) -> ShuntActionOutcome {
+    let result = match step {
+        crate::gateway::AdminNeed::WriteKey => crate::gateway::add_admin_write_key(record),
+        crate::gateway::AdminNeed::AdminTable => crate::gateway::add_admin_table(record),
+        // Only offered when the config needs this exact step.
+        crate::gateway::AdminNeed::Neither => Ok(crate::gateway::AdminEdit::AlreadyPresent),
+    };
+    match result {
+        // Another writer added the key between the recompute and this worker:
+        // nothing was added, so no success toast (the recompute re-reads it).
+        Ok(crate::gateway::AdminEdit::AlreadyPresent) => ShuntActionOutcome::NoOp,
+        Ok(_) => ShuntActionOutcome::AdminAdded,
+        Err(e) => ShuntActionOutcome::AdminFailed {
+            error: e.to_string(),
+        },
     }
 }
 
@@ -5548,6 +6852,8 @@ fn plugin_check(
         detail,
         fix,
         problems,
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
@@ -10590,7 +11896,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                     if delegate_row_text { "on" } else { "off" }
                 ),
             );
-            recompute_services_checks(app, false);
+            recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
         Ok(notes) => {
             // Non-empty notes = pieces clauth refused to touch (a table it
@@ -10600,7 +11906,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                 ToastKind::Warning,
                 format!("herdr's config needs attention\n{}", notes.join("\n")),
             );
-            recompute_services_checks(app, false);
+            recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
         Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
     }
@@ -10768,7 +12074,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
                     // Reflect the new wiring in the rows without a fresh version probe.
-                    recompute_services_checks(app, false);
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
             }
@@ -10797,7 +12103,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     ToastKind::Warning,
                     "plugin install made no changes\ninstall claude code first, then try again",
                 );
-                recompute_services_checks(app, false);
+                recompute_services_checks(app, false, ShuntRefresh::Keep);
             }
             // Installed / Repaired / Adopted / Updated, or anything agentgear
             // adds later: a real change happened, so the success toast is
@@ -10806,7 +12112,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(outcome) => {
                 app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
                 // Reflect the fresh install in the rows without a version probe.
-                recompute_services_checks(app, false);
+                recompute_services_checks(app, false, ShuntRefresh::Keep);
             }
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
@@ -10856,6 +12162,36 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
             Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
         },
+        ConfirmAction::AdoptConfig(path) => {
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::Adopt { found: path });
+        }
+        ConfirmAction::MoveStoresIn(confirmed) => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                app.toast(ToastKind::Danger, "move failed\nno move plan to confirm");
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::Move { record, confirmed });
+        }
+        ConfirmAction::AddAdminKey => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::AddAdminKey { record });
+        }
+        ConfirmAction::AddAdminTable => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::AddAdminTable { record });
+        }
         ConfirmAction::Acknowledge => {}
     }
 }
@@ -11812,7 +13148,7 @@ fn poll_services_refresh(app: &mut App) {
         return;
     }
     app.last_services_refresh = Instant::now();
-    recompute_services_checks(app, false);
+    recompute_services_checks(app, false, ShuntRefresh::Keep);
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.
