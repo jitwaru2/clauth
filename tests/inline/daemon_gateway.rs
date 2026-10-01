@@ -556,6 +556,58 @@ impl Rig {
     fn touch(&self, name: &str) {
         fs::write(self.dir.join(name), "").expect("stub switch");
     }
+
+    /// Rewrite the `shunt` stub to also answer `check`, keeping the run path
+    /// [`stub::write_stub`] wrote and the fifo it made: a `run` behaves
+    /// exactly as before, while a `check` records one line per run in
+    /// `dir/checks` and exits by marker — `check-fail` exits 1 with one
+    /// stderr line, `check-slow` sleeps 60 s (for a timeout), else it exits 0.
+    fn arm_check_stub(&self) {
+        let script = format!(
+            "#!/bin/sh\n\
+             d='{d}'\n\
+             if [ \"$1\" = \"check\" ]; then\n\
+             \x20 echo check >> \"$d/checks\"\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
+             \x20 exit 0\n\
+             fi\n\
+             if [ -e \"$d/ignore-term\" ]; then\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"' TERM\n\
+             else\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"; trap - TERM; kill -s TERM $$' TERM\n\
+             fi\n\
+             {{\n\
+             \x20 echo \"pid $$\"\n\
+             \x20 echo \"bin $0\"\n\
+             \x20 for a in \"$@\"; do echo \"arg $a\"; done\n\
+             \x20 echo \"cwd $(pwd -P)\"\n\
+             \x20 env | grep -e '^SHUNT_' -e '^CODEX_AUTH_FILE=' -e '^CLAUDE_CREDENTIALS=' | LC_ALL=C sort | sed 's/^/env /'\n\
+             \x20 echo \"secret ${{GATEWAY_TEST_SECRET-}}\"\n\
+             \x20 echo end\n\
+             }} >> \"$d/calls\"\n\
+             echo \"gateway stub stdout $$\"\n\
+             echo \"gateway stub stderr $$\" >&2\n\
+             if [ ! -e \"$d/no-health\" ]; then exec 3>\"$d/fifo\"; fi\n\
+             i=0\n\
+             while [ \"$i\" -lt 120 ]; do\n\
+             \x20 sleep 1 3>&- &\n\
+             \x20 wait $!\n\
+             \x20 i=$((i + 1))\n\
+             done\n",
+            d = self.dir.display(),
+        );
+        fs::write(&self.binary, script).expect("arm the check stub");
+    }
+
+    /// The number of `check` runs the armed stub recorded.
+    fn check_runs(&self) -> usize {
+        fs::read_to_string(self.dir.join("checks"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count()
+    }
 }
 
 /// A supervisor whose gateway is killed and reaped when the test ends, red
@@ -1056,6 +1108,625 @@ fn a_changed_binary_stops_the_running_gateway_once_and_spawns_the_new_one_once()
             ..rig.described(GatewayState::Healthy)
         }
     );
+}
+
+/// The rig's config text with `[server.admin]` added after the bind table, so
+/// the same port and drain keep the spawn preparable while the admin-table
+/// fact flips.
+#[cfg(unix)]
+fn with_admin_table(rig: &Rig) -> String {
+    format!(
+        "[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n",
+        port = rig.port
+    )
+}
+
+/// The rig's config text with clauth's own `[server.admin]` entry — the shape
+/// [`crate::gateway::add_admin_table`] writes: a table plus a `write_keys`
+/// entry carrying clauth's id and `${file:}` key reference.
+#[cfg(unix)]
+fn with_clauth_admin_table(rig: &Rig) -> String {
+    let key_ref = format!(
+        "${{file:{}}}",
+        rig.home
+            .home()
+            .join(".clauth")
+            .join("gateway-admin-token")
+            .display()
+    );
+    format!(
+        "[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"{key_ref}\"\n",
+        port = rig.port
+    )
+}
+
+/// A config that gains `[server.admin]` after the child spawned restarts it
+/// with the normal stop: one SIGTERM to the old run, one spawn on the changed
+/// config, no crash counted and `restarts` unchanged. The first stub ignores
+/// SIGTERM, so the `terms` pin counts every signal it got.
+#[cfg(unix)]
+#[test]
+fn a_config_gaining_the_admin_table_restarts_the_gateway_once_without_a_restart_count() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("ignore-term");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let first = rig.only_call();
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a config that gained [server.admin] restarts the child"
+    );
+
+    stub::wait_until("the first stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
+    supervisor.step(t0.after(secs(14)));
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(14)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first.pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+}
+
+/// An edit that does not gain the table (another key changed) keeps the
+/// child: only the one fact the ruling names forces the restart.
+#[cfg(unix)]
+#[test]
+fn an_edit_that_does_not_gain_the_admin_table_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 3\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "an edit that keeps the table absent keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for an unrelated edit");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A re-read that does not parse is no evidence: the child keeps running (the
+/// "a record that does not load keeps a running gateway" precedent).
+#[cfg(unix)]
+#[test]
+fn a_config_that_becomes_unparseable_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, "[server\nbind = \"127.0.0.1:1\"\n").expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "an unparseable re-read is no evidence and keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for an unparseable config");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A config that had the table at spawn and still has it keeps the child: a
+/// table REMOVED since spawn is out of the ruling and also does not restart.
+#[cfg(unix)]
+#[test]
+fn a_config_that_had_the_admin_table_at_spawn_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a table held since spawn keeps the child"
+    );
+    assert!(
+        stub::alive(pid),
+        "never stopped for a table it spawned with"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// The stop line for an admin-table restart names its cause distinctly from a
+/// record change, so `daemon.log` says why.
+#[cfg(unix)]
+#[test]
+fn the_admin_table_restart_names_its_cause() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Stopping);
+    let stop_line = format!(
+        "clauth daemon: stopping the shunt gateway (pid {pid}): its config gained [server.admin]"
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == stop_line)
+            .count(),
+        1,
+        "the log line names the cause distinctly from a record change"
+    );
+}
+
+/// A gained table whose `shunt check` refuses keeps the child, logs the
+/// refusal once (the daemon's own words, never the check's stderr), and does
+/// not re-run the check while the bytes stay unchanged within the re-check
+/// bound.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_whose_check_is_refused_keeps_the_child_and_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a gained table whose check is refused keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a refused check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a refused check");
+    assert_eq!(rig.check_runs(), 1, "one check for the gained table");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config gained [server.admin], but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, in the daemon's own words"
+    );
+
+    // Unchanged bytes within the re-check bound: the memo keeps the check
+    // from re-running.
+    supervisor.step(t0.after(secs(3)));
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(rig.check_runs(), 1, "an unchanged config is not re-checked");
+    assert_eq!(rig.calls().len(), 1, "still no respawn");
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across the memoized rounds"
+    );
+}
+
+/// The same refused config, then fixed (bytes change, check passes): the
+/// changed bytes are re-checked and the child restarts exactly once.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_refused_then_fixed_restarts_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "the refused check keeps the child");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+
+    // The user finishes the edit: the bytes change and the check now passes.
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+    fs::write(&rig.config, with_clauth_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a fixed config whose check passes restarts the child"
+    );
+    assert_eq!(rig.check_runs(), 2, "the changed bytes are re-checked once");
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(4)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A `shunt check` that outruns its bound keeps the child: the restart is
+/// gated on the check passing, and a wedged check is a refusal.
+#[cfg(unix)]
+#[test]
+fn a_check_that_times_out_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-slow");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let _short = crate::gateway::CheckTimeoutOverride::set(Duration::from_millis(200));
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a timed-out check keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a timed-out check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a timed-out check");
+    assert_eq!(rig.check_runs(), 1, "one check ran");
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config gained [server.admin], but `{} check --config {}` ran past 200ms and was stopped; keeping the running gateway until the check passes; run that command to see why it does not finish",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the timeout is logged once, in the daemon's own words"
+    );
+}
+
+/// A refusal fixed only through the stub's answer (the config bytes
+/// unchanged) is re-checked once the re-check bound elapses on the harness's
+/// clock, never before, and restarts exactly once.
+#[cfg(unix)]
+#[test]
+fn a_refusal_fixed_through_the_stub_restarts_once_the_bound_elapses() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "the refused check keeps the child");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+
+    // Fix only what the stub answers; the config bytes stay byte-identical.
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+
+    supervisor.step(t0.after(secs(61)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "no restart before the re-check bound elapses"
+    );
+    assert_eq!(rig.check_runs(), 1, "no re-check before the bound");
+
+    // The bound elapses 60 s after the refusal (at 2 s): the unchanged bytes
+    // are re-checked, the check now passes, and the child restarts once.
+    supervisor.step(t0.after(secs(62)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a fixed check restarts once the bound elapses"
+    );
+    assert_eq!(
+        rig.check_runs(),
+        2,
+        "the unchanged bytes are re-checked after the bound"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(63)),
+        GatewayState::Starting,
+    );
+    assert_eq!(rig.calls().len(), 2, "respawned exactly once");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// An unchanged refusal re-checked after each bound still logs once: the
+/// refusal line is logged when its text differs from the last one for this
+/// child, never once per re-check.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_refusal_rechecked_twice_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert_eq!(rig.check_runs(), 1, "the first check");
+
+    // Two re-checks, one per elapsed bound, each still refused.
+    supervisor.step(t0.after(secs(62)));
+    assert_eq!(rig.check_runs(), 2, "re-checked once the bound elapses");
+    supervisor.step(t0.after(secs(63)));
+    assert_eq!(
+        rig.check_runs(),
+        2,
+        "the bound restarts at each re-check, never one check per round"
+    );
+    supervisor.step(t0.after(secs(122)));
+    assert_eq!(rig.check_runs(), 3, "re-checked again a bound later");
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "never stopped for an unchanged refusal");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config gained [server.admin], but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, not once per re-check"
+    );
+}
+
+/// A `shunt check` whose binary is gone keeps the child and logs the missing
+/// binary by path, in the daemon's own words.
+#[cfg(unix)]
+#[test]
+fn a_missing_check_binary_keeps_the_child_and_names_the_binary() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    // The binary the child already runs as is gone by the time the check
+    // would run: the running child is unaffected, the check finds nothing.
+    fs::remove_file(&rig.binary).expect("remove the binary");
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a missing check binary keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a missing binary");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config gained [server.admin], but {} is not there to check it; keeping the running gateway until the check passes",
+        rig.binary.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the missing binary is logged once, by path"
+    );
+}
+
+/// A check cancelled before it starts — the cancel flag already set — yields
+/// the cancellation outcome (never a timeout) and never restarts the child.
+#[cfg(unix)]
+#[test]
+fn a_check_cancelled_before_it_starts_is_cancelled_not_a_timeout_and_never_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-slow");
+
+    // By value: a cancel already set when the check starts yields the
+    // cancellation outcome, never `CheckTimedOut`.
+    {
+        let mut record = GatewayRecord::new(rig.config.clone()).expect("adoptable");
+        record.binary = Some(rig.binary.clone());
+        record.env_file = Some(rig.env_file.clone());
+        let cancel = AtomicBool::new(true);
+        let _short = crate::gateway::CheckTimeoutOverride::set(Duration::from_millis(200));
+        let err = crate::gateway::check_adopted_config(&record, &cancel)
+            .expect_err("a cancelled check refuses");
+        assert_eq!(
+            err.downcast_ref::<crate::gateway::ConfigEditRefusal>(),
+            None,
+            "the cancellation is not a ConfigEditRefusal, never CheckTimedOut"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("{} was cancelled while it ran", rig.binary.display()),
+            "the cancellation outcome by value"
+        );
+    }
+
+    // Through the gate: a cancel already set keeps the child silently.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut supervisor = Supervised(Supervisor::build_with_cancel(
+        Gateway::for_daemon(),
+        Arc::clone(&rig.handle),
+        Arc::clone(&cancel),
+    ));
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    cancel.store(true, Ordering::SeqCst);
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a check cancelled before it starts never restarts the child"
+    );
+    assert!(stub::alive(pid), "the child stays alive");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+    assert!(
+        !rig.lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("keeping")),
+        "a cancelled check is silent, never a refusal line"
+    );
+}
+
+/// A gained table shaped as clauth's own entry (the shape `add_admin_table`
+/// writes) reads as a table and restarts: `has_admin_table` answers the
+/// table's presence, never the admin step.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_shaped_as_clauths_own_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+
+    fs::write(&rig.config, with_clauth_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a table shaped as clauth's own entry restarts the child"
+    );
+    assert_eq!(rig.check_runs(), 1, "the gain is gated on one check");
+}
+
+/// A child spawned while `[server.admin]` was not a table (mark `None`) does
+/// not restart when the table later appears: a `None` mark at spawn is no
+/// evidence.
+#[cfg(unix)]
+#[test]
+fn a_config_whose_admin_shape_was_not_a_table_at_spawn_does_not_restart_on_a_gained_table() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\nadmin = \"not-a-table\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a None spawn mark is no evidence and keeps the child"
+    );
+    assert!(
+        stub::alive(pid),
+        "never stopped for a table gained after a None mark"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+    assert_eq!(rig.check_runs(), 0, "no check runs for a None mark");
 }
 
 /// The stop bound is the drain shunt runs with plus its 5 s blocking grace and

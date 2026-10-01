@@ -40,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use super::log_rotate::{LOG_KEEP_BYTES, LOG_MAX_BYTES, rotate_log_if_large};
@@ -60,6 +61,13 @@ use crate::usage::{epoch_secs_to_iso, now_ms};
 /// second, a state change shows within one feed write, and an exit is noticed
 /// within one.
 pub(crate) const SUPERVISE_POLL: Duration = Duration::from_secs(1);
+
+/// How soon a still-refused `shunt check` of a gained `[server.admin]` is
+/// re-run. The memo is keyed on the config's bytes alone, so a refusal fixed
+/// through the check's other inputs — the env file, a `${file:}` key file,
+/// the shunt binary — reads as unchanged bytes; this bound is the only way
+/// such a fix eventually re-checks and lets the restart through.
+const REFUSED_RECHECK: Duration = Duration::from_secs(60);
 
 /// How often a running child, a foreign answerer on its port, or a start
 /// that could not spawn is looked at again. A healthy probe is a loopback
@@ -311,6 +319,19 @@ pub(crate) fn unsupervised_slot() -> GatewaySlot {
 
 // ── the machine ─────────────────────────────────────────────────────────────
 
+/// What gating a [`Supervised::respawn_mark_why`] gain asks for: whether the
+/// kind's own check of the record clears the respawn now.
+pub(crate) enum GateRespawn {
+    /// Stop and respawn at once.
+    Respawn,
+    /// Keep the child and log `reason`, already the full message body.
+    Keep { reason: String },
+    /// Keep the child silently: the same config bytes already refused and
+    /// re-checked too soon, a shutdown cancelled the check, or the refusal
+    /// line is unchanged from the one already logged for this child.
+    KeepMemoized,
+}
+
 /// One supervised kind: the per-kind decisions the generic machine defers to.
 /// [`Gateway`] implements it for the shunt gateway,
 /// [`crate::daemon::proxies::Proxy`] for a clauth proxy.
@@ -432,6 +453,37 @@ pub(crate) trait Supervised: Clone + Send + 'static {
     /// Whether `a` and `b` differ on what a running child was spawned over.
     fn respawn_inputs_changed(&self, a: &Self::Record, b: &Self::Record) -> bool;
 
+    /// Capture the spawn-time fact a respawn round re-reads (the gateway's
+    /// `[server.admin]` presence); `None` for a kind with none.
+    fn spawn_mark(&self, _record: &Self::Record) -> Option<bool> {
+        None
+    }
+
+    /// Whether `mark`, captured at spawn, gained a restart-only fact since:
+    /// `Some(why)` asks for a respawn, `None` keeps the child (unchanged, or
+    /// an unreadable re-read, which is no evidence). Defaults to `None`.
+    fn respawn_mark_why(&self, _record: &Self::Record, _mark: Option<bool>) -> Option<String> {
+        None
+    }
+
+    /// Whether a [`Supervised::respawn_mark_why`] gain should respawn now.
+    /// `Respawn` stops and respawns; `Keep` keeps the child and logs `reason`
+    /// (already the full message body); `KeepMemoized` keeps it silently. The
+    /// `memo` carries the last refusal's config-bytes digest and instant, so
+    /// an unchanged re-read is not re-checked until [`REFUSED_RECHECK`] has
+    /// passed, and the refusal line last logged, so a re-check that refuses
+    /// with the same text stays silent. Defaults to `Respawn`: a kind with no
+    /// restart-only fact never reaches the gate.
+    fn gate_respawn(
+        &self,
+        _record: &Self::Record,
+        _memo: &mut RefusedCheck,
+        _now: Instant,
+        _cancel: &AtomicBool,
+    ) -> GateRespawn {
+        GateRespawn::Respawn
+    }
+
     /// Classify a probe answer against the running child.
     fn classify_child(
         &self,
@@ -552,7 +604,25 @@ pub(crate) struct Running<K: Supervised> {
     contract: Option<String>,
     stop_bound: Duration,
     pub(crate) identity: Identity<K>,
+    spawn_mark: Option<bool>,
+    /// The last refused `shunt check` of the gained `[server.admin]`: its
+    /// config-bytes digest, the instant it refused, and the refusal line
+    /// logged. Cleared with the child it belongs to.
+    refused_check: RefusedCheck,
     stop: Option<Stop<K>>,
+}
+
+/// The state [`Supervised::gate_respawn`] carries about a child's last
+/// refused `shunt check`, so the memo survives the round and the re-check
+/// bound and log dedup are enforced per child.
+#[derive(Default)]
+pub(crate) struct RefusedCheck {
+    /// The digest of the config bytes whose check last refused.
+    digest: Option<[u8; 32]>,
+    /// When the check last refused.
+    at: Option<Instant>,
+    /// The refusal line last logged for this child.
+    line: Option<String>,
 }
 
 impl<K: Supervised> Running<K> {
@@ -579,8 +649,9 @@ enum AfterStop<K: Supervised> {
     /// The child was refused (below floor, a contract major mismatch, a
     /// manifest refusal); publish `slot` and hold until something changes.
     Refused { why: String, slot: K::Slot },
-    /// The record's spawn inputs changed; spawn it afresh on them at once.
-    Respawn,
+    /// A respawn input changed (the record's, or a restart-only fact of the
+    /// kind); spawn afresh at once.
+    Respawn { why: String },
     /// The daemon is exiting.
     Shutdown,
 }
@@ -852,15 +923,39 @@ impl<K: Supervised> Supervisor<K> {
             // the last one clauth knows.
             Intent::Idle(_) => {}
             Intent::Unchanged => {}
-            Intent::Run(record)
+            Intent::Run(record) => {
                 if self
                     .kind
-                    .respawn_inputs_changed(record, &running.identity.record) =>
-            {
-                self.begin_stop(AfterStop::Respawn, tick);
-                return None;
+                    .respawn_inputs_changed(record, &running.identity.record)
+                {
+                    self.begin_stop(
+                        AfterStop::Respawn {
+                            why: self.kind.respawn_why(),
+                        },
+                        tick,
+                    );
+                    return None;
+                }
+                if let Some(why) = self.kind.respawn_mark_why(record, running.spawn_mark) {
+                    match self.kind.gate_respawn(
+                        record,
+                        &mut running.refused_check,
+                        tick.at,
+                        &self.cancel,
+                    ) {
+                        GateRespawn::Respawn => {
+                            self.begin_stop(AfterStop::Respawn { why }, tick);
+                            return None;
+                        }
+                        GateRespawn::Keep { reason } => {
+                            logline!("clauth daemon: {reason}");
+                        }
+                        GateRespawn::KeepMemoized => {}
+                    }
+                    // A refused or memoized gain keeps the child and its
+                    // health probe: only a cleared check stops it here.
+                }
             }
-            Intent::Run(_) => {}
         }
         if tick.at >= running.next_probe {
             Some(StepWants::Child {
@@ -933,7 +1028,7 @@ impl<K: Supervised> Supervisor<K> {
         let why = match &then {
             AfterStop::Idle(slot) => self.kind.idle_stop_why(slot),
             AfterStop::Refused { why, .. } => why.clone(),
-            AfterStop::Respawn => self.kind.respawn_why(),
+            AfterStop::Respawn { why } => why.clone(),
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
         logline!(
@@ -983,9 +1078,9 @@ impl<K: Supervised> Supervisor<K> {
                 self.held = Some(running.identity);
                 self.set(slot, tick);
             }
-            Some(AfterStop::Respawn) => {
+            Some(AfterStop::Respawn { .. }) => {
                 logline!(
-                    "clauth daemon: {} (pid {}) stopped ({report}); starting it on the changed record",
+                    "clauth daemon: {} (pid {}) stopped ({report}); starting it afresh",
                     self.kind.name(),
                     running.pid
                 );
@@ -1102,6 +1197,9 @@ impl<K: Supervised> Supervisor<K> {
             ForeignVerdict::Spawn => {
                 let stop_bound = self.kind.stop_bound(&record, &prepared);
                 self.log_skipped(&record, &prepared);
+                // Read before the spawn, so a save landing while the child
+                // boots can only cause a needless restart, never a missed one.
+                let spawn_mark = self.kind.spawn_mark(&record);
                 let child = match self.kind.spawn(&record, &prepared, log) {
                     Ok(child) => child,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1138,6 +1236,8 @@ impl<K: Supervised> Supervisor<K> {
                     contract: None,
                     stop_bound,
                     identity,
+                    spawn_mark,
+                    refused_check: RefusedCheck::default(),
                     stop: None,
                 };
                 if let Err(e) = Self::write_marker(&self.kind, &running.marker(None)) {
@@ -1728,6 +1828,60 @@ impl Supervised for Gateway {
         spawn_inputs(a) != spawn_inputs(b)
     }
 
+    fn spawn_mark(&self, record: &GatewayRecord) -> Option<bool> {
+        crate::gateway::has_admin_table(record.config()).ok()
+    }
+
+    fn respawn_mark_why(&self, record: &GatewayRecord, mark: Option<bool>) -> Option<String> {
+        if mark == Some(false)
+            && crate::gateway::has_admin_table(record.config()).ok() == Some(true)
+        {
+            Some("its config gained [server.admin]".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn gate_respawn(
+        &self,
+        record: &GatewayRecord,
+        memo: &mut RefusedCheck,
+        now: Instant,
+        cancel: &AtomicBool,
+    ) -> GateRespawn {
+        let digest = std::fs::read(record.config())
+            .ok()
+            .map(|bytes| <[u8; 32]>::from(Sha256::digest(&bytes)));
+        if let Some(digest) = &digest
+            && memo.digest.as_ref() == Some(digest)
+            && memo
+                .at
+                .is_some_and(|at| now.saturating_duration_since(at) < REFUSED_RECHECK)
+        {
+            return GateRespawn::KeepMemoized;
+        }
+        match crate::gateway::check_adopted_config(record, cancel) {
+            Ok(()) => GateRespawn::Respawn,
+            Err(e) => {
+                // A shutdown set the flag while the check ran: it was
+                // cancelled, not refused, so nothing is logged or memoized.
+                if cancel.load(Ordering::Acquire) {
+                    return GateRespawn::KeepMemoized;
+                }
+                memo.digest = digest;
+                memo.at = Some(now);
+                let reason = refusal_line(&self.name(), &e);
+                // A re-check that refuses with the same text stays silent:
+                // the refusal was already logged for this child.
+                if memo.line.as_deref() == Some(reason.as_str()) {
+                    return GateRespawn::KeepMemoized;
+                }
+                memo.line = Some(reason.clone());
+                GateRespawn::Keep { reason }
+            }
+        }
+    }
+
     fn classify_child(
         &self,
         running: &Running<Gateway>,
@@ -1824,6 +1978,47 @@ impl Supervised for Gateway {
 
     fn respawn_why(&self) -> String {
         "its config, binary or env file changed".to_string()
+    }
+}
+
+/// The refusal line for a gained `[server.admin]` whose check refused, in the
+/// daemon's own words: what the child waits on and why. Never the check's
+/// stderr, which can quote env-file values.
+fn refusal_line(name: &str, e: &anyhow::Error) -> String {
+    let gained = format!("{name}'s config gained [server.admin]");
+    match e.downcast_ref::<crate::gateway::ConfigEditRefusal>() {
+        Some(crate::gateway::ConfigEditRefusal::ShuntMissing { binary }) => format!(
+            "{gained}, but {binary} is not there to check it; keeping the running gateway until the check passes",
+            binary = binary.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckTimedOut {
+            binary,
+            config,
+            after,
+        }) => format!(
+            "{gained}, but `{binary} check --config {config}` ran past {after:?} and was stopped; keeping the running gateway until the check passes; run that command to see why it does not finish",
+            binary = binary.display(),
+            config = config.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckFailed {
+            binary,
+            config,
+            code,
+            ..
+        }) => {
+            let status = match code {
+                Some(code) => format!("exit {code}"),
+                None => "killed by a signal".to_string(),
+            };
+            format!(
+                "{gained}, but `{binary} check --config {config}` refused it ({status}); keeping the running gateway until the check passes; run that command to see why",
+                binary = binary.display(),
+                config = config.display()
+            )
+        }
+        _ => format!(
+            "{gained}, but its check could not run: {e:#}; keeping the running gateway until the check passes"
+        ),
     }
 }
 

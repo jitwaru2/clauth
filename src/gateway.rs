@@ -1883,6 +1883,27 @@ pub(crate) fn admin_need(config: &Path) -> Result<AdminNeed> {
     admin_need_of(&read_config_text(config)?, &admin_key_ref()?)
 }
 
+/// Whether the parsed config holds a `[server.admin]` table, whatever its
+/// `write_keys` content: the fact the supervisor re-reads is the table's
+/// presence, not which admin step it needs. `Err` only when the file cannot
+/// be read, does not parse, or `[server]`/`[server.admin]` is not a table.
+pub(crate) fn has_admin_table(config: &Path) -> Result<bool> {
+    let doc = parse_config(&read_config_text(config)?)?;
+    let Some(server) = doc.get("server") else {
+        return Ok(false);
+    };
+    let server = server
+        .as_table_like()
+        .ok_or(ConfigEditRefusal::UnexpectedShape { what: SERVER_SHAPE })?;
+    let Some(admin) = server.get("admin") else {
+        return Ok(false);
+    };
+    admin
+        .as_table_like()
+        .ok_or(ConfigEditRefusal::UnexpectedShape { what: ADMIN_SHAPE })?;
+    Ok(true)
+}
+
 /// [`admin_need`] over a config's text and clauth's `${file:}` reference.
 fn admin_need_of(text: &str, key_ref: &str) -> Result<AdminNeed> {
     Ok(need_in(&parse_config(text)?, key_ref)?)
@@ -2142,6 +2163,7 @@ fn write_checked(record: &GatewayRecord, original: &[u8], candidate: &str) -> Re
         config,
         gateway_cwd(record)?,
         &env,
+        None,
     )?;
     let now =
         std::fs::read(config).with_context(|| format!("failed to re-read {}", config.display()))?;
@@ -2211,13 +2233,16 @@ impl Drop for CheckTimeoutOverride {
 
 /// `<binary> check --config <candidate>` in `cwd` under `env`, bounded by
 /// [`CHECK_TIMEOUT`]: a check that outruns it is killed and reaped, it being
-/// clauth's own child, and the edit refuses.
+/// clauth's own child, and the edit refuses. `cancel`, when given, preempts
+/// the bound: a flag set when the check starts (or while it runs) cancels it
+/// at once instead of waiting it out.
 fn run_check(
     binary: &Path,
     candidate: &Path,
     config: &Path,
     cwd: &Path,
     env: &GatewayEnv,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut command = Command::new(binary);
     command
@@ -2227,7 +2252,7 @@ fn run_check(
         .current_dir(cwd);
     env.apply(&mut command);
     let bound = check_timeout();
-    let exited = match run_bounded(&mut command, binary, bound, None)? {
+    let exited = match run_bounded_impl(&mut command, binary, bound, None, cancel)? {
         Bounded::Missing => {
             return Err(ConfigEditRefusal::ShuntMissing {
                 binary: binary.to_path_buf(),
@@ -2254,6 +2279,25 @@ fn run_check(
         stderr: CheckStderr(String::from_utf8_lossy(&exited.stderr()).trim().to_string()),
     }
     .into())
+}
+
+/// `shunt check` on the adopted config as it now stands, through the same
+/// [`run_check`] the edit path uses (env and cwd built exactly as
+/// [`write_checked`]'s check does), with the caller's `cancel` so a daemon
+/// shutdown preempts a wedged check instead of waiting [`CHECK_TIMEOUT`] out.
+/// Refusals carry the same [`ConfigEditRefusal`] the edit path maps.
+pub(crate) fn check_adopted_config(
+    record: &GatewayRecord,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    run_check(
+        record.shunt_binary(),
+        record.config(),
+        record.config(),
+        gateway_cwd(record)?,
+        &gateway_env(record)?,
+        Some(cancel),
+    )
 }
 
 /// How a [`run_bounded`] child ended.
