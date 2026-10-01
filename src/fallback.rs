@@ -1772,7 +1772,7 @@ pub(crate) fn next_target(
         order
             .iter()
             .copied()
-            .find(|&i| !skip(i) && config.find(&chain[i]).is_some_and(&accept))
+            .find(|&i| !skip(i) && config.find(&chain[i]).is_some_and(accept))
             .map(|i| chain[i].to_string())
     };
 
