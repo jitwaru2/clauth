@@ -14,7 +14,7 @@
 
 #![expect(
     dead_code,
-    reason = "`write_hold`/`remove_hold` are C5's `stop shunt` verb, not yet called; `GatewayEnv::get` and `CheckStderr::text` are surfaces no caller reaches yet"
+    reason = "`GatewayEnv::get` and `CheckStderr::text` are surfaces no caller reaches yet"
 )]
 
 use std::collections::{BTreeMap, HashSet};
@@ -921,6 +921,79 @@ pub(crate) fn inherited_bind_env() -> Result<Option<String>> {
 pub(crate) fn gateway_probe(record: &GatewayRecord) -> Result<SocketAddr> {
     let env = gateway_env(record)?;
     Ok(gateway_bind_in(record, &env, inherited_env()?.0)?.probe)
+}
+
+/// The gateway's bind for a display read on the UI thread: the adopted config
+/// and its env file over the running daemon's recorded env, that record
+/// matched to the singleton holder by pid alone ([`recorded_env_for_holder_pid`])
+/// so no process is spawned. With no holder, or no record naming it, the
+/// files alone decide.
+pub(crate) fn displayed_gateway_bind(record: &GatewayRecord) -> Result<GatewayBind> {
+    let env = gateway_env(record)?;
+    gateway_bind_in(
+        record,
+        &env,
+        recorded_env_for_holder_pid().unwrap_or_default(),
+    )
+}
+
+/// The running daemon's recorded env, matched to the singleton holder by pid
+/// alone: the start-time half of [`DaemonIdentity`] spawns `ps` or PowerShell
+/// off linux, which a UI-thread read must not. A record a dead daemon left
+/// under a pid the holder reuses passes this match, so it feeds display reads
+/// only, never the plan or the move ([`inherited_env`]).
+fn recorded_env_for_holder_pid() -> Option<Vec<(OsString, OsString)>> {
+    if !crate::daemon::singleton_held().ok()? {
+        return None;
+    }
+    let pid = crate::daemon::holder_pid()?;
+    let record = read_env_record().ok()??;
+    if record.identity.pid != pid {
+        return None;
+    }
+    recorded_pairs(&record).ok()
+}
+
+/// Whether `url` (a profile's `base_url`) names the gateway bound at `bind`:
+/// an `http`/`https` URL whose port, written or the scheme's default, is the
+/// bind's, and whose host is the probe address, or `localhost` while that
+/// address is loopback, or the unspecified address of the probe's family. A
+/// wildcard bind is named through its loopback probe address only; a LAN
+/// address of the box reaching it does not count.
+pub(crate) fn url_names_bind(url: &str, bind: &GatewayBind) -> bool {
+    let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+        return false;
+    };
+    let default_port = match uri.scheme_str() {
+        Some(scheme) if scheme.eq_ignore_ascii_case("http") => 80,
+        Some(scheme) if scheme.eq_ignore_ascii_case("https") => 443,
+        Some(_) | None => return false,
+    };
+    if uri.port_u16().unwrap_or(default_port) != bind.probe.port() {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    // `Uri::host` keeps an IPv6 literal's brackets.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return bind.probe.ip().is_loopback();
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    // A connect to the unspecified address reaches the loopback listener on
+    // linux and macOS, so it names the gateway as loopback does.
+    let ip = match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) if v4.is_unspecified() => Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(v6) if v6.is_unspecified() => Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    ip == bind.probe.ip().to_canonical()
 }
 
 /// The env override shunt's figment layer maps onto

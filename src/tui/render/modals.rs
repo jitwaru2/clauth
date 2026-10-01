@@ -334,6 +334,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::BlankCredentials(_)
             | ConfirmAction::DeleteLiveSession(_)
             | ConfirmAction::AddAdminTable
+            | ConfirmAction::StopShunt
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
@@ -344,6 +345,8 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::AdoptConfig(_) => "adopt".to_string(),
         ConfirmAction::MoveStoresIn(_) => "move".to_string(),
         ConfirmAction::AddAdminKey | ConfirmAction::AddAdminTable => "add".to_string(),
+        ConfirmAction::StartDaemon => "start".to_string(),
+        ConfirmAction::StopShunt => "stop".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -353,6 +356,18 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     ))];
     if let Some(detail) = &state.detail {
         lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
+    }
+    // The daemon-start confirm's command span is ACCENT inside a dim line,
+    // which a plain `detail` string cannot carry.
+    if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
+        lines.push(Line::from(vec![
+            Span::styled("spawns the clauth daemon detached: ", theme::dim()),
+            Span::styled("clauth daemon", theme::accent()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "logfile at ~/.clauth/daemon.log.",
+            theme::dim(),
+        )));
     }
     lines.push(Line::from(""));
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.

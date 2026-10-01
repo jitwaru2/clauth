@@ -4548,6 +4548,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("refresh all accounts", Some('f')),
             ("new account", Some('n')),
             ("start daemon", Some('s')),
+            ("start shunt", None),
         ]
     );
 
@@ -4562,6 +4563,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("toggle estimates", Some('e')),
             ("toggle pace marker", Some('p')),
             ("start daemon", Some('s')),
+            ("start shunt", None),
         ]
     );
 
@@ -4575,6 +4577,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("refresh all accounts", Some('f')),
             ("new account", Some('n')),
             ("start daemon", Some('s')),
+            ("start shunt", Some('t')),
         ]
     );
 }
@@ -4609,10 +4612,22 @@ fn every_tab_offers_the_daemon_verb_that_applies() {
             app.daemon_health = health;
             app.daemon_control_busy = false;
             let menu = build_action_menu(&app);
+            // The shunt verb, when one applies, sits directly after the daemon
+            // verb, so the daemon verb is no longer last.
+            let daemon_idx = menu
+                .items
+                .iter()
+                .rposition(|i| i.label.ends_with(" daemon"));
+            let shunt_idx = menu.items.iter().position(|i| i.label.ends_with(" shunt"));
             assert_eq!(
-                menu.items.last().map(|i| i.label),
+                daemon_idx.map(|i| menu.items[i].label),
                 Some(verb),
                 "{tab:?} with the daemon {health:?}"
+            );
+            assert_eq!(
+                shunt_idx,
+                daemon_idx.map(|i| i + 1),
+                "{tab:?}: the shunt verb follows the daemon verb"
             );
             assert!(
                 menu.scoped_len < menu.items.len(),
@@ -4704,11 +4719,22 @@ fn daemon_control_outcomes_toast_and_rearm_the_verb() {
 /// the sandbox.
 #[test]
 fn the_daemon_verbs_reach_their_workers() {
-    use super::{ActionMenuAction, dispatch_action_menu_action, join_test_workers};
+    use super::{ActionMenuAction, ConfirmAction, dispatch_action_menu_action, join_test_workers};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
 
+    // `start daemon` opens the shared confirm now; its `start` runs the start.
     dispatch_action_menu_action(&mut app, ActionMenuAction::StartDaemon);
+    let Some(super::Modal::Confirm(state)) = app.modals.last() else {
+        panic!("start daemon must open the confirm, got {:?}", app.modals);
+    };
+    assert_eq!(state.message, "start daemon?");
+    assert!(
+        matches!(state.on_confirm, ConfirmAction::StartDaemon),
+        "the confirm's start runs start_daemon"
+    );
+    app.modals.pop();
+    super::run_confirm_action(&mut app, ConfirmAction::StartDaemon);
     assert_eq!(
         app.toasts.back().map(|t| t.body.as_str()),
         Some("daemon start failed\na test build starts no daemon")
@@ -4734,6 +4760,696 @@ fn the_daemon_verbs_reach_their_workers() {
         "the tick drains the worker's outcome"
     );
     assert!(!app.daemon_control_busy);
+}
+
+// ── C5: the `a`-menu shunt verb + the shared daemon-start confirm ────────────
+
+/// Pin the app's daemon health and re-read the gateway slot under it, as the
+/// throttled poll does.
+fn set_daemon(app: &mut App, health: crate::daemon::DaemonHealth) {
+    app.daemon_health = health;
+    super::sync_gateway_state(app);
+}
+
+/// Drain the Services probes until the shunt action in flight lands.
+fn drain_shunt_action(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.shunt_action.running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shunt action did not land"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_service_probes(app);
+    }
+    super::drain_service_probes(app);
+}
+
+/// The confirm on top, or a panic naming what is open instead.
+fn top_confirm(app: &App) -> &super::ConfirmState {
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => state,
+        other => panic!("expected a confirm, got {other:?}"),
+    }
+}
+
+/// The verb table, first match wins: a running gateway under a fresh daemon
+/// stops; an absent or disabled gateway jumps; a no-daemon box opens the
+/// daemon-start confirm; a held gateway releases; the rest offer nothing. All
+/// through `build_action_menu`.
+#[test]
+fn the_shunt_verb_table_holds_per_state_and_health() {
+    use super::build_action_menu;
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::profile::Profile;
+
+    let cases: &[(DaemonHealth, S, Option<&str>)] = &[
+        // Running gateway under a fresh daemon: stop (the hold).
+        (DaemonHealth::Fresh, S::Starting, Some("stop shunt")),
+        (DaemonHealth::Fresh, S::Healthy, Some("stop shunt")),
+        (DaemonHealth::Fresh, S::Unhealthy, Some("stop shunt")),
+        (DaemonHealth::Fresh, S::Restarting, Some("stop shunt")),
+        // Absent: jump to the adopt line, any health.
+        (DaemonHealth::Fresh, S::Absent, Some("start shunt")),
+        (DaemonHealth::Stale, S::Absent, Some("start shunt")),
+        (DaemonHealth::Absent, S::Absent, Some("start shunt")),
+        // Disabled: jump to the enabled row, any health.
+        (DaemonHealth::Fresh, S::Disabled, Some("start shunt")),
+        (DaemonHealth::Stale, S::Disabled, Some("start shunt")),
+        (DaemonHealth::Absent, S::Disabled, Some("start shunt")),
+        // No daemon, whatever the record: the daemon-start confirm.
+        (DaemonHealth::Absent, S::Unobserved, Some("start shunt")),
+        (DaemonHealth::Absent, S::NoConfig, Some("start shunt")),
+        (DaemonHealth::Absent, S::YamlRefused, Some("start shunt")),
+        (DaemonHealth::Absent, S::Misconfigured, Some("start shunt")),
+        // Held: release.
+        (DaemonHealth::Fresh, S::Held, Some("start shunt")),
+        // The rest offer nothing.
+        (DaemonHealth::Fresh, S::Foreign, None),
+        (DaemonHealth::Fresh, S::BelowFloor, None),
+        (DaemonHealth::Fresh, S::Misconfigured, None),
+        (DaemonHealth::Fresh, S::Stopping, None),
+        (DaemonHealth::Fresh, S::NoConfig, None),
+        (DaemonHealth::Fresh, S::YamlRefused, None),
+        (DaemonHealth::Fresh, S::BinaryMissing, None),
+        (DaemonHealth::Fresh, S::Unobserved, None),
+        (DaemonHealth::Stale, S::Unobserved, None),
+        (DaemonHealth::Stale, S::NoConfig, None),
+        (DaemonHealth::Stale, S::YamlRefused, None),
+        (DaemonHealth::Stale, S::Misconfigured, None),
+    ];
+
+    for &(health, state, expected) in cases {
+        let home = crate::testutil::HomeSandbox::new();
+        match health {
+            DaemonHealth::Fresh => crate::testutil::write_daemon_gateway_slot(&home, state),
+            DaemonHealth::Stale | DaemonHealth::Absent => match state {
+                S::Absent => {}
+                S::Disabled => {
+                    crate::testutil::write_adopted_record(&home, true, "[server]\n");
+                }
+                S::Unobserved => {
+                    crate::testutil::write_adopted_record(&home, false, "[server]\n");
+                }
+                S::NoConfig => {
+                    let record = crate::testutil::write_adopted_record(&home, false, "[server]\n");
+                    std::fs::remove_file(record.config()).unwrap();
+                }
+                // A record naming a YAML config, and one that does not parse.
+                S::YamlRefused | S::Misconfigured => {
+                    let dir = home.home().join(".clauth");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let yaml = home.home().join("etc").join("shunt.yaml");
+                    let body = if state == S::YamlRefused {
+                        format!("config = {:?}\n", yaml.display().to_string())
+                    } else {
+                        "config = 3\n".to_string()
+                    };
+                    std::fs::write(dir.join("gateway.toml"), body).unwrap();
+                }
+                other => panic!("unreachable record-only state {other:?}"),
+            },
+        }
+        let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+        app.profile_cursor = 0;
+        set_daemon(&mut app, health);
+        assert_eq!(app.gateway_state, state, "the fixture reads as {state:?}");
+        let shunt_verbs: Vec<&str> = build_action_menu(&app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .filter(|l| l.ends_with(" shunt"))
+            .collect();
+        let expected: Vec<&str> = expected.into_iter().collect();
+        assert_eq!(
+            shunt_verbs, expected,
+            "{health:?} with the gateway {state:?}"
+        );
+    }
+}
+
+/// The shunt verb sits directly after the daemon verb on every tab, and is
+/// gone while a shunt action is in flight; the daemon-start row also yields
+/// none while a daemon control runs.
+#[test]
+fn the_shunt_verb_follows_the_daemon_verb_and_gates_on_in_flight() {
+    use super::{Tab, build_action_menu};
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState as S;
+    use crate::profile::Profile;
+
+    // A fresh daemon running a healthy gateway: stop shunt after stop daemon.
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+        let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+        app.profile_cursor = 0;
+        set_daemon(&mut app, DaemonHealth::Fresh);
+        for tab in Tab::ALL {
+            app.tab = tab;
+            let labels: Vec<&str> = build_action_menu(&app)
+                .items
+                .iter()
+                .map(|i| i.label)
+                .collect();
+            let daemon_idx = labels
+                .iter()
+                .position(|l| l.ends_with(" daemon"))
+                .unwrap_or_else(|| panic!("{tab:?}: a daemon verb"));
+            assert_eq!(
+                labels.get(daemon_idx + 1).copied(),
+                Some("stop shunt"),
+                "{tab:?}: stop shunt directly after stop daemon"
+            );
+        }
+
+        // In flight: no shunt verb while a shunt action runs.
+        app.tab = Tab::Overview;
+        app.services.shunt_action.running = true;
+        assert!(
+            !build_action_menu(&app)
+                .items
+                .iter()
+                .any(|i| i.label.ends_with(" shunt")),
+            "no shunt verb while a shunt action runs"
+        );
+        app.services.shunt_action.running = false;
+    }
+
+    // The daemon-start row yields none while a daemon control runs.
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\n");
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    set_daemon(&mut app, DaemonHealth::Absent);
+    assert_eq!(app.gateway_state, S::Unobserved);
+    app.daemon_control_busy = true;
+    assert!(
+        !build_action_menu(&app)
+            .items
+            .iter()
+            .any(|i| i.label.ends_with(" shunt")),
+        "the daemon-start row yields none while a daemon control runs"
+    );
+}
+
+/// The one Services detail row carrying the caret after a jump, drawn the way
+/// the TUI draws it.
+fn caret_row(app: &App) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    let rows: Vec<String> = crate::testutil::buffer_rows(term.backend().buffer())
+        .into_iter()
+        .filter(|row| row.contains('❯'))
+        .collect();
+    assert_eq!(rows.len(), 1, "one caret on screen: {rows:#?}");
+    rows.into_iter().next().unwrap_or_default()
+}
+
+/// `start shunt` on an absent gateway jumps to the Services shunt card with the
+/// `f  adopt config` line focused and its caret drawn; a card with no adopt
+/// line (a YAML find) lands with the descend rule's focus (none).
+#[test]
+fn start_shunt_on_an_absent_gateway_jumps_to_the_adopt_line() {
+    use super::{
+        ActionMenuAction, ServicesFocus, ShuntFocusLine, StandaloneShunt, Tab,
+        dispatch_action_menu_action,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.standalone = Some(StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: None,
+        unread_config: None,
+        unread_env: false,
+        answer: None,
+    });
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+
+    assert_eq!(app.tab, Tab::Services, "lands on the Services tab");
+    let shunt_idx = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "shunt")
+        .expect("a shunt row");
+    assert_eq!(app.services.cursor, shunt_idx, "the shunt row selected");
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "descended");
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(ShuntFocusLine::Adopt),
+        "the adopt line focused"
+    );
+    let row = caret_row(&app);
+    assert!(
+        row.contains("❯ f  adopt config"),
+        "the caret sits on the adopt line: {row:?}"
+    );
+
+    // A YAML find offers no adopt line: the focus is the descend rule's (none).
+    let mut app = bare_app();
+    app.services.standalone = Some(StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.yaml")),
+        unread_bind: Some(super::UnreadBind::Yaml),
+        unread_config: Some(super::UnreadConfig::Yaml),
+        unread_env: false,
+        answer: None,
+    });
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    assert_eq!(app.tab, Tab::Services);
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "still descended");
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        None,
+        "no adopt line: the descend rule leaves focus none"
+    );
+}
+
+/// `start shunt` on a disabled gateway jumps to the `enabled` row, caret drawn,
+/// and never flips the record.
+#[test]
+fn start_shunt_on_a_disabled_gateway_jumps_to_the_enabled_row_without_flipping_it() {
+    use super::{ActionMenuAction, ServicesFocus, ShuntFocusLine, dispatch_action_menu_action};
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, true, "[server]\n");
+    let mut app = bare_app();
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    assert_eq!(app.tab, super::Tab::Services);
+    let shunt_idx = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "shunt")
+        .expect("a shunt row");
+    assert_eq!(app.services.cursor, shunt_idx, "the shunt row selected");
+    assert_eq!(app.services.focus, ServicesFocus::Detail, "descended");
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(ShuntFocusLine::Enabled),
+        "the enabled row focused"
+    );
+    let row = caret_row(&app);
+    assert!(
+        row.contains("❯ enabled"),
+        "the caret sits on the enabled row: {row:?}"
+    );
+    assert!(
+        crate::gateway::GatewayRecord::load()
+            .unwrap()
+            .unwrap()
+            .disabled,
+        "the record is untouched"
+    );
+}
+
+/// A no-daemon `start shunt` opens the shared daemon-start confirm; `esc` and
+/// `enter` on the focused `cancel` close it without reaching `start_daemon`,
+/// and `start` reaches it (which a test build refuses, by name).
+#[test]
+fn a_no_daemon_start_shunt_opens_the_daemon_start_confirm() {
+    use super::{
+        ActionMenuAction, ConfirmAction, KeyCode, dispatch_action_menu_action, handle_confirm_key,
+    };
+    const REFUSED: &str = "daemon start failed\na test build starts no daemon";
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\n");
+    let mut app = bare_app();
+    let open = |app: &mut App| {
+        dispatch_action_menu_action(app, ActionMenuAction::StartShunt);
+        let state = top_confirm(app);
+        assert_eq!(
+            (
+                state.message.as_str(),
+                state.detail.as_deref(),
+                state.choice
+            ),
+            ("start daemon?", None, false),
+            "the shared confirm, cancel focused"
+        );
+        assert!(matches!(state.on_confirm, ConfirmAction::StartDaemon));
+    };
+
+    open(&mut app);
+    handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc closes the confirm");
+    assert!(
+        app.toasts.iter().all(|t| t.body != REFUSED),
+        "esc never reaches start_daemon: {:?}",
+        app.toasts
+    );
+
+    open(&mut app);
+    handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.modals.is_empty(), "cancel closes the confirm");
+    assert!(
+        app.toasts.iter().all(|t| t.body != REFUSED),
+        "cancel never reaches start_daemon: {:?}",
+        app.toasts
+    );
+
+    open(&mut app);
+    handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some(REFUSED),
+        "start reaches start_daemon"
+    );
+}
+
+/// Through the menu: `stop shunt` opens its confirm, whose `stop` writes the
+/// hold naming this process (a held daemon lock + pid stamp); once the feed
+/// reports `held`, `start shunt` removes it with no confirm.
+#[test]
+fn the_shunt_hold_verbs_write_and_remove_the_hold_through_the_menu() {
+    use super::{ActionMenuAction, ConfirmAction, KeyCode, ToastKind, dispatch_action_menu_action};
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState as S;
+    let home = crate::testutil::HomeSandbox::new();
+    let _held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+
+    let mut app = bare_app();
+    app.services.shunt_action.prober = Some(super::run_shunt_action);
+    set_daemon(&mut app, DaemonHealth::Fresh);
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+    let state = top_confirm(&app);
+    assert_eq!(state.message, "stop shunt?");
+    assert!(matches!(state.on_confirm, ConfirmAction::StopShunt));
+    assert!(
+        !app.services.shunt_action.running,
+        "nothing runs before the confirm's stop"
+    );
+    super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+    super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert!(app.services.shunt_action.running, "stop starts the hold");
+    drain_shunt_action(&mut app);
+    let hold = crate::gateway::hold_path().expect("hold path");
+    let identity: crate::gateway::DaemonIdentity =
+        serde_json::from_slice(&std::fs::read(&hold).unwrap()).unwrap();
+    assert_eq!(
+        identity.pid,
+        std::process::id(),
+        "the hold names this process"
+    );
+    assert_eq!(
+        identity.start,
+        crate::daemon::gateway::process_start_time(std::process::id()),
+        "and this process start time"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((
+            ToastKind::Success,
+            "shunt stopped\nit stays off until the daemon restarts"
+        ))
+    );
+
+    crate::testutil::write_daemon_gateway_slot(&home, S::Held);
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    assert!(app.modals.is_empty(), "a release opens no confirm");
+    assert!(
+        app.services.shunt_action.running,
+        "start starts the release"
+    );
+    drain_shunt_action(&mut app);
+    assert!(!hold.exists(), "the hold file is removed");
+    assert_eq!(
+        app.toasts.back().map(|t| (t.kind, t.body.as_str())),
+        Some((ToastKind::Success, "shunt starting"))
+    );
+}
+
+/// A pick re-derives the verb from the slot at pick time: one whose label
+/// changed under the open menu, or that vanished, toasts and runs nothing,
+/// the stop confirm's `stop` included; a `start shunt` whose effect changed
+/// acts on the new state.
+#[test]
+fn a_shunt_pick_acts_on_the_state_at_pick_time() {
+    use super::{
+        ActionMenuAction, KeyCode, ServicesFocus, ShuntFocusLine, ToastKind,
+        dispatch_action_menu_action,
+    };
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState as S;
+    const CHANGED: (ToastKind, &str) = (
+        ToastKind::Info,
+        "the shunt gateway changed; open the menu again",
+    );
+    let last_toast = |app: &App| app.toasts.back().map(|t| (t.kind, t.body.clone()));
+    let changed_owned = Some((CHANGED.0, CHANGED.1.to_string()));
+
+    {
+        let home = crate::testutil::HomeSandbox::new();
+        crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+        let mut app = bare_app();
+        app.services.shunt_action.prober = Some(super::run_shunt_action);
+        set_daemon(&mut app, DaemonHealth::Fresh);
+
+        // `stop shunt` picked while the gateway went `stopping`: no verb now.
+        crate::testutil::write_daemon_gateway_slot(&home, S::Stopping);
+        dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+        assert!(app.modals.is_empty(), "no confirm for a vanished verb");
+        assert!(!app.services.shunt_action.running, "nothing runs");
+        assert_eq!(last_toast(&app), changed_owned);
+
+        // `start shunt` (the release) picked while the gateway runs again: the
+        // verb is `stop shunt` now.
+        crate::testutil::write_daemon_gateway_slot(&home, S::Healthy);
+        app.toasts.clear();
+        dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+        assert!(app.modals.is_empty());
+        assert!(!app.services.shunt_action.running, "nothing runs");
+        assert_eq!(last_toast(&app), changed_owned);
+
+        // The stop confirm's `stop` re-checks: the gateway went `stopping`
+        // while it sat open.
+        dispatch_action_menu_action(&mut app, ActionMenuAction::StopShunt);
+        assert_eq!(top_confirm(&app).message, "stop shunt?");
+        crate::testutil::write_daemon_gateway_slot(&home, S::Stopping);
+        app.toasts.clear();
+        super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Char('y')));
+        super::handle_confirm_key(&mut app, crate::testutil::key(KeyCode::Enter));
+        assert!(!app.services.shunt_action.running, "no hold is written");
+        assert_eq!(last_toast(&app), changed_owned);
+    }
+
+    // `start shunt` offered for an absent gateway, picked once the record is
+    // adopted `disabled`: it jumps to the `enabled` row, the state at pick time.
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    set_daemon(&mut app, DaemonHealth::Absent);
+    assert_eq!(app.gateway_state, S::Absent);
+    crate::testutil::write_adopted_record(&home, true, "[server]\n");
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartShunt);
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(ShuntFocusLine::Enabled),
+        "the jump the new state names"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .all(|t| (t.kind, t.body.as_str()) != CHANGED),
+        "the same label acts without a toast: {:?}",
+        app.toasts
+    );
+}
+
+/// `stop shunt?` leads its detail with the live sessions whose current account's
+/// `base_url` names the gateway's bind, singular at 1; the clause is gone at 0,
+/// and when the tally or the gateway record cannot be read.
+#[test]
+fn the_stop_confirm_counts_the_sessions_on_the_gateway() {
+    use crate::live_sessions::LiveTally;
+    use crate::profile::Profile;
+    use crate::testutil::live_row;
+    const DRAIN: &str =
+        "in-flight requests drain, then the gateway stays off until the daemon restarts.";
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, false, "[server]\nbind = \"127.0.0.1:3067\"\n");
+    let profile = |name: &str, url: Option<&str>| {
+        Profile::new(name.to_string(), url.map(str::to_string), None)
+    };
+    let mut app = app_with(vec![
+        profile("gw", Some("http://127.0.0.1:3067")),
+        profile("gw-local", Some("http://localhost:3067/")),
+        profile("other-port", Some("http://127.0.0.1:4000")),
+        profile("plain", None),
+    ]);
+    let detail = |app: &mut App, tally: LiveTally| {
+        app.live_sessions = tally;
+        app.modals.clear();
+        super::open_shunt_stop_confirm(app);
+        let state = top_confirm(app);
+        assert_eq!(state.message, "stop shunt?");
+        state.detail.clone()
+    };
+
+    let mut swapped_off = live_row("s4", "gw");
+    swapped_off.current_member = Some("plain".to_string());
+    let mut swapped_on = live_row("s5", "plain");
+    swapped_on.current_member = Some("gw".to_string());
+    assert_eq!(
+        detail(
+            &mut app,
+            LiveTally::of([
+                live_row("s1", "gw"),
+                live_row("s2", "gw-local"),
+                live_row("s3", "other-port"),
+                swapped_off,
+                swapped_on,
+            ])
+        ),
+        Some(format!("3 live sessions use it; {DRAIN}")),
+        "s1, s2 and s5 run on the gateway now; s3 and s4 do not"
+    );
+    assert_eq!(
+        detail(&mut app, LiveTally::of([live_row("s1", "gw")])),
+        Some(format!("1 live session uses it; {DRAIN}"))
+    );
+    assert_eq!(
+        detail(&mut app, LiveTally::of([live_row("s3", "other-port")])),
+        Some(DRAIN.to_string())
+    );
+    assert_eq!(
+        detail(&mut app, LiveTally::partly_read([live_row("s1", "gw")])),
+        Some(DRAIN.to_string()),
+        "a tally that could not read every dir shows no count"
+    );
+
+    // The port is the running gateway's: a bind edited to 4000 since its spawn
+    // moves nothing until a restart, so the slot's 3067 still counts.
+    let record = crate::gateway::GatewayRecord::load().unwrap().unwrap();
+    std::fs::write(record.config(), "[server]\nbind = \"127.0.0.1:4000\"\n").unwrap();
+    let feed = serde_json::json!({
+        "gateway": {
+            "state": crate::daemon::gateway::GatewayState::Healthy,
+            "port": 3067,
+            "floor": "0.48.0",
+            "restarts": 0,
+        }
+    });
+    std::fs::write(
+        home.home().join(".clauth").join("status.json"),
+        feed.to_string(),
+    )
+    .unwrap();
+    app.daemon_health = crate::daemon::DaemonHealth::Fresh;
+    assert_eq!(
+        detail(&mut app, LiveTally::of([live_row("s1", "gw")])),
+        Some(format!("1 live session uses it; {DRAIN}")),
+        "the slot's port, never the edited config's"
+    );
+    app.daemon_health = crate::daemon::DaemonHealth::Absent;
+    std::fs::remove_file(home.home().join(".clauth").join("gateway.toml")).unwrap();
+    assert_eq!(
+        detail(&mut app, LiveTally::of([live_row("s1", "gw")])),
+        Some(DRAIN.to_string()),
+        "no record, no bind to count against"
+    );
+}
+
+/// The cached gateway state is read at construction and follows the slot on
+/// the throttled daemon poll, on a landed daemon control and on a Services
+/// recompute, so the menu never reads a state the disk left.
+#[test]
+fn the_cached_gateway_state_follows_every_sync_site() {
+    use crate::daemon::gateway::GatewayState as S;
+    let home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_adopted_record(&home, true, "[server]\n");
+    let mut app = bare_app();
+    assert_eq!(app.gateway_state, S::Disabled, "construction read the slot");
+
+    let set_disabled = |disabled: bool| {
+        crate::gateway::GatewayRecord::update(|slot| {
+            if let Some(record) = slot.as_mut() {
+                record.disabled = disabled;
+            }
+            Ok(())
+        })
+        .unwrap();
+    };
+
+    set_disabled(false);
+    app.last_daemon_probe = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    super::poll_daemon_health(&mut app);
+    assert_eq!(
+        app.gateway_state,
+        S::Unobserved,
+        "the poll re-read the slot"
+    );
+
+    set_disabled(true);
+    app.daemon_control_tx
+        .send(super::DaemonControlResult::Stop(Ok(
+            crate::daemon::DaemonStop::NotRunning,
+        )))
+        .expect("send");
+    super::drain_daemon_control(&mut app);
+    assert_eq!(
+        app.gateway_state,
+        S::Disabled,
+        "a landed daemon control re-read the slot"
+    );
+
+    set_disabled(false);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert_eq!(
+        app.gateway_state,
+        S::Unobserved,
+        "a Services recompute re-read the slot"
+    );
+}
+
+/// The hold's success and failure toasts, kind and body.
+#[test]
+fn the_shunt_hold_toasts_follow_the_outcome() {
+    use super::{ShuntActionOutcome as O, ToastKind};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    for (outcome, kind, body) in [
+        (
+            O::Held,
+            ToastKind::Success,
+            "shunt stopped\nit stays off until the daemon restarts",
+        ),
+        (
+            O::HoldFailed {
+                error: "boom".to_string(),
+            },
+            ToastKind::Danger,
+            "shunt stop failed\nboom",
+        ),
+        (O::Released, ToastKind::Success, "shunt starting"),
+        (
+            O::ReleaseFailed {
+                error: "boom".to_string(),
+            },
+            ToastKind::Danger,
+            "shunt start failed\nboom",
+        ),
+    ] {
+        app.toasts.clear();
+        super::handle_shunt_action_outcome(&mut app, outcome);
+        assert_eq!(
+            app.toasts
+                .iter()
+                .map(|t| (t.kind, t.body.as_str()))
+                .collect::<Vec<_>>(),
+            [(kind, body)]
+        );
+    }
 }
 
 /// Usage `r` and the action menu's "refresh usage" share one gate. A generic
@@ -9529,6 +10245,7 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
             "toggle cache counting",
             "reload stats",
             "start daemon",
+            "start shunt",
         ]
     );
 
@@ -11713,6 +12430,7 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
                 ("save as preset", Some('s')),
                 ("apply preset", Some('p')),
                 ("start daemon", Some('t')),
+                ("start shunt", None),
             ],
             "{focus:?} carries the account-scoped trio, then the daemon verb",
         );
@@ -11729,7 +12447,11 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
             .iter()
             .map(|i| (i.label, i.hotkey))
             .collect::<Vec<_>>(),
-        [("apply preset", Some('p')), ("start daemon", Some('s'))],
+        [
+            ("apply preset", Some('p')),
+            ("start daemon", Some('s')),
+            ("start shunt", Some('t')),
+        ],
         "`+ new` offers apply preset, then the daemon verb",
     );
     assert_eq!(menu.scoped_len, 1);
@@ -14994,7 +15716,12 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     );
     assert_eq!(
         menu.items.iter().map(|i| i.label).collect::<Vec<_>>(),
-        ["refresh all accounts", "new account", "start daemon"]
+        [
+            "refresh all accounts",
+            "new account",
+            "start daemon",
+            "start shunt"
+        ]
     );
     app.modals.clear();
 

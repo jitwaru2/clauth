@@ -1314,6 +1314,45 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
     }
 }
 
+/// Write `~/.clauth/status.json` carrying a daemon `gateway` slot in `state`,
+/// so `daemon::gateway_slot(DaemonHealth::Fresh)` reads it.
+pub(crate) fn write_daemon_gateway_slot(
+    home: &HomeSandbox,
+    state: crate::daemon::gateway::GatewayState,
+) {
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "gateway": {
+            "state": state,
+            "floor": "0.48.0",
+            "restarts": 0,
+        }
+    });
+    std::fs::write(dir.join("status.json"), body.to_string()).unwrap();
+}
+
+/// Adopt a `shunt.toml` holding `config_text` into `~/.clauth/gateway.toml`
+/// with `disabled`, returning the record so a caller can delete its config for
+/// the `no_config` verdict.
+pub(crate) fn write_adopted_record(
+    home: &HomeSandbox,
+    disabled: bool,
+    config_text: &str,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, config_text).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = disabled;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    record
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing

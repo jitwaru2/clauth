@@ -887,6 +887,11 @@ pub(crate) enum ConfirmAction {
     /// Services tab: add a `[server.admin]` table carrying clauth's key (the
     /// gateway restarts once to register its admin routes).
     AddAdminTable,
+    /// The shared daemon-start confirm's `start`: spawn `<this binary> daemon`
+    /// detached.
+    StartDaemon,
+    /// `stop shunt?`'s `stop`: the transient hold, if the verb still applies.
+    StopShunt,
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -1104,6 +1109,12 @@ pub(crate) enum ActionMenuAction {
     StartDaemon,
     /// `--replace`'s termination with no successor, offered while one runs.
     StopDaemon,
+    /// The `start shunt` verb; the effect re-derives from the gateway slot at
+    /// dispatch (jump to the card, the daemon-start confirm, or a hold release).
+    StartShunt,
+    /// The `stop shunt` verb: a transient hold while a fresh daemon runs the
+    /// gateway.
+    StopShunt,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -1243,6 +1254,8 @@ impl ActionMenuAction {
             Self::OpenProviderConsole => "open provider console",
             Self::StartDaemon => "start daemon",
             Self::StopDaemon => "stop daemon",
+            Self::StartShunt => "start shunt",
+            Self::StopShunt => "stop shunt",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1901,6 +1914,11 @@ pub(crate) enum ShuntActionJob {
     AddAdminTable {
         record: crate::gateway::GatewayRecord,
     },
+    /// `stop shunt`: write the gateway hold naming the daemon that holds the
+    /// singleton now.
+    Hold,
+    /// `start shunt` on a held gateway: remove the hold.
+    RemoveHold,
 }
 
 /// The result of one shunt-card action, drained on the tick into a toast and a
@@ -1932,6 +1950,16 @@ pub(crate) enum ShuntActionOutcome {
     },
     AdminAdded,
     AdminFailed {
+        error: String,
+    },
+    /// `stop shunt` landed: the hold file names the running daemon.
+    Held,
+    HoldFailed {
+        error: String,
+    },
+    /// `start shunt` on a held gateway released the hold.
+    Released,
+    ReleaseFailed {
         error: String,
     },
     /// The worker panicked, or no action was started: no toast, just a
@@ -2669,6 +2697,10 @@ pub(crate) struct App {
     /// instead would render `Absent` — "no daemon runs" — as fact for the whole
     /// first interval, and the first paint happens before any `on_tick`.
     pub(crate) last_daemon_probe: Instant,
+    /// The gateway slot's state under `daemon_health`, re-read beside it and
+    /// whenever a daemon control, a shunt action or a Services recompute
+    /// lands ([`sync_gateway_state`]). UI-thread-only.
+    pub(crate) gateway_state: GatewayState,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -3080,6 +3112,7 @@ impl App {
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
         let live_sessions = crate::live_sessions::LiveTally::collect(&config);
+        let daemon_health = crate::daemon::daemon_health();
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -3154,7 +3187,8 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
-            daemon_health: crate::daemon::daemon_health(),
+            daemon_health,
+            gateway_state: crate::daemon::gateway_slot(daemon_health).0.state,
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -5594,6 +5628,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
     // and the admin need are cheap local reads on the recompute; the store
     // move plan and the codex pool read run on workers.
     let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    app.gateway_state = gateway_slot.state;
     if gateway_slot.state == GatewayState::Absent {
         // The readout's bind comes from the env the adopt reads, which a
         // daemon start or stop flips.
@@ -5861,6 +5896,27 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
             app.toast(
                 ToastKind::Danger,
                 format!("admin key failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::Held => {
+            app.toast(
+                ToastKind::Success,
+                "shunt stopped\nit stays off until the daemon restarts",
+            );
+        }
+        ShuntActionOutcome::HoldFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("shunt stop failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::Released => {
+            app.toast(ToastKind::Success, "shunt starting");
+        }
+        ShuntActionOutcome::ReleaseFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("shunt start failed\n{}", escape_control(&error)),
             );
         }
         ShuntActionOutcome::NoOp => {}
@@ -6493,6 +6549,20 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
         ShuntActionJob::AddAdminTable { record } => {
             run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable)
         }
+        // The cause chain rides the toast: a hold write names its path in the
+        // context and why it failed only in the io error under it.
+        ShuntActionJob::Hold => match crate::gateway::write_hold() {
+            Ok(()) => ShuntActionOutcome::Held,
+            Err(e) => ShuntActionOutcome::HoldFailed {
+                error: format!("{e:#}"),
+            },
+        },
+        ShuntActionJob::RemoveHold => match crate::gateway::remove_hold() {
+            Ok(()) => ShuntActionOutcome::Released,
+            Err(e) => ShuntActionOutcome::ReleaseFailed {
+                error: format!("{e:#}"),
+            },
+        },
     }
 }
 
@@ -9200,8 +9270,87 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             crate::daemon::DaemonHealth::Stale | crate::daemon::DaemonHealth::Fresh => StopDaemon,
         });
     }
+    // Directly after it, the shunt verb that applies — never while a shunt
+    // action is in flight, and the daemon-start row also yields none while a
+    // daemon control runs (the daemon verb's own rule).
+    if let Some(verb) = shunt_verb(app) {
+        actions.push(verb.action());
+    }
 
     ActionMenuState::new(scoped, actions, context)
+}
+
+/// What the action menu's shunt verb does, decided once by [`shunt_verb`] for
+/// both the label the menu shows and the effect a pick runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntVerb {
+    /// `stop shunt`: the `stop shunt?` confirm, then the transient hold.
+    Stop,
+    /// `start shunt` with nothing adopted: the card's `f  adopt config` line.
+    JumpAdopt,
+    /// `start shunt` on a `disabled` gateway: the card's `enabled` row.
+    JumpEnabled,
+    /// `start shunt` with no daemon: the shared daemon-start confirm.
+    StartDaemon,
+    /// `start shunt` on a held gateway: the hold's release.
+    Release,
+}
+
+impl ShuntVerb {
+    pub(crate) fn action(self) -> ActionMenuAction {
+        match self {
+            Self::Stop => ActionMenuAction::StopShunt,
+            Self::JumpAdopt | Self::JumpEnabled | Self::StartDaemon | Self::Release => {
+                ActionMenuAction::StartShunt
+            }
+        }
+    }
+}
+
+/// The one shunt verb that applies: an absent or `disabled` gateway jumps to
+/// its card whatever the daemon; a running gateway under a fresh daemon stops;
+/// a held one releases while a daemon runs; any other state with no daemon
+/// starts the daemon. None while a shunt action is in flight, and the no-daemon
+/// start none while a daemon control runs (the daemon verb's own rule). Reads
+/// the cached [`App::gateway_state`], so the per-frame footer never touches the
+/// disk.
+pub(crate) fn shunt_verb(app: &App) -> Option<ShuntVerb> {
+    use crate::daemon::DaemonHealth;
+    use GatewayState as S;
+    if app.services.shunt_action.running {
+        return None;
+    }
+    let health = app.daemon_health;
+    match app.gateway_state {
+        S::Absent => Some(ShuntVerb::JumpAdopt),
+        S::Disabled => Some(ShuntVerb::JumpEnabled),
+        S::Starting | S::Healthy | S::Unhealthy | S::Restarting
+            if health == DaemonHealth::Fresh =>
+        {
+            Some(ShuntVerb::Stop)
+        }
+        S::Held if health != DaemonHealth::Absent => Some(ShuntVerb::Release),
+        S::Held
+        | S::Starting
+        | S::Healthy
+        | S::Unhealthy
+        | S::Restarting
+        | S::NoConfig
+        | S::YamlRefused
+        | S::Misconfigured
+        | S::BinaryMissing
+        | S::Foreign
+        | S::BelowFloor
+        | S::Stopping
+        | S::Unobserved => (health == DaemonHealth::Absent && !app.daemon_control_busy)
+            .then_some(ShuntVerb::StartDaemon),
+    }
+}
+
+/// Re-read the gateway slot for [`App::gateway_state`] under the daemon health
+/// the app holds now.
+pub(crate) fn sync_gateway_state(app: &mut App) {
+    app.gateway_state = crate::daemon::gateway_slot(app.daemon_health).0.state;
 }
 
 /// Push what the account under the cursor can be told to do, returning the name
@@ -9392,8 +9541,11 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             toggle_focused_account_disabled(app);
         }
         ActionMenuAction::OpenProviderConsole => open_provider_console(app),
-        ActionMenuAction::StartDaemon => start_daemon(app),
+        ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
+        ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
+            dispatch_shunt_verb(app, action);
+        }
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -9413,10 +9565,121 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     }
 }
 
+/// The toast for a shunt pick whose verb no longer applies.
+const SHUNT_CHANGED: &str = "the shunt gateway changed; open the menu again";
+
+/// The shunt verb a pick of `picked` runs now: [`shunt_verb`] over a slot
+/// re-read at pick time, or the [`SHUNT_CHANGED`] toast and `None` when the
+/// state moved under the open menu to a verb with another label, or to none.
+fn shunt_verb_at_pick(app: &mut App, picked: ActionMenuAction) -> Option<ShuntVerb> {
+    sync_gateway_state(app);
+    let verb = shunt_verb(app).filter(|verb| verb.action() == picked);
+    if verb.is_none() {
+        app.toast(ToastKind::Info, SHUNT_CHANGED);
+    }
+    verb
+}
+
+/// A picked `start shunt` / `stop shunt`, acting on the verb that applies at
+/// pick time.
+fn dispatch_shunt_verb(app: &mut App, picked: ActionMenuAction) {
+    let Some(verb) = shunt_verb_at_pick(app, picked) else {
+        return;
+    };
+    match verb {
+        ShuntVerb::Stop => open_shunt_stop_confirm(app),
+        ShuntVerb::JumpAdopt => jump_to_shunt_card(app, ShuntFocusLine::Adopt),
+        ShuntVerb::JumpEnabled => jump_to_shunt_card(app, ShuntFocusLine::Enabled),
+        ShuntVerb::StartDaemon => open_daemon_start_confirm(app),
+        ShuntVerb::Release => app.services.shunt_action.start(ShuntActionJob::RemoveHold),
+    }
+}
+
+/// `stop shunt?`, its detail leading with how many live sessions run on the
+/// gateway when that is at least one and clauth could count them.
+fn open_shunt_stop_confirm(app: &mut App) {
+    const DRAIN: &str =
+        "in-flight requests drain, then the gateway stays off until the daemon restarts.";
+    let detail = match gateway_session_count(app) {
+        Some(1) => format!("1 live session uses it; {DRAIN}"),
+        Some(n) if n > 1 => format!("{n} live sessions use it; {DRAIN}"),
+        Some(_) | None => DRAIN.to_string(),
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "stop shunt?".to_string(),
+        detail: Some(detail),
+        choice: false,
+        on_confirm: ConfirmAction::StopShunt,
+    }));
+}
+
+/// Live sessions whose current account's `base_url` names the gateway's
+/// address, off the tally the header already polls. The port is the running
+/// gateway's, off the daemon's slot (a bind edited since its spawn moves
+/// nothing until a restart); the host is the one
+/// [`crate::gateway::displayed_gateway_bind`] resolves. `None` when the tally,
+/// the gateway record or its bind could not be read.
+fn gateway_session_count(app: &App) -> Option<usize> {
+    app.live_sessions.total()?;
+    let record = crate::gateway::GatewayRecord::load().ok().flatten()?;
+    let mut bind = crate::gateway::displayed_gateway_bind(&record).ok()?;
+    if let Some(port) = crate::daemon::gateway_slot(app.daemon_health).0.port {
+        bind.configured.set_port(port);
+        bind.probe.set_port(port);
+    }
+    Some(
+        app.config()
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| crate::gateway::url_names_bind(url, &bind))
+            })
+            .map(|profile| app.live_sessions.member(&profile.name).sessions)
+            .sum(),
+    )
+}
+
+/// Switch to the Services tab, select the `shunt` row, descend, and focus the
+/// named actionable line when the card offers it; a kind the card does not
+/// offer leaves the focus to the descend rule (the first line in view, else
+/// none).
+fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
+    switch_tab(app, Tab::Services);
+    if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
+        app.services.cursor = idx;
+    }
+    app.services.focus = ServicesFocus::Detail;
+    app.services.detail_scroll = 0;
+    app.services.shunt_focus.set(
+        app.services
+            .selected_check()
+            .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == focus))
+            .then_some(focus),
+    );
+}
+
 /// Where the daemon's start and stop toasts send the user when either fails.
 const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
 
-/// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
+/// The shared daemon-start confirm, opened by the action menu's `start daemon`
+/// and by a no-daemon `start shunt`; its two detail lines are drawn off
+/// [`ConfirmAction::StartDaemon`]. `cancel`/`esc` spawn nothing; `start` runs
+/// [`start_daemon`].
+fn open_daemon_start_confirm(app: &mut App) {
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "start daemon?".to_string(),
+        detail: None,
+        choice: false,
+        on_confirm: ConfirmAction::StartDaemon,
+    }));
+}
+
+/// The daemon-start confirm's `start`: spawn `<this binary> daemon` detached,
 /// then report, off the UI thread, whether a daemon came up. The worker stays
 /// to reap the child, so a daemon this TUI started and stops never lingers as
 /// a zombie while the TUI runs.
@@ -9513,6 +9776,7 @@ fn drain_daemon_control(app: &mut App) {
             }
         }
         app.daemon_health = crate::daemon::daemon_health();
+        sync_gateway_state(app);
         app.last_daemon_probe = Instant::now();
     }
 }
@@ -12200,6 +12464,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 .shunt_action
                 .start(ShuntActionJob::AddAdminTable { record });
         }
+        ConfirmAction::StartDaemon => start_daemon(app),
+        ConfirmAction::StopShunt => {
+            if shunt_verb_at_pick(app, ActionMenuAction::StopShunt).is_some() {
+                app.services.shunt_action.start(ShuntActionJob::Hold);
+            }
+        }
         ConfirmAction::Acknowledge => {}
     }
 }
@@ -13023,8 +13293,9 @@ fn poll_codex_rows(app: &mut App) {
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
-/// header chip, at most once a second (a flock try-lock + `status.json` read is
-/// cheap but not free, and the chip changes on a human timescale).
+/// header chip, and the gateway slot the action menu's shunt verb reads, at
+/// most once a second (a flock try-lock + `status.json` read is cheap but not
+/// free, and both change on a human timescale).
 fn poll_daemon_health(app: &mut App) {
     const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     if app.last_daemon_probe.elapsed() < DAEMON_PROBE_INTERVAL {
@@ -13032,6 +13303,7 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
+    sync_gateway_state(app);
 }
 
 /// Re-tally the live-session registry for the Overview `live` column, the

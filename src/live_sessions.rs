@@ -302,6 +302,16 @@ impl LiveTally {
         self.members.get(name.as_str()).copied().unwrap_or_default()
     }
 
+    /// A tally that read `rows` but not every dir it counts from (the bare
+    /// markers refused), for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn partly_read(rows: impl IntoIterator<Item = LiveSession>) -> Self {
+        Self {
+            unread: true,
+            ..Self::from_live_rows(rows)
+        }
+    }
+
     /// A tally whose reads failed, for render tests in other modules.
     #[cfg(test)]
     pub(crate) fn unread() -> Self {

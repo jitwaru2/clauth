@@ -642,6 +642,103 @@ fn the_bind_is_the_env_then_the_config_then_shunts_default() {
     }
 }
 
+/// A profile's `base_url` names the gateway when its port (written or the
+/// scheme's default) is the bind's and its host is the probe address, or
+/// `localhost` over a loopback probe; nothing else counts.
+#[test]
+fn a_base_url_names_the_gateway_by_its_probe_address_and_port() {
+    let _home = HomeSandbox::new();
+    let bind = |configured: &str, probe: &str| GatewayBind {
+        configured: configured.parse().expect("configured"),
+        probe: probe.parse().expect("probe"),
+    };
+    let loopback = bind("127.0.0.1:3067", "127.0.0.1:3067");
+    let wildcard = bind("0.0.0.0:3067", "127.0.0.1:3067");
+    let v6 = bind("[::1]:3067", "[::1]:3067");
+    let lan = bind("192.168.1.5:3067", "192.168.1.5:3067");
+    let port_80 = bind("127.0.0.1:80", "127.0.0.1:80");
+    let port_443 = bind("127.0.0.1:443", "127.0.0.1:443");
+    let mapped = bind("[::ffff:127.0.0.1]:3067", "[::ffff:127.0.0.1]:3067");
+    for (url, bind, names) in [
+        ("http://127.0.0.1:3067", &loopback, true),
+        ("http://127.0.0.1:3067/", &loopback, true),
+        ("http://127.0.0.1:3067/v1/messages", &loopback, true),
+        ("HTTP://LOCALHOST:3067", &loopback, true),
+        ("https://127.0.0.1:3067", &loopback, true),
+        ("http://[::ffff:127.0.0.1]:3067", &loopback, true),
+        ("http://127.0.0.1:3068", &loopback, false),
+        ("http://127.0.0.2:3067", &loopback, false),
+        ("http://[::1]:3067", &loopback, false),
+        ("http://example.com:3067", &loopback, false),
+        ("127.0.0.1:3067", &loopback, false),
+        ("ftp://127.0.0.1:3067", &loopback, false),
+        ("not a url", &loopback, false),
+        ("http://127.0.0.1:3067", &wildcard, true),
+        ("http://localhost:3067", &wildcard, true),
+        ("http://192.168.1.5:3067", &wildcard, false),
+        ("http://[::1]:3067", &v6, true),
+        ("http://localhost:3067", &v6, true),
+        ("http://127.0.0.1:3067", &v6, false),
+        ("http://192.168.1.5:3067", &lan, true),
+        ("http://localhost:3067", &lan, false),
+        ("http://127.0.0.1", &port_80, true),
+        ("http://127.0.0.1:/x", &port_80, true),
+        ("https://127.0.0.1", &port_443, true),
+        ("http://127.0.0.1", &loopback, false),
+        ("http://0.0.0.0:3067", &loopback, true),
+        ("http://0.0.0.0:3067", &wildcard, true),
+        ("http://0.0.0.0:3067", &v6, false),
+        ("http://[::]:3067", &v6, true),
+        ("http://[::]:3067", &loopback, false),
+        ("http://127.0.0.1:3067", &mapped, true),
+    ] {
+        assert_eq!(url_names_bind(url, bind), names, "{url:?} against {bind:?}");
+    }
+}
+
+/// The displayed bind honours a `SHUNT_SERVER__BIND` the running daemon
+/// recorded, matched to the singleton holder by pid; with no daemon, or a
+/// record naming another pid, the adopted files alone decide.
+#[test]
+fn the_displayed_bind_reads_the_daemon_recorded_bind_matched_by_pid() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "[server]\nbind = \"127.0.0.1:3067\"\n").unwrap();
+    let record = GatewayRecord::new(config).unwrap();
+    let configured = |record: &GatewayRecord| {
+        displayed_gateway_bind(record)
+            .expect("the bind resolves")
+            .configured
+    };
+    let files: SocketAddr = "127.0.0.1:3067".parse().unwrap();
+    assert_eq!(configured(&record), files, "no daemon: the files");
+
+    let held = crate::daemon::hold_daemon_lock();
+    let pid_file = home.home().join(".clauth").join("clauthd.pid");
+    fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
+    write_daemon_env_from(|key| (key == BIND_ENV).then(|| OsString::from("192.168.1.5:3067")))
+        .expect("record the daemon env");
+    assert_eq!(
+        configured(&record),
+        "192.168.1.5:3067".parse::<SocketAddr>().unwrap(),
+        "the running daemon's recorded bind"
+    );
+
+    fs::write(&pid_file, format!("{}\n", std::process::id() + 1)).unwrap();
+    assert_eq!(
+        configured(&record),
+        files,
+        "a record naming another pid: the files"
+    );
+
+    // The pid stamp and the record outlive a daemon: with the lock free they
+    // name no running daemon.
+    fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
+    drop(held);
+    assert_eq!(configured(&record), files, "no lock held: the files");
+}
+
 #[test]
 fn an_unusable_bind_is_refused_by_its_source_never_its_value() {
     let _home = HomeSandbox::new();

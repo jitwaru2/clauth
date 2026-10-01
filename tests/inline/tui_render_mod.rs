@@ -1079,7 +1079,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 4);
+    assert_eq!(menu.items.len(), 5);
     assert_eq!(
         menu.context.as_deref(),
         Some("acct"),
@@ -1097,7 +1097,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.profile_cursor = app.profile_count();
     app.config_draft = None;
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 2);
+    assert_eq!(menu.items.len(), 3);
     assert_eq!(
         menu.context, None,
         "no draft is mounted yet, so the group title is bare"
@@ -1108,7 +1108,11 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
         "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
     );
 
+    // The one empty menu left: a stale daemon's `unobserved` gateway offers
+    // no shunt verb, and a daemon control busy holds the daemon verb back.
     app.tab = Tab::Config;
+    app.daemon_health = crate::daemon::DaemonHealth::Stale;
+    app.gateway_state = crate::daemon::gateway::GatewayState::Unobserved;
     app.daemon_control_busy = true;
     assert!(crate::tui::app::build_action_menu(&app).items.is_empty());
     let out = dump(&app, 120, 30);

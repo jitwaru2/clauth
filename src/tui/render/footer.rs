@@ -94,7 +94,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // `a` opens nothing where the menu is empty: a tab with no action of its
-    // own while a daemon start or stop is in flight. Reading the real menu
+    // own while a daemon start or stop is in flight and no shunt verb
+    // applies. Reading the real menu
     // keeps the hint honest per row instead of leaving each arm's literal to
     // drift.
     if build_action_menu(app).items.is_empty() {

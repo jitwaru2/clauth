@@ -500,7 +500,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 10].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 11].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "╭─ ACTIONS ───────────── acct ─╮".to_string(),
             "│                              │".to_string(),
@@ -511,6 +511,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
             "│    refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
             "│    start daemon           s  │".to_string(),
+            "│    start shunt               │".to_string(),
             "│                              │".to_string(),
         ],
     );
@@ -533,13 +534,14 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 8].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "╭─ ACTIONS ────────────────────╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
             "│    start daemon           s  │".to_string(),
+            "│    start shunt            t  │".to_string(),
             "│                              │".to_string(),
             "╰──────────────────────────────╯".to_string(),
         ],
@@ -548,8 +550,8 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
 
 /// A menu that is scoped end to end (the Setup tab, whose three actions all
 /// work on the account being configured, while a daemon start or stop holds
-/// the daemon verb back) still names that account, and still draws no rule —
-/// there is no second group to hold off.
+/// the daemon verb back and the gateway offers no shunt verb) still names that
+/// account, and still draws no rule — there is no second group to hold off.
 #[test]
 fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     use crate::tui::app::{ConfigFocus, handle_key};
@@ -568,6 +570,9 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
     app.daemon_control_busy = true;
+    // A stale daemon's `unobserved` gateway offers no shunt verb.
+    app.daemon_health = crate::daemon::DaemonHealth::Stale;
+    app.gateway_state = crate::daemon::gateway::GatewayState::Unobserved;
 
     let (rows, left, right) = render_action_menu(&app, 60, 20);
     let slice =
@@ -783,4 +788,162 @@ fn the_add_admin_table_confirm_button_is_dangerous() {
         Some(crate::tui::theme::text_dim_color()),
         "the adopt confirm button is neutral (dim):\n{screen}"
     );
+}
+
+/// Draw `state` as the TUI draws a confirm on a `width`×`height` screen and
+/// return the buffer plus the modal's rows, border to border.
+fn render_confirm(
+    state: &crate::tui::app::ConfirmState,
+    width: u16,
+    height: u16,
+) -> (ratatui::buffer::Buffer, Vec<String>, (u16, u16)) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), state)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let rows = crate::testutil::buffer_rows(&buf);
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .unwrap_or_else(|| panic!("the confirm's top border:\n{}", rows.join("\n")));
+    let bottom = rows
+        .iter()
+        .position(|r| r.contains('\u{2570}'))
+        .expect("the confirm's bottom border");
+    let left = rows[top].chars().position(|c| c == '\u{256d}').unwrap();
+    let right = rows[top].chars().position(|c| c == '\u{256e}').unwrap();
+    let modal = rows[top..=bottom]
+        .iter()
+        .map(|row| row.chars().skip(left).take(right - left + 1).collect())
+        .collect();
+    (
+        buf,
+        modal,
+        (u16::try_from(left).unwrap(), u16::try_from(top).unwrap()),
+    )
+}
+
+/// The cell at `(x, y)` of the modal, counted from its top-left border corner.
+fn modal_cell(
+    buf: &ratatui::buffer::Buffer,
+    origin: (u16, u16),
+    x: usize,
+    y: usize,
+) -> &ratatui::buffer::Cell {
+    let stride = buf.area.width as usize;
+    &buf.content[(origin.1 as usize + y) * stride + origin.0 as usize + x]
+}
+
+/// The shared daemon-start confirm at 80 columns: its exact rows, the message in
+/// TEXT, both detail lines TEXT_DIM with the `clauth daemon` command span in
+/// ACCENT (never bold), and the right-aligned buttons, `cancel` focused as the
+/// inverse block and `start` neutral.
+#[test]
+fn the_daemon_start_confirm_renders_its_rows_and_spans() {
+    use crate::tui::app::{ConfirmAction, ConfirmState};
+    use crate::tui::theme;
+    use ratatui::style::Modifier;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "start daemon?".into(),
+        detail: None,
+        choice: false,
+        on_confirm: ConfirmAction::StartDaemon,
+    };
+    let (buf, rows, origin) = render_confirm(&state, 80, 24);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ──────────────────────────────────────────╮".to_string(),
+            "│                                                    │".to_string(),
+            "│  start daemon?                                     │".to_string(),
+            "│  spawns the clauth daemon detached: clauth daemon  │".to_string(),
+            "│  logfile at ~/.clauth/daemon.log.                  │".to_string(),
+            "│                                                    │".to_string(),
+            "│                                 cancel     start   │".to_string(),
+            "│                                                    │".to_string(),
+            "╰────────────────────────────────────────────────────╯".to_string(),
+        ],
+    );
+    let fg = |x: usize, y: usize| modal_cell(&buf, origin, x, y).fg;
+    // Content starts at column 3: the border plus two cells of padding.
+    assert_eq!(fg(3, 2), theme::text_color(), "the message is TEXT");
+    for x in 3..38 {
+        assert_eq!(
+            fg(x, 3),
+            theme::text_dim_color(),
+            "the prefix is TEXT_DIM at {x}"
+        );
+    }
+    for x in 38..51 {
+        let cell = modal_cell(&buf, origin, x, 3);
+        assert_eq!(
+            cell.fg,
+            theme::accent_color(),
+            "the command is ACCENT at {x}"
+        );
+        assert!(!cell.modifier.contains(Modifier::BOLD), "never bold at {x}");
+    }
+    for x in 3..35 {
+        assert_eq!(
+            fg(x, 4),
+            theme::text_dim_color(),
+            "the logfile line is TEXT_DIM at {x}"
+        );
+    }
+    // ` cancel ` spans columns 33..41, ` start ` 44..51.
+    for x in 33..41 {
+        let cell = modal_cell(&buf, origin, x, 6);
+        assert_eq!(
+            (cell.fg, cell.bg),
+            (theme::bg(), theme::text_color()),
+            "cancel is the focused inverse block at {x}"
+        );
+    }
+    for x in 44..51 {
+        assert_eq!(fg(x, 6), theme::text_dim_color(), "start is neutral at {x}");
+    }
+}
+
+/// `stop shunt?` with its count clause: the exact rows and a DANGER `stop`
+/// beside the focused `cancel`.
+#[test]
+fn the_stop_shunt_confirm_renders_its_rows_and_a_danger_stop() {
+    use crate::tui::app::{ConfirmAction, ConfirmState};
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "stop shunt?".into(),
+        detail: Some(
+            "2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts."
+                .into(),
+        ),
+        choice: false,
+        on_confirm: ConfirmAction::StopShunt,
+    };
+    // 120 columns hold the 103-cell detail on one row.
+    let (buf, rows, origin) = render_confirm(&state, 120, 24);
+    assert_eq!(
+        rows,
+        vec![
+            "╭─ CONFIRM ─────────────────────────────────────────────────────────────────────────────────────────────────╮".to_string(),
+            "│                                                                                                           │".to_string(),
+            "│  stop shunt?                                                                                              │".to_string(),
+            "│  2 live sessions use it; in-flight requests drain, then the gateway stays off until the daemon restarts.  │".to_string(),
+            "│                                                                                                           │".to_string(),
+            "│                                                                                         cancel     stop   │".to_string(),
+            "│                                                                                                           │".to_string(),
+            "╰───────────────────────────────────────────────────────────────────────────────────────────────────────────╯".to_string(),
+        ],
+    );
+    // ` stop ` spans the last six inner columns of the button row, 100..106.
+    for x in 100..106 {
+        assert_eq!(
+            modal_cell(&buf, origin, x, 5).fg,
+            crate::tui::theme::danger_color(),
+            "stop is DANGER unfocused at {x}"
+        );
+    }
 }
