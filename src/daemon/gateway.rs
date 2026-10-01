@@ -878,7 +878,7 @@ impl<K: Supervised> Supervisor<K> {
                 );
                 return;
             }
-            std::thread::sleep(STOP_POLL);
+            std::thread::sleep(STOP_POLL.min(deadline - now));
         }
     }
 
