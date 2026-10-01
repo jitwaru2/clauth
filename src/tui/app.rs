@@ -5955,6 +5955,8 @@ pub(crate) enum UnreadConfig {
     Yaml,
     /// The config file could not be read.
     Unreadable,
+    /// The config is not valid TOML.
+    Unparsed,
 }
 
 impl UnreadConfig {
@@ -5962,6 +5964,7 @@ impl UnreadConfig {
         match self {
             UnreadConfig::Yaml => "yaml",
             UnreadConfig::Unreadable => "unreadable",
+            UnreadConfig::Unparsed => "does not parse",
         }
     }
 }
@@ -5971,6 +5974,7 @@ impl From<UnreadConfig> for UnreadBind {
         match unread {
             UnreadConfig::Yaml => UnreadBind::Yaml,
             UnreadConfig::Unreadable => UnreadBind::Unreadable,
+            UnreadConfig::Unparsed => UnreadBind::Unparsed,
         }
     }
 }
@@ -5987,12 +5991,16 @@ pub(crate) fn standalone_readout_from(
 ) -> StandaloneShunt {
     let (found, config_text, unread_config) = match discovered {
         Ok(Some(path)) => match std::fs::read_to_string(&path) {
-            // The adopt's own first step: a TOML name linked onto a YAML file
-            // reads here but refuses there, at its resolved target.
-            Ok(text) => match crate::gateway::GatewayRecord::new(path.clone()) {
+            // The adopt's own check: a TOML name linked onto a YAML file, or a
+            // config that does not parse (an env bind skips the bind's parse),
+            // reads here but refuses there.
+            Ok(text) => match crate::gateway::adoptable_record(path.clone()) {
                 Ok(_) => (Some(path), text, None),
                 Err(e) if e.is::<crate::gateway::NotToml>() => {
                     (Some(path), String::new(), Some(UnreadConfig::Yaml))
+                }
+                Err(e) if e.is::<crate::gateway::ConfigUnparsed>() => {
+                    (Some(path), String::new(), Some(UnreadConfig::Unparsed))
                 }
                 Err(_) => (Some(path), String::new(), Some(UnreadConfig::Unreadable)),
             },
@@ -6268,8 +6276,8 @@ pub(crate) fn shunt_card(
 
     if slot.state == GatewayState::Absent {
         // `f  adopt config` sits directly under the absent card's lines, and
-        // only a readable TOML find whose bind clauth READ gets it: a YAML or
-        // unreadable find, an unreadable bind, or a daemon env clauth cannot
+        // only a readable TOML find whose bind clauth READ gets it: a YAML,
+        // unreadable or unparsed find, an unreadable bind, or a daemon env clauth cannot
         // read offers nothing, since the adopt would only ever fail.
         let toml = standalone.and_then(|s| {
             if s.unread_bind.is_none() && s.unread_config.is_none() && !s.unread_env {
@@ -6492,7 +6500,7 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
 /// (`disabled` while a move is due, enabled when nothing moves).
 fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
     use crate::gateway::Health;
-    let candidate = match crate::gateway::GatewayRecord::new(found.to_path_buf()) {
+    let candidate = match crate::gateway::adoptable_record(found.to_path_buf()) {
         Ok(candidate) => candidate,
         Err(e) => {
             return ShuntActionOutcome::AdoptFailed {

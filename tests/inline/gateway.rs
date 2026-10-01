@@ -108,6 +108,45 @@ fn the_record_refuses_a_config_it_cannot_edit_in_place() {
     }
 }
 
+/// An adopt refuses a config the gateway could never run: on top of the
+/// record's own checks, one that does not parse as TOML, which a bind from
+/// the env would otherwise let through. A config that parses is adoptable.
+#[test]
+fn an_adopt_refuses_a_config_that_does_not_parse() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("shunt.toml");
+    write(&config, "[server]\nbind = \"127.0.0.1:4200\"\n");
+    assert_eq!(
+        adoptable_record(config.clone())
+            .expect("adoptable")
+            .config(),
+        std::fs::canonicalize(&config).expect("canonical")
+    );
+
+    write(&config, "a = 1\n[server\n");
+    let err = adoptable_record(config.clone()).expect_err("unparsed");
+    assert_eq!(
+        err.downcast_ref::<ConfigUnparsed>(),
+        Some(&ConfigUnparsed(
+            "the adopted shunt config does not parse as TOML (line 2)".to_string()
+        ))
+    );
+    assert_eq!(
+        err.to_string(),
+        "the adopted shunt config does not parse as TOML (line 2)"
+    );
+
+    let yaml = home.home().join("shunt.yaml");
+    write(&yaml, "server:\n  bind: 127.0.0.1:4200\n");
+    assert!(
+        adoptable_record(yaml)
+            .expect_err("yaml")
+            .downcast_ref::<NotToml>()
+            .is_some(),
+        "the record's own checks still run first"
+    );
+}
+
 /// Every path the record holds resolves against whatever working directory
 /// its reader has, so a hand-edited relative one fails the load, naming the
 /// field and the fix.

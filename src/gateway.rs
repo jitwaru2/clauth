@@ -555,6 +555,28 @@ impl std::fmt::Display for NotToml {
 
 impl std::error::Error for NotToml {}
 
+/// A config that does not parse as TOML: shunt could not load it either.
+/// Carries the parse error's text, which names the line and never quotes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigUnparsed(String);
+
+impl std::fmt::Display for ConfigUnparsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConfigUnparsed {}
+
+/// The record an adopt of `config` writes, refused where the gateway could
+/// never run it: [`GatewayRecord::new`]'s checks, then the config's own parse
+/// ([`ConfigUnparsed`]), which a bind from the env would otherwise skip.
+pub(crate) fn adoptable_record(config: PathBuf) -> Result<GatewayRecord> {
+    let record = GatewayRecord::new(config)?;
+    parse_config(&read_config_text(record.config())?).map_err(|e| ConfigUnparsed(e.to_string()))?;
+    Ok(record)
+}
+
 /// shunt's `ConfigFormat::from_path`: `.yaml`/`.yml` in any case is YAML,
 /// every other name is TOML.
 fn is_yaml(path: &Path) -> bool {

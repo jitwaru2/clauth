@@ -785,14 +785,15 @@ fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
         ],
         "a found path is escaped too: a directory name can carry a bidi override",
     );
-    // A YAML or unreadable config is unread too, as the readout reports it:
-    // the bind line alone names it, never a second `config:` line.
+    // A YAML, unreadable or unparsed config is unread too, as the readout
+    // reports it: the bind line alone names it, never a second `config:` line.
     let unread = |reason: super::UnreadBind| super::StandaloneShunt {
         found: Some(std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml")),
         unread_config: match reason {
             super::UnreadBind::Yaml => Some(super::UnreadConfig::Yaml),
             super::UnreadBind::Unreadable => Some(super::UnreadConfig::Unreadable),
-            super::UnreadBind::Unparsed | super::UnreadBind::Value(_) => None,
+            super::UnreadBind::Unparsed => Some(super::UnreadConfig::Unparsed),
+            super::UnreadBind::Value(_) => None,
         },
         unread_env: false,
         unread_bind: Some(reason),
@@ -1007,12 +1008,12 @@ fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
         readout(Some(dir), None, Some(UnreadConfig::Unreadable)),
         "an env bind moves the probe off an unreadable config, which stays unread",
     );
-    // A TOML file that does not parse is still read: under an env bind the
-    // adopt's probe never parses it, so the adopt can succeed.
+    // A TOML file that does not parse stays unread under an env bind too:
+    // the env hides only the bind's reason.
     std::fs::write(&config, "[server\n").unwrap();
     assert_eq!(
         super::standalone_readout_from(Ok(Some(config.clone())), Some("127.0.0.1:4400"), silent),
-        readout(Some(config.clone()), None, None),
+        readout(Some(config.clone()), None, Some(UnreadConfig::Unparsed)),
     );
     assert_eq!(
         super::standalone_readout_from(Ok(None), Some("\"127.0.0.1:4500\""), silent),
@@ -16542,8 +16543,31 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
     );
 }
 
-/// An env `SHUNT_SERVER__BIND` hides a YAML or unreadable find from the bind
-/// line, but the adopt would still fail on the config itself: the card offers
+/// The adopt refuses a config that does not parse on its own, before any
+/// bind is read: the card's readout can be older than the file's breakage.
+/// The held daemon lock with no env record makes the env read refuse, so only
+/// the adopt's own parse step can produce the parse error.
+#[test]
+fn the_adopt_refuses_an_unparsed_config_before_reading_any_bind() {
+    let home = crate::testutil::HomeSandbox::new();
+    let config = home.home().join("shunt.toml");
+    std::fs::write(&config, "a = 1\n[server\n").unwrap();
+    let _held = crate::daemon::hold_daemon_lock();
+    match super::run_adopt(&config) {
+        super::ShuntActionOutcome::AdoptFailed { error } => assert_eq!(
+            error,
+            "the adopted shunt config does not parse as TOML (line 2)"
+        ),
+        other => panic!("expected the parse refusal, got {other:?}"),
+    }
+    assert!(
+        crate::gateway::GatewayRecord::load().unwrap().is_none(),
+        "a refused adopt writes no record"
+    );
+}
+
+/// An env `SHUNT_SERVER__BIND` hides a YAML, unreadable or unparsed find from
+/// the bind line, but the adopt would still fail on the config itself: the card offers
 /// no adopt and a `config: not read (…)` line says why. Built through the
 /// readout, so the producer and the card's gate are pinned together.
 #[test]
@@ -16553,6 +16577,8 @@ fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
     let yaml = std::path::PathBuf::from("/cfg/shunt.yaml");
     let dir = home.home().join("a-dir-not-a-file");
     std::fs::create_dir_all(&dir).unwrap();
+    let unparsed = home.home().join("shunt.toml");
+    std::fs::write(&unparsed, "[server\n").unwrap();
     for (what, standalone, want) in [
         (
             "a YAML find",
@@ -16574,6 +16600,29 @@ fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
                 "state: not adopted".to_string(),
                 format!("found: {}", dir.display()),
                 "config: not read (unreadable)".to_string(),
+            ],
+        ),
+        (
+            "an unparseable TOML find",
+            super::standalone_readout_from(
+                Ok(Some(unparsed.clone())),
+                Some("127.0.0.1:4200"),
+                silent,
+            ),
+            vec![
+                "state: not adopted".to_string(),
+                format!("found: {}", unparsed.display()),
+                "config: not read (does not parse)".to_string(),
+            ],
+        ),
+        (
+            "a refused env bind over an unparseable TOML find",
+            super::standalone_readout_from(Ok(Some(unparsed.clone())), Some("nope"), silent),
+            vec![
+                "state: not adopted".to_string(),
+                format!("found: {}", unparsed.display()),
+                "bind: not read (SHUNT_SERVER__BIND=nope)".to_string(),
+                "config: not read (does not parse)".to_string(),
             ],
         ),
         (
