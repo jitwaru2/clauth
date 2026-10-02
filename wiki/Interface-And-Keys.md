@@ -60,9 +60,9 @@ The footer labels <kbd>c</kbd> `harness` on the Overview; the <kbd>?</kbd> help 
 
 ## Action menus
 
-<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so on Config, Fallback and Services, where every action already has a key, it holds only the daemon entry every tab ends on. The footer only advertises <kbd>a</kbd> where something would open.
+<kbd>a</kbd> opens the actions available for whatever is selected. It lists what no key already does, so on Config, Fallback and Services, where every action already has a key, it holds only the daemon and shunt entries every tab ends on. The footer only advertises <kbd>a</kbd> where something would open.
 
-Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab, and the last one on the daemon.
+Entries above the rule act on the account named in the menu's title bar; entries below it act on the tab, and the daemon and shunt entries, when shown, come last.
 
 | Tab | Account | Tab-wide |
 |-----|---------|----------|
@@ -71,11 +71,13 @@ Entries above the rule act on the account named in the menu's title bar; entries
 | Tokens | none | `period: lifetime` / `daily` / `weekly` / `monthly`, `show all models` / `show claude models` / `show other models`, `toggle cache counting`, `reload stats` |
 | Setup | `duplicate account`, `save as preset`, `apply preset`, `open provider console` | none |
 | Status | none | `refresh status`, `open in browser` |
-| every tab | none | `start daemon` / `stop daemon`, last |
+| every tab | none | `start daemon` / `stop daemon`, then `start shunt` / `stop shunt`, last |
 
 The usage tab claims <kbd>n</kbd> for the selected account's note: a free-form text block shown in full on the tab under `notes:` (`press n to add notes` while the account has none). <kbd>⏎</kbd> saves, <kbd>esc</kbd> cancels, <kbd>⌃j</kbd> starts a new line. The note is stored as `profiles/<name>/note.txt` (see [Configuration](Configuration#storage-layout)), so it follows the account on rename and goes with it on delete; everywhere else <kbd>n</kbd> still starts a new account.
 
-`start daemon` shows while no daemon runs and starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway and every enabled proxy down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
+`start daemon` shows while no daemon runs and, once you confirm, starts `clauth daemon` in the background, detached from the TUI: it keeps running after you quit the TUI or close its terminal, and writes its log to `~/.clauth/daemon.log`. It starts the plain daemon, so it serves no REST API; for the clauth app, run `clauth daemon --listen` yourself ([Daemon](Daemon)). `stop daemon` shows while one runs and stops it the way `clauth daemon --replace` does, taking the shunt gateway and every enabled proxy down with it (a daemon that takes over at once, such as a standby, runs its own). Neither shows while one of them is still working; a toast reports how it went.
+
+`stop shunt` shows while the daemon runs the shunt gateway and its status is fresh. It asks first, naming how many live sessions run on an account whose base URL points at the gateway when any do and clauth can count them, then holds the gateway off until the daemon next restarts; it never changes the card's `enabled` setting. `start shunt` shows in four cases: with no gateway adopted it opens the Services tab on the `shunt` card, on its `f  adopt config` line when the card offers one; with the gateway disabled it lands on the card's `enabled` row; with no daemon running it asks to start the daemon (hidden while a daemon start or stop is still working); and on a held gateway it lifts the hold. In any other state, and while a shunt action is still working, neither shows. A pick whose entry no longer applies, because the gateway changed since the menu opened, says so and does nothing.
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
 
