@@ -13525,6 +13525,138 @@ fn await_service_probes(app: &mut App) {
     }
 }
 
+/// While the Services tab shows a standalone shunt's claim, the readout is
+/// re-probed once the recheck interval passes and the claim drops once that
+/// shunt stops answering, with no `r`; nothing re-probes inside the interval,
+/// on another tab, under a modal, or once no claim shows.
+#[test]
+fn a_standalone_claim_is_rechecked_while_the_services_tab_shows_it() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    static ANSWERS: AtomicBool = AtomicBool::new(true);
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn stub() -> super::StandaloneShunt {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt {
+            found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+            answer: ANSWERS
+                .load(Ordering::SeqCst)
+                .then(|| ("0.49.1".to_string(), crate::gateway::SHUNT_DEFAULT_BIND)),
+            ..super::StandaloneShunt::default()
+        }
+    }
+    let ago = |secs: u64| {
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .unwrap()
+    };
+    let home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.standalone_probe.prober = Some(stub);
+    app.services.standalone_probe.start();
+    await_service_probes(&mut app);
+    let claim = |app: &App| {
+        app.services
+            .standalone
+            .as_ref()
+            .and_then(|s| s.answer.clone())
+    };
+    let claim_line = "standalone shunt 0.49.1 answers on 127.0.0.1:3001".to_string();
+    let card_claims = |app: &App| {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "shunt")
+            .is_some_and(|c| c.detail.contains(&claim_line))
+    };
+    assert!(claim(&app).is_some(), "the stub's shunt answers");
+    assert!(card_claims(&app), "the card shows the claim");
+    let runs = RUNS.load(Ordering::SeqCst);
+
+    // Each poll below runs the 1 s Services refresh, its own throttle passed;
+    // `refresh` leaves the recheck timer where the last recheck put it.
+    let refresh = |app: &mut App| {
+        app.last_services_refresh = ago(2);
+        super::poll_services_refresh(app);
+    };
+    let poll = |app: &mut App, since_recheck: u64| {
+        app.services.last_standalone_recheck = ago(since_recheck);
+        refresh(app);
+    };
+
+    poll(&mut app, 3);
+    assert!(
+        !app.services.standalone_probe.running,
+        "inside the interval"
+    );
+    app.tab = super::Tab::Overview;
+    poll(&mut app, 6);
+    assert!(!app.services.standalone_probe.running, "on another tab");
+    app.tab = super::Tab::Services;
+    app.modals.push(super::Modal::Help);
+    poll(&mut app, 6);
+    assert!(!app.services.standalone_probe.running, "under a modal");
+    app.modals.clear();
+    // An adopted gateway hides the readout, cached claim and all.
+    crate::testutil::write_adopted_record(&home, true, "[server]\n");
+    poll(&mut app, 6);
+    assert!(
+        !app.services.standalone_probe.running,
+        "with a gateway adopted"
+    );
+    std::fs::remove_file(home.home().join(".clauth").join("gateway.toml")).unwrap();
+    // The claim renders only in the `shunt` card: the cursor on another row
+    // takes it off screen.
+    let shunt_row = app.services.cursor;
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "delegates")
+        .expect("a delegates row");
+    poll(&mut app, 6);
+    assert!(
+        !app.services.standalone_probe.running,
+        "with another row selected"
+    );
+    app.services.cursor = shunt_row;
+    assert_eq!(RUNS.load(Ordering::SeqCst), runs, "no probe ran");
+
+    // A recheck that still hears the shunt keeps the claim and restarts the
+    // interval: the next second's refresh probes nothing.
+    poll(&mut app, 6);
+    assert!(
+        app.services.standalone_probe.running,
+        "a recheck past the interval"
+    );
+    await_service_probes(&mut app);
+    assert!(card_claims(&app), "the shunt still answers");
+    refresh(&mut app);
+    assert!(
+        !app.services.standalone_probe.running,
+        "the interval restarted"
+    );
+    assert_eq!(RUNS.load(Ordering::SeqCst), runs + 1);
+
+    ANSWERS.store(false, Ordering::SeqCst);
+    poll(&mut app, 6);
+    assert!(
+        app.services.standalone_probe.running,
+        "past the interval, on the tab"
+    );
+    await_service_probes(&mut app);
+    assert_eq!(claim(&app), None, "the claim dropped with no `r`");
+    assert!(!card_claims(&app), "and the card no longer shows it");
+    assert_eq!(RUNS.load(Ordering::SeqCst), runs + 2);
+
+    poll(&mut app, 6);
+    assert!(
+        !app.services.standalone_probe.running,
+        "no claim, no re-probe"
+    );
+}
+
 /// `r` during a probe already in flight queues one follow-up run, started
 /// when the held run lands, so the toast's "re-running service checks" holds
 /// for a change made just before the key. A second `r` queues no second run.

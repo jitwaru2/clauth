@@ -2060,10 +2060,14 @@ pub(crate) struct ServicesState {
     /// is adopted: `None` = unprobed. Probed on a worker (config discovery plus
     /// one `/health` round trip) the first time the row reads `absent`; every
     /// `r` starts it or queues one follow-up behind the run in flight; a tab
-    /// switch and the per-tick refresh reuse it.
+    /// switch and the per-tick refresh reuse it, except that a claim that a
+    /// shunt answers is re-probed while the tab shows it
+    /// ([`STANDALONE_RECHECK_INTERVAL`]).
     pub(crate) standalone: Option<StandaloneShunt>,
     /// The worker running [`standalone_probe`].
     pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
+    /// When the shown claim was last re-probed.
+    pub(crate) last_standalone_recheck: Instant,
     /// The gateway record on disk, read once per recompute (a cheap local
     /// read). `None` = no record, or one that cannot load. Every shunt-card
     /// action and the `enabled` row read this, never the file per frame.
@@ -2164,6 +2168,7 @@ impl Default for ServicesState {
             herdr_probe: ProbeWorker::new(crate::herdr::probe),
             standalone: None,
             standalone_probe: ProbeWorker::new(standalone_probe),
+            last_standalone_recheck: Instant::now(),
             shunt_record: None,
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
@@ -13413,11 +13418,16 @@ fn sync_broken_verdicts(app: &mut App) {
     }
 }
 
+/// How often a shown standalone-shunt claim is re-probed, so a shunt that
+/// stopped answering loses its claim with no `r`.
+const STANDALONE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Services tab live refresh: re-run the cheap local reads (job store, wiring,
 /// herdr config) at most once per interval while the tab is focused and no
 /// modal is open, so a delegate started elsewhere shows up without a manual
-/// `r`. Never re-probes `claude --version` or `clauth mcp` — both stay
-/// `r`-gated.
+/// `r`, and re-probe a shown standalone-shunt claim every
+/// [`STANDALONE_RECHECK_INTERVAL`]. Never re-probes `claude --version` or
+/// `clauth mcp` — both stay `r`-gated.
 fn poll_services_refresh(app: &mut App) {
     const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -13429,6 +13439,23 @@ fn poll_services_refresh(app: &mut App) {
     }
     app.last_services_refresh = Instant::now();
     recompute_services_checks(app, false, ShuntRefresh::Keep);
+    // The claim renders only in the `shunt` card, the readout only while no
+    // gateway is adopted.
+    let claim_shown = app.gateway_state == GatewayState::Absent
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|check| check.label == "shunt")
+        && app
+            .services
+            .standalone
+            .as_ref()
+            .is_some_and(|readout| readout.answer.is_some());
+    if claim_shown && app.services.last_standalone_recheck.elapsed() >= STANDALONE_RECHECK_INTERVAL
+    {
+        app.services.last_standalone_recheck = Instant::now();
+        app.services.standalone_probe.start();
+    }
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.
