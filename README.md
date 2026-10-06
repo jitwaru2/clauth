@@ -21,11 +21,12 @@ suite pass.
 
 The main checkout is `~/code/jitwaru2/clauth`.
 
-1. Build and install. rustup's `stable` on this Mac (1.94.1) cannot compile v0.17.0: it fails
-   with E0658 because `atomic_try_update` is unstable there. Use the installed 1.98.1 toolchain:
+1. Build and install. `rust-toolchain.toml` pins Rust 1.98.1, and cargo selects it
+   automatically inside the checkout. rustup's `stable` on this Mac (1.94.1) cannot compile
+   v0.17.0: it fails with E0658 because `atomic_try_update` is unstable there.
 
    ```sh
-   cargo +1.98.1 install --path ~/code/jitwaru2/clauth --locked --force
+   cd ~/code/jitwaru2/clauth && cargo install --path . --locked --force
    ```
 
 2. Check that the daemon is not mid-Keychain-write. The last line in `~/.clauth/daemon.log`
@@ -60,5 +61,5 @@ prefix commands with `NO_PROXY=api.anthropic.com,.anthropic.com`.
 ## Tests
 
 ```sh
-cargo +1.98.1 test --locked
+cargo test --locked
 ```
